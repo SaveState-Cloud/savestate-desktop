@@ -1,0 +1,35 @@
+# Rust build artifacts
+target/
+dist/
+
+# Node
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Tauri dev artifacts
+src-tauri/WixTools/
+src-tauri/bin/
+src-tauri/.kopia-tmp/
+tauri-updater.key
+tauri-updater.key.pub
+
+# Local logs and private operational notes
+*.log
+PRODUCT.md
+WINDOWS_QA_REPORT*.txt
+docs/ENGINEERING_HANDOFF*.md

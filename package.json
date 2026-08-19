@@ -1,0 +1,26 @@
+{
+  "name": "savestate-desktop",
+  "version": "2.0.13",
+  "description": "Official open-source Windows client for SaveState encrypted backups",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SaveState-Cloud/savestate-desktop.git"
+  },
+  "homepage": "https://savestate.dk",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "bundle:kopia": "node scripts/bundle-kopia.mjs",
+    "build": "node scripts/bundle-kopia.mjs && tauri build",
+    "build:release": "node scripts/bundle-kopia.mjs && tauri build --config src-tauri/tauri.release.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "sharp": "^0.35.3"
+  }
+}

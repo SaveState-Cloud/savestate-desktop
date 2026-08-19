@@ -1,0 +1,8 @@
+* @BareMelon
+
+.github/workflows/ @BareMelon
+scripts/ @BareMelon
+src-tauri/src/auth.rs @BareMelon
+src-tauri/src/backup.rs @BareMelon
+src-tauri/src/restore.rs @BareMelon
+src-tauri/src/updates.rs @BareMelon

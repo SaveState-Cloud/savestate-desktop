@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SaveState Vault</title>
+    <link rel="icon" type="image/png" href="icons/favicon.png" />
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <div id="app">
+        <!-- ───────────── LOGIN VIEW ───────────── -->
+        <div id="view-login" class="view active">
+            <div class="login-container">
+                <div class="login-card glass-card">
+                    <div class="logo-area">
+                        <div class="logo-icon">
+                            <img src="icons/favicon.png" alt="SaveState" />
+                        </div>
+                        <h1>SaveState <span class="accent">Vault</span></h1>
+                        <p class="text-muted">Encrypted cloud backup agent</p>
+                    </div>
+                    <form id="login-form" autocomplete="off">
+                        <div class="form-group">
+                            <label for="login-email">Email</label>
+                            <input type="email" id="login-email" placeholder="you@example.com" required />
+                        </div>
+                        <div class="form-group">
+                            <label for="login-password">Password</label>
+                            <input type="password" id="login-password" placeholder="Your password" required />
+                        </div>
+                        <label class="remember-row" for="login-remember">
+                            <input type="checkbox" id="login-remember" checked />
+                            <span>Remember me on this PC</span>
+                        </label>
+                        <button type="submit" class="btn btn-primary btn-full" id="login-btn">
+                            <span class="btn-text">Sign In</span>
+                            <span class="spinner hidden"></span>
+                        </button>
+                        <p id="login-error" class="error-text hidden"></p>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- ───────────── MAIN APP SHELL ───────────── -->
+        <div id="view-app" class="view">
+            <nav class="sidebar">
+                <div class="sidebar-header">
+                    <div class="sidebar-logo">
+                        <img src="icons/favicon.png" alt="SaveState" class="sidebar-logo-img" />
+                    </div>
+                    <span class="sidebar-title">SaveState</span>
+                </div>
+                <ul class="nav-links">
+                    <li>
+                        <a href="#" data-view="dashboard" class="nav-link active">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                            <span>Dashboard</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" data-view="profiles" class="nav-link">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                            <span>Profiles</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" data-view="backup" class="nav-link">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            <span>Quick Backup</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" data-view="backups" class="nav-link">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5" rx="1"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+                            <span>My Backups</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" data-view="settings" class="nav-link">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+                            <span>Settings</span>
+                        </a>
+                    </li>
+                </ul>
+                <div class="sidebar-footer">
+                    <div class="user-info">
+                        <span class="user-email" id="sidebar-email">—</span>
+                    </div>
+                    <button class="btn btn-ghost btn-sm" id="btn-logout">Sign Out</button>
+                </div>
+            </nav>
+
+            <main class="content">
+                <!-- ── DASHBOARD ───────────────────── -->
+                <section id="page-dashboard" class="page active">
+                    <h2 class="page-title">Dashboard</h2>
+                    <div class="dashboard-overview">
+                        <div class="account-summary">
+                            <div class="account-summary-identity">
+                                <span class="summary-label">Account</span>
+                                <strong id="stat-email">—</strong>
+                                <span id="stat-plan" class="account-plan">—</span>
+                            </div>
+                            <div id="sub-status-card" class="dashboard-status hidden">
+                                <div class="sub-status-row">
+                                    <span class="sub-status-label">Status</span>
+                                    <span class="sub-status-value" id="sub-status-text">Active</span>
+                                </div>
+                                <div class="sub-status-row">
+                                    <span class="sub-status-label">Renews</span>
+                                    <span class="sub-status-value" id="sub-renews-text">—</span>
+                                </div>
+                                <button class="btn btn-primary btn-sm hidden" id="btn-resume-sub">Resume Subscription</button>
+                            </div>
+                        </div>
+
+                        <div class="usage-section" aria-labelledby="usage-heading">
+                            <div class="usage-section-header">
+                                <div>
+                                    <h3 id="usage-heading">Usage</h3>
+                                    <p>Storage is plan-limited. Uploads are free. Restores have a monthly allowance.</p>
+                                </div>
+                                <div id="cleanup-state" class="cleanup-state hidden" role="status">
+                                    <span class="cleanup-dot" aria-hidden="true"></span>
+                                    <span id="cleanup-state-text">Cleanup pending</span>
+                                </div>
+                            </div>
+
+                            <div class="usage-list">
+                                <div class="usage-row">
+                                    <div>
+                                        <strong>Storage</strong>
+                                        <span id="usage-storage-meta">Current encrypted repository size</span>
+                                    </div>
+                                    <div class="usage-measure">
+                                        <strong id="usage-storage">—</strong>
+                                        <span id="storage-pct">0%</span>
+                                    </div>
+                                    <div class="progress-bar usage-storage-bar">
+                                        <div class="progress-bar-fill" id="storage-fill" style="width: 0%"></div>
+                                    </div>
+                                </div>
+                                <div class="usage-row">
+                                    <div>
+                                        <strong>Uploads</strong>
+                                        <span id="usage-upload-meta">This month, not charged</span>
+                                    </div>
+                                    <div class="usage-measure">
+                                        <strong id="usage-upload">0 B</strong>
+                                    </div>
+                                </div>
+                                <div class="usage-row">
+                                    <div>
+                                        <strong>Restores</strong>
+                                        <span id="usage-restore-meta">Included monthly restore traffic</span>
+                                    </div>
+                                    <div class="usage-measure">
+                                        <strong id="usage-restore">0 B</strong>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="quick-actions">
+                        <button class="btn btn-primary" id="btn-goto-profiles">
+                            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                            Manage Profiles
+                        </button>
+                        <button class="btn btn-ghost" id="btn-goto-backup">Quick Backup</button>
+                        <button class="btn btn-ghost" id="btn-goto-backups">View Backups</button>
+                    </div>
+                </section>
+
+                <!-- ── PROFILES ─────────────────────── -->
+                <section id="page-profiles" class="page">
+                    <div class="page-header">
+                        <h2 class="page-title">Backup Profiles</h2>
+                        <button class="btn btn-primary btn-sm" id="btn-create-profile">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            New Profile
+                        </button>
+                    </div>
+                    <div id="profiles-list" class="profiles-grid">
+                        <div class="empty-state glass-card">
+                            <p class="text-muted">No backup profiles yet. Create one to get started.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ── QUICK BACKUP ─────────────────── -->
+                <section id="page-backup" class="page">
+                    <h2 class="page-title">Quick Backup</h2>
+                    <p class="text-muted" style="margin-bottom: 1.5rem;">One-off backup without a profile. Files are auto-encrypted with your master key.</p>
+
+                    <div class="quick-backup-folder-selector glass-card">
+                        <div class="folder-selector-row">
+                            <span class="folder-selector-label">Save to:</span>
+                            <select class="select-input" id="quick-backup-folder">
+                                <option value="/">/ (Root)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="backup-options">
+                        <div class="glass-card backup-option" id="opt-files">
+                            <div class="backup-option-icon">
+                                <svg width="40" height="40" fill="none" stroke="#82e0aa" stroke-width="1.5" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            </div>
+                            <h3>Backup Files</h3>
+                            <p class="text-muted">Select one or more files to encrypt and upload.</p>
+                            <button class="btn btn-primary" id="btn-pick-files">Select Files</button>
+                        </div>
+                        <div class="glass-card backup-option" id="opt-folder">
+                            <div class="backup-option-icon">
+                                <svg width="40" height="40" fill="none" stroke="#82e0aa" stroke-width="1.5" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                            </div>
+                            <h3>Backup Folder</h3>
+                            <p class="text-muted">Archive, compress, encrypt, and upload a folder.</p>
+                            <button class="btn btn-primary" id="btn-pick-folder">Select Folder</button>
+                        </div>
+                    </div>
+
+                    <!-- Progress -->
+                    <div id="backup-progress-area" class="glass-card hidden">
+                        <h3>Backup Progress</h3>
+                        <div class="progress-bar">
+                            <div class="progress-bar-fill" id="backup-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <p id="backup-progress-msg" class="text-muted">Starting...</p>
+                    </div>
+                </section>
+
+                <!-- ── BACKUPS LIST ────────────────── -->
+                <section id="page-backups" class="page">
+                    <div class="page-header">
+                        <h2 class="page-title">My Backups</h2>
+                        <div class="page-header-actions">
+                            <button class="btn btn-ghost btn-sm" id="btn-refresh-backups">↻ Refresh</button>
+                            <button class="btn btn-primary btn-sm" id="btn-create-folder">
+                                <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                New Folder
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Breadcrumb Navigation -->
+                    <div class="backups-breadcrumb glass-card" id="backups-breadcrumb">
+                        <span class="breadcrumb-segment active" data-path="/">📂 / (root)</span>
+                    </div>
+
+                    <!-- Folder Cards Grid -->
+                    <div class="folder-grid" id="folder-grid"></div>
+
+                    <!-- Backup Files Table -->
+                    <div class="glass-card table-container">
+                        <table class="data-table" id="backups-table">
+                            <thead>
+                                <tr>
+                                    <th>Filename</th>
+                                    <th>Size</th>
+                                    <th>Date</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="backups-tbody">
+                                <tr><td colspan="4" class="text-muted text-center">Loading…</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Restore modal -->
+                    <div id="restore-modal" class="modal-overlay hidden">
+                        <div class="modal glass-card">
+                            <h3>Restore Backup</h3>
+                            <p class="text-muted">Choose a destination folder. Decryption is automatic.</p>
+                            <div class="form-group">
+                                <label>Destination</label>
+                                <div class="input-row">
+                                    <input type="text" id="restore-dest" placeholder="Select folder…" readonly />
+                                    <button class="btn btn-ghost btn-sm" id="btn-pick-restore-dest">Browse</button>
+                                </div>
+                            </div>
+                            <div class="modal-actions">
+                                <button class="btn btn-ghost" id="btn-cancel-restore">Cancel</button>
+                                <button class="btn btn-primary" id="btn-confirm-restore">Restore All</button>
+                            </div>
+                            <div class="progress-bar hidden" id="restore-progress-wrap">
+                                <div class="progress-bar-fill" id="restore-progress-fill" style="width:0%"></div>
+                            </div>
+                            <p id="restore-progress-msg" class="text-muted hidden"></p>
+                        </div>
+                    </div>
+
+                    <!-- File Explorer modal -->
+                    <div id="file-explorer-modal" class="modal-overlay hidden">
+                        <div class="modal modal-lg glass-card">
+                            <div class="modal-header">
+                                <h3>📁 Browse Backup</h3>
+                                <button class="btn btn-ghost btn-sm" id="btn-close-explorer">✕</button>
+                            </div>
+                            <div class="file-explorer-toolbar">
+                                <div class="breadcrumb" id="explorer-breadcrumb">
+                                    <span class="breadcrumb-item active">/</span>
+                                </div>
+                                <div class="explorer-actions">
+                                    <button class="btn btn-ghost btn-sm" id="btn-select-all-files">Select All</button>
+                                    <button class="btn btn-primary btn-sm" id="btn-restore-selected" disabled>Restore Selected (0)</button>
+                                </div>
+                            </div>
+                            <div class="file-tree-container" id="file-tree-container">
+                                <div class="empty-state"><p class="text-muted">Loading file tree…</p></div>
+                            </div>
+                            <div class="modal-actions">
+                                <button class="btn btn-ghost" id="btn-close-explorer-bottom">Close</button>
+                                <button class="btn btn-primary" id="btn-restore-all-explorer">Restore All</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Selective restore destination modal -->
+                    <div id="selective-restore-modal" class="modal-overlay hidden">
+                        <div class="modal glass-card">
+                            <h3>Restore Selected Files</h3>
+                            <p class="text-muted" id="selective-restore-count">Restoring 0 files</p>
+                            <div class="form-group">
+                                <label>Destination</label>
+                                <div class="input-row">
+                                    <input type="text" id="selective-restore-dest" placeholder="Select folder…" readonly />
+                                    <button class="btn btn-ghost btn-sm" id="btn-pick-selective-dest">Browse</button>
+                                </div>
+                            </div>
+                            <div class="modal-actions">
+                                <button class="btn btn-ghost" id="btn-cancel-selective">Cancel</button>
+                                <button class="btn btn-primary" id="btn-confirm-selective">Restore</button>
+                            </div>
+                            <div class="progress-bar hidden" id="selective-progress-wrap">
+                                <div class="progress-bar-fill" id="selective-progress-fill" style="width:0%"></div>
+                            </div>
+                            <p id="selective-progress-msg" class="text-muted hidden"></p>
+                        </div>
+                    </div>
+
+                    <!-- New Folder modal -->
+                    <div id="new-folder-modal" class="modal-overlay hidden">
+                        <div class="modal glass-card">
+                            <h3>Create New Folder</h3>
+                            <p class="text-muted" id="new-folder-location">Creating in / (Root)</p>
+                            <div class="form-group">
+                                <label for="new-folder-name">Folder Name</label>
+                                <input type="text" id="new-folder-name" placeholder="e.g. ServerBackups" />
+                            </div>
+                            <div class="modal-actions">
+                                <button class="btn btn-ghost" id="btn-cancel-new-folder">Cancel</button>
+                                <button class="btn btn-primary" id="btn-confirm-new-folder">Create Folder</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Move Backup modal -->
+                    <div id="move-backup-modal" class="modal-overlay hidden">
+                        <div class="modal glass-card">
+                            <h3>Move Backup</h3>
+                            <p class="text-muted" id="move-backup-filename">Moving: backup.enc</p>
+                            <div class="form-group">
+                                <label for="move-dest-folder">Destination Folder</label>
+                                <select class="select-input" id="move-dest-folder">
+                                    <option value="/">/ (Root)</option>
+                                </select>
+                            </div>
+                            <div class="modal-actions">
+                                <button class="btn btn-ghost" id="btn-cancel-move">Cancel</button>
+                                <button class="btn btn-primary" id="btn-confirm-move">Move</button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ── SETTINGS ────────────────────── -->
+                <section id="page-settings" class="page">
+                    <h2 class="page-title">Settings</h2>
+
+                    <!-- Encryption Info -->
+                    <div class="settings-section glass-card">
+                        <h3>🔐 Encryption</h3>
+                        <p class="text-muted">Your files are encrypted locally with a per-account master key. A password-protected copy lets the app recover that key after sign-in.</p>
+                        <div class="badge badge-success">Client-Side Encryption Active</div>
+                    </div>
+
+                    <!-- Discord Notifications -->
+                    <div class="settings-section glass-card">
+                        <h3>🔔 Notifications</h3>
+                        <p class="text-muted">Get alerts in Discord when backups and restores succeed or fail.</p>
+
+                        <div class="settings-subsection">
+                            <h4>Discord Webhook</h4>
+                            <p class="text-muted text-sm">In Discord, open Server Settings → Integrations → Webhooks, create a webhook, and copy its URL here. Test Notification saves the current settings first and reports Discord's actual result.</p>
+                            <div class="form-group">
+                                <input type="url" id="settings-webhook-url" placeholder="https://discord.com/api/webhooks/..." />
+                            </div>
+                        </div>
+
+                        <div class="settings-subsection">
+                            <h4>Discord Bot</h4>
+                            <p class="text-muted text-sm">Invite the SaveState bot and use <code>/setup</code> in your server to get your Channel ID.</p>
+                            <div class="form-group">
+                                <label>Channel ID</label>
+                                <input type="text" id="settings-channel-id" placeholder="e.g. 1234567890123456789" />
+                            </div>
+                            <a href="#" class="btn btn-ghost btn-sm" id="btn-invite-bot" target="_blank">
+                                <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                Invite Bot to Server
+                            </a>
+                        </div>
+
+                        <div class="settings-subsection">
+                            <h4>Notification Events</h4>
+                            <div class="toggle-grid">
+                                <label class="toggle-item">
+                                    <input type="checkbox" id="pref-backup-success" checked />
+                                    <span>✅ Successful Backups</span>
+                                </label>
+                                <label class="toggle-item">
+                                    <input type="checkbox" id="pref-backup-failure" checked />
+                                    <span>❌ Failed Backups</span>
+                                </label>
+                                <label class="toggle-item">
+                                    <input type="checkbox" id="pref-restore-success" checked />
+                                    <span>✅ Successful Restores</span>
+                                </label>
+                                <label class="toggle-item">
+                                    <input type="checkbox" id="pref-restore-failure" checked />
+                                    <span>❌ Failed Restores</span>
+                                </label>
+                                <label class="toggle-item">
+                                    <input type="checkbox" id="pref-backup-scheduled" checked />
+                                    <span>📅 Scheduled Backup Reminders</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="settings-actions">
+                            <button class="btn btn-primary btn-sm" id="btn-save-settings">Save Notification Settings</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-test-notification">Test Notification</button>
+                        </div>
+                    </div>
+
+                    <!-- Account -->
+                    <div class="settings-section glass-card">
+                        <h3>👤 Account</h3>
+                        <p class="text-muted">To manage billing or cancel your subscription, visit your account dashboard on the website.</p>
+                    </div>
+                </section>
+            </main>
+        </div>
+    </div>
+
+    <!-- Profile Create/Edit Modal -->
+    <div id="profile-modal" class="modal-overlay hidden">
+        <div class="modal glass-card">
+            <h3 id="profile-modal-title">Create Backup Profile</h3>
+            <form id="profile-form" autocomplete="off">
+                <input type="hidden" id="profile-edit-id" />
+                <div class="form-group">
+                    <label for="profile-name">Profile Name</label>
+                    <input type="text" id="profile-name" placeholder='e.g. "Production Database"' required />
+                </div>
+                <div class="form-group">
+                    <label>Source Folder</label>
+                    <div class="input-row">
+                        <input type="text" id="profile-source" placeholder="Select folder…" readonly required />
+                        <button type="button" class="btn btn-ghost btn-sm" id="btn-pick-profile-source">Browse</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="profile-schedule-times">Backup Times <span class="text-muted text-sm">(optional; this machine's local time, e.g. 15:30, 02:00)</span></label>
+                    <input type="text" id="profile-schedule-times" placeholder="e.g. 15:30, 02:00" aria-describedby="profile-schedule-time-help" />
+                    <p class="text-muted text-sm" id="profile-schedule-time-help">Leave blank for a manual-only profile. UTC equivalents appear here after you enter a time.</p>
+                </div>
+                <div class="form-group">
+                    <label for="profile-schedule-interval">Repeat Every (days) <span class="text-muted text-sm">(used only when backup times are set)</span></label>
+                    <input type="number" id="profile-schedule-interval" value="1" min="1" max="365" />
+                </div>
+                <div class="form-group">
+                    <label for="profile-retention">Retention (keep last N backups, 0 = unlimited)</label>
+                    <input type="number" id="profile-retention" value="0" min="0" />
+                </div>
+                <div class="form-group">
+                    <label for="profile-folder">Save backups to folder</label>
+                    <select class="select-input" id="profile-folder">
+                        <option value="/">/ (Root)</option>
+                    </select>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost" id="btn-cancel-profile">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Profile</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Global Progress Bar -->
+    <div id="global-progress-bar" class="global-progress-bar hidden">
+        <div class="global-progress-info">
+            <span id="global-progress-msg" class="text-sm">Uploading...</span>
+            <span id="global-progress-pct" class="text-sm font-bold">0%</span>
+        </div>
+        <div class="progress-bar" style="margin-top: 0.5rem; height: 6px;">
+            <div class="progress-bar-fill" id="global-progress-fill" style="width: 0%"></div>
+        </div>
+    </div>
+
+    <!-- Update Banner -->
+    <div id="update-banner" class="update-banner hidden">
+        <div class="update-banner-content">
+            <div class="update-banner-info">
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none" style="flex-shrink:0">
+                    <path d="M10 2L10 14M10 14L6 10M10 14L14 10" stroke="#82e0aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M4 17H16" stroke="#82e0aa" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <span id="update-banner-text">A new version is ready to install</span>
+            </div>
+            <div class="update-banner-actions">
+                <div id="update-progress-area" class="update-progress-area hidden">
+                    <div class="progress-bar" style="height: 4px; width: 120px;">
+                        <div class="progress-bar-fill" id="update-progress-fill" style="width: 0%"></div>
+                    </div>
+                    <span id="update-progress-pct" class="text-xs">0%</span>
+                </div>
+                <button class="btn btn-sm btn-primary" id="btn-install-update">Update Now</button>
+                <button class="btn btn-sm btn-ghost" id="btn-dismiss-update">Later</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

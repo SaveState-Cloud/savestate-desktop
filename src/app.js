@@ -1,0 +1,1870 @@
+// ─────────────────────────────────────────────────────────────────────
+// SaveState Vault — Frontend Logic (V2)
+// ─────────────────────────────────────────────────────────────────────
+
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const { open, confirm: confirmDialog } = window.__TAURI__.dialog;
+
+// ── Auto-updater state ───────────────────────────────────────────
+let availableUpdateVersion = null;
+let dismissedUpdateVersion = null;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// ── Page map ──────────────────────────────────────────────────────
+const pages = {
+    dashboard: document.getElementById('page-dashboard'),
+    profiles:  document.getElementById('page-profiles'),
+    backup:    document.getElementById('page-backup'),
+    backups:   document.getElementById('page-backups'),
+    settings:  document.getElementById('page-settings'),
+};
+
+// ── UI State ──────────────────────────────────────────────────────
+let currentAccount = null;
+let restoreTarget = null;        // { key, filename }
+let restoreInProgress = false;
+let restoreCancelRequested = false;
+let explorerTarget = null;       // { key, filename }
+let explorerManifest = null;     // manifest JSON
+let selectedExplorerFiles = new Set();
+let currentFolder = '/';       // Current folder path in backups view
+let folderList = [];           // Available folders for move/profile dropdowns
+let storageCleanupPending = false;
+const activeToasts = new Map();
+let globalProgressHideTimer = null;
+let pendingBackupErrorToast = null;
+let pendingRestoreErrorToast = null;
+let repositoryRecoveryPromptOpen = false;
+let authenticatedSessionActive = false;
+let repositoryWarmupPromise = null;
+let repositorySessionGeneration = 0;
+let legacyProfileNoticeShown = false;
+const EMPTY_REPOSITORY_DISPLAY_THRESHOLD_BYTES = 5 * 1024 * 1024;
+
+// ────────────────────────────────────────────────────────────────
+// Initialization
+// ────────────────────────────────────────────────────────────────
+async function init() {
+    setupEventListeners();
+    setupTauriListeners();
+    await checkAuthStatus();
+    // Check for updates in the background (non-blocking)
+    checkForUpdates();
+    setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+}
+
+document.addEventListener('DOMContentLoaded', init);
+
+// ────────────────────────────────────────────────────────────────
+// Event Listeners
+// ────────────────────────────────────────────────────────────────
+function setupEventListeners() {
+    // Re-warm after the app is reopened from the tray. The native cache makes
+    // this a no-op while the existing 15-minute repository session is valid.
+    window.addEventListener('focus', () => {
+        warmRepositoryInBackground();
+    });
+
+    // Nav links
+    document.querySelectorAll('.nav-link').forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            navigateTo(link.getAttribute('data-view'));
+        });
+    });
+
+    // Dashboard quick-action buttons
+    document.getElementById('btn-goto-profiles').addEventListener('click', () => navigateTo('profiles'));
+    document.getElementById('btn-goto-backup').addEventListener('click', () => navigateTo('backup'));
+    document.getElementById('btn-goto-backups').addEventListener('click', () => navigateTo('backups'));
+
+    // Resume subscription
+    document.getElementById('btn-resume-sub').addEventListener('click', async () => {
+        try {
+            await invoke('cmd_resume_subscription');
+            showToast('Subscription resumed!', 'success');
+            loadDashboard();
+        } catch (err) {
+            showToast('Failed to resume: ' + String(err), 'error');
+        }
+    });
+
+    // Auto-updater banner buttons
+    document.getElementById('btn-install-update').addEventListener('click', () => installUpdate());
+    document.getElementById('btn-dismiss-update').addEventListener('click', () => {
+        dismissedUpdateVersion = availableUpdateVersion;
+        document.getElementById('update-banner').classList.add('hidden');
+    });
+
+    // Login
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = document.getElementById('login-email').value.trim();
+        const password = document.getElementById('login-password').value;
+        const rememberMe = document.getElementById('login-remember').checked;
+        const btn = document.getElementById('login-btn');
+        const errorEl = document.getElementById('login-error');
+
+        btn.querySelector('.btn-text').textContent = 'Signing in…';
+        btn.querySelector('.spinner').classList.remove('hidden');
+        btn.disabled = true;
+        errorEl.classList.add('hidden');
+
+        try {
+            await invoke('cmd_login', { email, password, rememberMe });
+            await checkAuthStatus();
+        } catch (err) {
+            errorEl.textContent = friendlyError(err);
+            errorEl.classList.remove('hidden');
+        } finally {
+            btn.querySelector('.btn-text').textContent = 'Sign In';
+            btn.querySelector('.spinner').classList.add('hidden');
+            btn.disabled = false;
+        }
+    });
+
+    // Logout
+    document.getElementById('btn-logout').addEventListener('click', async () => {
+        endAuthenticatedSession();
+        await invoke('cmd_logout');
+        showView('login');
+    });
+
+    // ── Quick Backup ──────────────────────────────────────────
+    document.getElementById('btn-pick-files').addEventListener('click', async () => {
+        const files = await open({ multiple: true });
+        if (files && files.length > 0) {
+            startBackupMode();
+            try {
+                const folder = document.getElementById('quick-backup-folder')?.value || '/';
+                await invoke('cmd_backup_files', { paths: Array.isArray(files) ? files : [files], folder });
+            } catch (err) {
+                failBackupUi(err);
+            }
+        }
+    });
+
+    document.getElementById('btn-pick-folder').addEventListener('click', async () => {
+        const folder = await open({ directory: true });
+        if (folder) {
+            startBackupMode();
+            try {
+                const destFolder = document.getElementById('quick-backup-folder')?.value || '/';
+                await invoke('cmd_backup_folder', { path: folder, folder: destFolder });
+            } catch (err) {
+                failBackupUi(err);
+            }
+        }
+    });
+
+    // ── Backups ───────────────────────────────────────────────
+    document.getElementById('btn-refresh-backups').addEventListener('click', loadBackups);
+
+    // ── Restore Modal ─────────────────────────────────────────
+    document.getElementById('btn-cancel-restore').addEventListener('click', async () => {
+        if (!restoreInProgress || !restoreTarget) {
+            resetRestoreModal();
+            return;
+        }
+        if (restoreCancelRequested) return;
+
+        restoreCancelRequested = true;
+        const cancelBtn = document.getElementById('btn-cancel-restore');
+        cancelBtn.textContent = 'Stopping…';
+        cancelBtn.disabled = true;
+        document.getElementById('restore-progress-msg').textContent = 'Stopping restore and removing partial files…';
+        try {
+            await invoke('cmd_cancel_restore', { key: restoreTarget.key });
+        } catch (err) {
+            restoreCancelRequested = false;
+            cancelBtn.textContent = 'Stop Restore';
+            cancelBtn.disabled = false;
+            showToast('Could not stop restore: ' + String(err), 'error');
+        }
+    });
+
+    document.getElementById('btn-pick-restore-dest').addEventListener('click', async () => {
+        const folder = await open({ directory: true });
+        if (folder) {
+            document.getElementById('restore-dest').value = folder;
+        }
+    });
+
+    document.getElementById('btn-confirm-restore').addEventListener('click', async () => {
+        if (!restoreTarget) return;
+        const dest = document.getElementById('restore-dest').value;
+        if (!dest) { showToast('Please select a destination folder', 'error'); return; }
+
+        try {
+            restoreInProgress = true;
+            restoreCancelRequested = false;
+            document.getElementById('btn-confirm-restore').disabled = true;
+            document.getElementById('btn-pick-restore-dest').disabled = true;
+            document.getElementById('btn-cancel-restore').textContent = 'Stop Restore';
+            document.getElementById('restore-progress-wrap').classList.remove('hidden');
+            document.getElementById('restore-progress-msg').classList.remove('hidden');
+            await invoke('cmd_restore_backup', {
+                key: restoreTarget.key,
+                filename: restoreTarget.filename,
+                destination: dest,
+            });
+        } catch (err) {
+            if (!String(err).toLowerCase().includes('cancelled')) {
+                if (pendingRestoreErrorToast) {
+                    clearTimeout(pendingRestoreErrorToast);
+                    pendingRestoreErrorToast = null;
+                }
+                handleRepositoryError(err);
+            }
+            resetRestoreModal();
+        }
+    });
+
+    // ── File Explorer Modal ───────────────────────────────────
+    document.getElementById('btn-close-explorer').addEventListener('click', closeFileExplorer);
+    document.getElementById('btn-close-explorer-bottom').addEventListener('click', closeFileExplorer);
+
+    document.getElementById('btn-select-all-files').addEventListener('click', () => {
+        const checkboxes = document.querySelectorAll('#file-tree-container input[type="checkbox"]');
+        const allChecked = [...checkboxes].every(cb => cb.checked);
+        checkboxes.forEach(cb => { cb.checked = !allChecked; cb.dispatchEvent(new Event('change')); });
+        updateSelectedCount();
+    });
+
+    document.getElementById('btn-restore-selected').addEventListener('click', () => {
+        if (selectedExplorerFiles.size === 0) return;
+        document.getElementById('file-explorer-modal').classList.add('hidden');
+        document.getElementById('selective-restore-count').textContent = `Restoring ${selectedExplorerFiles.size} file(s)`;
+        document.getElementById('selective-restore-modal').classList.remove('hidden');
+    });
+
+    document.getElementById('btn-restore-all-explorer').addEventListener('click', () => {
+        if (!explorerTarget) return;
+        document.getElementById('file-explorer-modal').classList.add('hidden');
+        restoreTarget = explorerTarget;
+        document.getElementById('restore-dest').value = '';
+        document.getElementById('restore-modal').classList.remove('hidden');
+    });
+
+    // ── Selective Restore Modal ────────────────────────────────
+    document.getElementById('btn-cancel-selective').addEventListener('click', () => {
+        document.getElementById('selective-restore-modal').classList.add('hidden');
+    });
+
+    document.getElementById('btn-pick-selective-dest').addEventListener('click', async () => {
+        const folder = await open({ directory: true });
+        if (folder) document.getElementById('selective-restore-dest').value = folder;
+    });
+
+    document.getElementById('btn-confirm-selective').addEventListener('click', async () => {
+        if (!explorerTarget || selectedExplorerFiles.size === 0) return;
+        const dest = document.getElementById('selective-restore-dest').value;
+        if (!dest) { showToast('Please select a destination folder', 'error'); return; }
+
+        try {
+            document.getElementById('selective-progress-wrap').classList.remove('hidden');
+            document.getElementById('selective-progress-msg').classList.remove('hidden');
+            await invoke('cmd_restore_selected_files', {
+                key: explorerTarget.key,
+                filename: explorerTarget.filename,
+                destination: dest,
+                selectedPaths: [...selectedExplorerFiles],
+            });
+        } catch (err) {
+            handleRepositoryError(err);
+            document.getElementById('selective-progress-wrap').classList.add('hidden');
+            document.getElementById('selective-progress-msg').classList.add('hidden');
+            document.getElementById('selective-restore-modal').classList.add('hidden');
+        }
+    });
+
+    // ── Profiles ──────────────────────────────────────────────
+    document.getElementById('btn-create-profile').addEventListener('click', () => {
+        openProfileModal();
+    });
+
+    document.getElementById('btn-cancel-profile').addEventListener('click', () => {
+        document.getElementById('profile-modal').classList.add('hidden');
+    });
+
+    document.getElementById('btn-pick-profile-source').addEventListener('click', async () => {
+        const folder = await open({ directory: true });
+        if (folder) document.getElementById('profile-source').value = folder;
+    });
+
+    document.getElementById('profile-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const editId = document.getElementById('profile-edit-id').value;
+        const name = document.getElementById('profile-name').value.trim();
+        const sourcePath = document.getElementById('profile-source').value;
+        const timesRaw = document.getElementById('profile-schedule-times').value.trim();
+        let intervalDays = parseInt(document.getElementById('profile-schedule-interval').value) || 1;
+        const retention = parseInt(document.getElementById('profile-retention').value) || 0;
+
+        if (!name || !sourcePath) { showToast('Name and source path required', 'error'); return; }
+
+        // Validate time format
+        let schedule = null;
+        if (timesRaw) {
+            intervalDays = Math.max(1, Math.min(365, intervalDays));
+            const times = timesRaw.split(',').map(t => t.trim()).filter(Boolean);
+            const validTime = /^([01]\d|2[0-3]):([0-5]\d)$/;
+            for (const t of times) {
+                if (!validTime.test(t)) {
+                    showToast(`Invalid time format: "${t}". Use HH:MM (24h)`, 'error');
+                    return;
+                }
+            }
+            schedule = JSON.stringify({ times, intervalDays });
+        }
+
+        const folder = document.getElementById('profile-folder')?.value || '/';
+
+        try {
+            if (editId) {
+                await invoke('cmd_update_profile', {
+                    id: editId, name, sourcePath, schedule, retention, enabled: true, folder,
+                });
+                showToast('Profile updated', 'success');
+            } else {
+                await invoke('cmd_create_profile', { name, sourcePath, schedule, retention, folder });
+                showToast('Profile created', 'success');
+            }
+            document.getElementById('profile-modal').classList.add('hidden');
+            loadProfiles();
+        } catch (err) {
+            showToast(String(err), 'error');
+        }
+    });
+
+    // ── Settings ──────────────────────────────────────────────
+    document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+    document.getElementById('btn-test-notification').addEventListener('click', testNotification);
+
+    // ── Folder Management ─────────────────────────────────────────
+    document.getElementById('btn-create-folder').addEventListener('click', () => {
+        document.getElementById('new-folder-name').value = '';
+        document.getElementById('new-folder-location').textContent = currentFolder === '/'
+            ? 'Creating in / (Root)'
+            : `Creating in ${currentFolder}`;
+        document.getElementById('new-folder-modal').classList.remove('hidden');
+    });
+
+    document.getElementById('btn-cancel-new-folder').addEventListener('click', () => {
+        document.getElementById('new-folder-modal').classList.add('hidden');
+    });
+
+    document.getElementById('btn-confirm-new-folder').addEventListener('click', async () => {
+        const name = document.getElementById('new-folder-name').value.trim();
+        if (!name) { showToast('Please enter a folder name', 'error'); return; }
+        const button = document.getElementById('btn-confirm-new-folder');
+        try {
+            button.disabled = true;
+            await invoke('cmd_create_folder', { name, parentFolder: currentFolder });
+            showToast(`Folder "${name}" created`, 'success');
+            document.getElementById('new-folder-modal').classList.add('hidden');
+            loadBackups();
+        } catch (err) {
+            showToast('Failed to create folder: ' + String(err), 'error');
+        } finally {
+            button.disabled = false;
+        }
+    });
+
+    // ── Move Backup Modal ─────────────────────────────────────────
+    document.getElementById('btn-cancel-move').addEventListener('click', () => {
+        document.getElementById('move-backup-modal').classList.add('hidden');
+    });
+
+    document.getElementById('btn-confirm-move').addEventListener('click', async () => {
+        const key = document.getElementById('move-backup-modal').dataset.backupKey;
+        const destinationFolder = document.getElementById('move-dest-folder').value;
+        if (!key) return;
+        const button = document.getElementById('btn-confirm-move');
+        try {
+            button.disabled = true;
+            button.textContent = 'Moving…';
+            await invoke('cmd_move_backup', { key, destinationFolder });
+            showToast('Backup moved successfully', 'success');
+            document.getElementById('move-backup-modal').classList.add('hidden');
+            await loadBackups();
+        } catch (err) {
+            showToast('Failed to move: ' + String(err), 'error');
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Move';
+        }
+    });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Tauri Event Listeners
+// ────────────────────────────────────────────────────────────────
+function setupTauriListeners() {
+    listen('backup-progress', (event) => {
+        const p = event.payload;
+        const pct = Math.round(p.progress * 100);
+
+        // Quick backup specific UI
+        const fill = document.getElementById('backup-progress-fill');
+        const msg = document.getElementById('backup-progress-msg');
+        if (fill) fill.style.width = `${pct}%`;
+        if (msg) msg.textContent = p.message;
+
+        // Global progress UI
+        const globalBar = document.getElementById('global-progress-bar');
+        const globalFill = document.getElementById('global-progress-fill');
+        const globalMsg = document.getElementById('global-progress-msg');
+        const globalPct = document.getElementById('global-progress-pct');
+
+        if (globalBar && globalFill && globalMsg && globalPct) {
+            if (globalProgressHideTimer) {
+                clearTimeout(globalProgressHideTimer);
+                globalProgressHideTimer = null;
+            }
+            globalBar.classList.remove('hidden');
+            globalFill.style.width = `${pct}%`;
+            globalMsg.textContent = p.message;
+            globalPct.textContent = `${pct}%`;
+
+            if (p.stage === 'done') {
+                globalProgressHideTimer = setTimeout(hideGlobalProgress, 2000);
+            } else if (p.stage === 'error') {
+                hideGlobalProgress();
+            }
+        }
+
+        // ── Profile card inline progress ──
+        // Update ALL profile cards that have visible progress bars
+        // (we don't know which profile ID emitted this, so update all active ones)
+        document.querySelectorAll('.profile-progress:not(.hidden)').forEach(el => {
+            const msgEl = el.querySelector('.profile-progress-msg');
+            const pctEl = el.querySelector('.profile-progress-pct');
+            const fillEl = el.querySelector('.profile-progress-fill');
+            if (msgEl) msgEl.textContent = p.message;
+            if (pctEl) pctEl.textContent = `${pct}%`;
+            if (fillEl) fillEl.style.width = `${pct}%`;
+        });
+
+        if (p.stage === 'done') {
+            showToast('Backup completed!', 'success');
+            setTimeout(resetBackupMode, 2000);
+            loadBackups();
+            // Reload profiles to update "Last Run" and reset progress
+            if (document.getElementById('page-profiles').classList.contains('active')) {
+                loadProfiles();
+            } else {
+                // Even if not on profiles page, hide inline progress bars
+                document.querySelectorAll('.profile-progress').forEach(el => el.classList.add('hidden'));
+                document.querySelectorAll('.profile-actions .btn-primary').forEach(btn => {
+                    btn.disabled = false;
+                    btn.textContent = '▶ Run Now';
+                });
+            }
+        } else if (p.stage === 'error') {
+            resetBackupMode();
+            if (pendingBackupErrorToast) clearTimeout(pendingBackupErrorToast);
+            // Manual invokes reject immediately after this event and replace
+            // the generic message with the actionable native error. Scheduled
+            // failures have no invoking screen, so retain this fallback.
+            pendingBackupErrorToast = setTimeout(() => {
+                pendingBackupErrorToast = null;
+                handleRepositoryError(p.message);
+            }, 100);
+            // Reset profile card progress on error
+            document.querySelectorAll('.profile-progress').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.profile-actions .btn-primary').forEach(btn => {
+                btn.disabled = false;
+                btn.textContent = '▶ Run Now';
+            });
+        }
+    });
+
+    listen('restore-progress', (event) => {
+        const p = event.payload;
+
+        // Update whichever restore modal is visible
+        const fills = ['restore-progress-fill', 'selective-progress-fill'];
+        const msgs = ['restore-progress-msg', 'selective-progress-msg'];
+        fills.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.width = `${Math.round(p.progress * 100)}%`;
+        });
+        msgs.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = p.message;
+        });
+
+        if (p.stage === 'done') {
+            showToast('Restore completed!', 'success');
+            resetRestoreModal();
+            document.getElementById('selective-restore-modal').classList.add('hidden');
+        } else if (p.stage === 'cancelled') {
+            showToast('Restore cancelled. Partial files were removed.', 'info');
+            resetRestoreModal();
+            document.getElementById('selective-restore-modal').classList.add('hidden');
+        } else if (p.stage === 'error') {
+            if (pendingRestoreErrorToast) clearTimeout(pendingRestoreErrorToast);
+            pendingRestoreErrorToast = setTimeout(() => {
+                pendingRestoreErrorToast = null;
+                handleRepositoryError(p.message);
+            }, 100);
+            resetRestoreModal();
+            document.getElementById('selective-restore-modal').classList.add('hidden');
+        }
+    });
+
+    listen('navigate', (event) => {
+        navigateTo(event.payload);
+    });
+
+    listen('storage-cleanup', (event) => {
+        const cleanup = event.payload;
+        storageCleanupPending = cleanup.status === 'pending' || cleanup.status === 'running';
+        setStorageCleanupState(
+            storageCleanupPending,
+            cleanup.status === 'pending' ? friendlyError(cleanup.message) : cleanup.message,
+        );
+
+        if (cleanup.status === 'complete') {
+            showToast('Deleted storage cleanup completed', 'success');
+            setTimeout(() => {
+                if (document.getElementById('page-dashboard').classList.contains('active')) {
+                    loadDashboard();
+                }
+            }, 1200);
+        }
+    });
+
+    listen('update-progress', (event) => {
+        const progress = event.payload;
+        const progressArea = document.getElementById('update-progress-area');
+        const progressFill = document.getElementById('update-progress-fill');
+        const progressPct = document.getElementById('update-progress-pct');
+        const bannerText = document.getElementById('update-banner-text');
+
+        progressArea.classList.remove('hidden');
+        if (progress.stage === 'started') {
+            bannerText.textContent = `Downloading v${progress.version}…`;
+            return;
+        }
+
+        if (progress.stage === 'progress' && progress.total > 0) {
+            const pct = Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
+            progressFill.style.width = `${pct}%`;
+            progressPct.textContent = `${pct}%`;
+        } else if (progress.stage === 'downloaded') {
+            progressFill.style.width = '100%';
+            progressPct.textContent = '100%';
+            bannerText.textContent = 'Download complete. Verifying update…';
+        }
+    });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Auth
+// ────────────────────────────────────────────────────────────────
+async function checkAuthStatus() {
+    try {
+        const result = await invoke('cmd_get_auth_status');
+        if (result && result.authenticated && result.master_key_ready) {
+            if (!authenticatedSessionActive) repositorySessionGeneration += 1;
+            authenticatedSessionActive = true;
+            showView('app');
+            warmRepositoryInBackground();
+            loadDashboard();
+            loadSettings();
+            if (!legacyProfileNoticeShown) {
+                legacyProfileNoticeShown = true;
+                invoke('cmd_count_unowned_profiles')
+                    .then((count) => {
+                        if (Number(count) > 0) {
+                            showToast('Existing profiles are paused until you assign them to an account from the Profiles page.', 'info');
+                        }
+                    })
+                    .catch(() => {});
+            }
+        } else {
+            // Token expired or master key missing - need fresh login
+            endAuthenticatedSession();
+            showView('login');
+        }
+    } catch {
+        endAuthenticatedSession();
+        showView('login');
+    }
+}
+
+function endAuthenticatedSession() {
+    authenticatedSessionActive = false;
+    currentAccount = null;
+    repositorySessionGeneration += 1;
+    repositoryWarmupPromise = null;
+    legacyProfileNoticeShown = false;
+}
+
+function warmRepositoryInBackground() {
+    if (!authenticatedSessionActive || repositoryWarmupPromise) return;
+
+    const sessionGeneration = repositorySessionGeneration;
+    const warmup = invoke('cmd_warm_repository')
+        .catch((error) => {
+            console.warn('Repository warm-up did not complete:', error);
+            if (authenticatedSessionActive
+                && repositorySessionGeneration === sessionGeneration
+                && isRepositoryKeyMismatch(error)) {
+                return handleRepositoryError(error);
+            }
+        })
+        .finally(() => {
+            if (repositoryWarmupPromise === warmup) {
+                repositoryWarmupPromise = null;
+            }
+        });
+    repositoryWarmupPromise = warmup;
+}
+
+// ────────────────────────────────────────────────────────────────
+// View / Page Management
+// ────────────────────────────────────────────────────────────────
+function showView(viewId) {
+    document.getElementById('view-login').classList.toggle('active', viewId === 'login');
+    document.getElementById('view-app').classList.toggle('active', viewId === 'app');
+}
+
+function navigateTo(pageId) {
+    Object.values(pages).forEach(p => { if (p) p.classList.remove('active'); });
+    const target = pages[pageId];
+    if (target) target.classList.add('active');
+
+    document.querySelectorAll('.nav-link').forEach(l => {
+        l.classList.toggle('active', l.getAttribute('data-view') === pageId);
+    });
+
+    if (pageId === 'dashboard') loadDashboard();
+    if (pageId === 'backups') loadBackups();
+    if (pageId === 'profiles') loadProfiles();
+    if (pageId === 'settings') loadSettings();
+}
+
+// ────────────────────────────────────────────────────────────────
+// Toast
+// ────────────────────────────────────────────────────────────────
+function friendlyError(error) {
+    const raw = String(error ?? '').replace(/\\n/g, ' ').replace(/[\r\n\t]+/g, ' ').trim();
+    const lower = raw.toLowerCase();
+
+    if (lower.includes('message authentication failed') ||
+        lower.includes('unable to decrypt content') ||
+        lower.includes('invalid checksum') ||
+        lower.includes('unable to load manifest content')) {
+        return 'This backup repository cannot be decrypted with the account key stored on this PC. No data was changed. Sign in again to reconnect it.';
+    }
+    if (lower.includes('designated user')) {
+        return 'Storage cleanup is waiting for repository ownership to be updated. Backups remain safe; cleanup will retry automatically.';
+    }
+    if (lower.includes('missing required key name') || lower.includes("invalid args `name`")) {
+        return 'The folder name could not be sent to the app. Install the latest update and try again.';
+    }
+    if (lower.includes('folder_not_empty')) {
+        return 'This folder is not empty. Move its backups and remove nested folders first.';
+    }
+
+    let message = raw;
+    const jsonMatch = raw.match(/\{\s*"(?:error|message)"\s*:\s*"([^"]+)"/i);
+    if (jsonMatch) message = jsonMatch[1];
+    if (!message) message = 'Something went wrong. Please try again.';
+    return message.length > 240 ? `${message.slice(0, 237)}…` : message;
+}
+
+function isRepositoryKeyMismatch(error) {
+    const lower = String(error ?? '').toLowerCase();
+    return lower.includes('repository_key_mismatch') ||
+        lower.includes('message authentication failed') ||
+        lower.includes('unable to decrypt content') ||
+        lower.includes('invalid checksum') ||
+        lower.includes('unable to load manifest content');
+}
+
+async function handleRepositoryError(error) {
+    if (!isRepositoryKeyMismatch(error)) {
+        showToast(error, 'error');
+        return;
+    }
+
+    showToast(error, 'error');
+    if (repositoryRecoveryPromptOpen) return;
+    repositoryRecoveryPromptOpen = true;
+
+    try {
+        const signInAgain = await confirmDialog(
+            'SaveState cannot open this repository with the account key currently stored on this PC. Sign in again to reload the correct account key and repository. No backup data will be changed.',
+            { title: 'Reconnect encrypted repository', kind: 'warning' },
+        );
+        if (!signInAgain) return;
+
+        endAuthenticatedSession();
+        await invoke('cmd_logout');
+        document.getElementById('login-password').value = '';
+        const errorEl = document.getElementById('login-error');
+        errorEl.textContent = 'Sign in again to reconnect your encrypted backup repository.';
+        errorEl.classList.remove('hidden');
+        showView('login');
+    } catch (recoveryError) {
+        showToast('Could not restart sign-in: ' + String(recoveryError), 'error');
+    } finally {
+        repositoryRecoveryPromptOpen = false;
+    }
+}
+
+function showToast(message, type = 'success') {
+    const container = document.getElementById('toast-container');
+    const displayMessage = type === 'error' ? friendlyError(message) : String(message);
+    const key = `${type}:${displayMessage}`;
+    if (activeToasts.has(key)) return;
+
+    while (container.children.length >= 3) {
+        const oldest = container.firstElementChild;
+        if (!oldest) break;
+        clearTimeout(oldest._removeTimer);
+        activeToasts.delete(oldest.dataset.toastKey);
+        oldest.remove();
+    }
+
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.dataset.toastKey = key;
+    toast.textContent = displayMessage;
+    container.appendChild(toast);
+    activeToasts.set(key, toast);
+    toast._removeTimer = setTimeout(() => {
+        activeToasts.delete(key);
+        toast.remove();
+    }, type === 'error' ? 7000 : 3500);
+}
+
+// ────────────────────────────────────────────────────────────────
+// Dashboard
+// ────────────────────────────────────────────────────────────────
+async function loadDashboard() {
+    try {
+        const [account, backupState] = await Promise.all([
+            invoke('cmd_get_account'),
+            invoke('cmd_list_backups').catch(() => null),
+        ]);
+        currentAccount = account;
+        document.getElementById('sidebar-email').textContent = account.email || '';
+        document.getElementById('stat-email').textContent = account.email || '';
+        document.getElementById('stat-email').title = account.email || '';
+        document.getElementById('stat-plan').textContent = account.plan || 'No plan';
+
+        const usage = Math.max(0, Math.trunc(Number(account.usage?.bytes || 0)));
+        const backupCount = Array.isArray(backupState?.backups)
+            ? backupState.backups.length
+            : (Number.isFinite(Number(backupState?.count)) ? Number(backupState.count) : null);
+        const displayedUsage = backupCount === 0 && usage < EMPTY_REPOSITORY_DISPLAY_THRESHOLD_BYTES
+            ? 0
+            : usage;
+        const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
+        const limitBytes = limitGB * 1024 * 1024 * 1024;
+        const pct = limitBytes > 0 ? Math.min(100, (displayedUsage / limitBytes) * 100) : 0;
+        const storageValue = document.getElementById('usage-storage');
+        storageValue.textContent = `${formatBytes(displayedUsage)} of ${formatBytes(limitBytes)}`;
+        storageValue.title = `${displayedUsage.toLocaleString()} of ${limitBytes.toLocaleString()} bytes`;
+        document.getElementById('usage-storage-meta').textContent =
+            `${displayedUsage.toLocaleString()} bytes currently stored`;
+        document.getElementById('storage-fill').style.width = `${pct}%`;
+        document.getElementById('storage-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
+
+        const uploadUsed = Math.max(0, Math.trunc(Number(account.ingress?.used || 0)));
+        const uploadValue = document.getElementById('usage-upload');
+        uploadValue.textContent = formatBytes(uploadUsed);
+        uploadValue.title = `${uploadUsed.toLocaleString()} source bytes backed up this month`;
+        document.getElementById('usage-upload-meta').textContent =
+            `This month · ${uploadUsed.toLocaleString()} source bytes · free`;
+
+        const restoreUsed = Math.max(0, Math.trunc(Number(account.egress?.used || 0)));
+        const restoreAllowance = Math.max(0, Math.trunc(Number(account.egress?.allowance || 0)));
+        const restoreValue = document.getElementById('usage-restore');
+        restoreValue.textContent = restoreAllowance > 0
+            ? `${formatBytes(restoreUsed)} of ${formatBytes(restoreAllowance)}`
+            : formatBytes(restoreUsed);
+        restoreValue.title = `${restoreUsed.toLocaleString()} of ${restoreAllowance.toLocaleString()} bytes`;
+
+        const restoreMeta = document.getElementById('usage-restore-meta');
+        if (account.egress?.paidOverageEnabled) {
+            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage US$${account.egress.overageUsdPerGB || '0.0205'}/GB`;
+        } else {
+            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · paid overage off`;
+        }
+
+        const inferredCleanup = backupCount === 0 && usage >= 1024 * 1024;
+        setStorageCleanupState(storageCleanupPending || inferredCleanup);
+        if (inferredCleanup) {
+            invoke('cmd_schedule_storage_cleanup').catch((error) => {
+                console.warn('Could not schedule storage cleanup:', error);
+            });
+        }
+
+        // Subscription status
+        const subCard = document.getElementById('sub-status-card');
+        const status = account.status || 'active';
+        const statusText = document.getElementById('sub-status-text');
+        const renewsText = document.getElementById('sub-renews-text');
+        const resumeBtn = document.getElementById('btn-resume-sub');
+
+        subCard.classList.remove('hidden');
+        statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+        statusText.className = 'sub-status-value status-' + status;
+
+        if (account.currentPeriodEnd || account.current_period_end) {
+            const end = account.currentPeriodEnd || account.current_period_end;
+            const endDate = new Date(end * 1000 || end);
+            renewsText.textContent = status === 'cancelling'
+                ? `Ends ${endDate.toLocaleDateString()}`
+                : `${endDate.toLocaleDateString()}`;
+        } else if (account.trialEndsAt || account.trial_ends_at) {
+            const trial = account.trialEndsAt || account.trial_ends_at;
+            const trialDate = new Date(trial);
+            renewsText.textContent = `Trial ends ${trialDate.toLocaleDateString()}`;
+        } else {
+            renewsText.textContent = '—';
+        }
+
+        // Show resume button only when cancelling
+        if (status === 'cancelling') {
+            resumeBtn.classList.remove('hidden');
+        } else {
+            resumeBtn.classList.add('hidden');
+        }
+    } catch (e) {
+        console.error('loadDashboard error:', e);
+        if (String(e).includes('401') || String(e).includes('Unauthorized') || String(e).includes('Not authenticated')) {
+            showView('login');
+        } else {
+            showToast('Failed to load account: ' + String(e), 'error');
+        }
+    }
+}
+
+function setStorageCleanupState(pending, message = 'Cleanup pending') {
+    const state = document.getElementById('cleanup-state');
+    const text = document.getElementById('cleanup-state-text');
+    if (!state || !text) return;
+    state.classList.toggle('hidden', !pending);
+    text.textContent = pending ? (message || 'Cleanup pending') : '';
+}
+
+// ────────────────────────────────────────────────────────────────
+// Backup helpers
+// ────────────────────────────────────────────────────────────────
+function startBackupMode() {
+    document.querySelector('.backup-options')?.classList.add('hidden');
+    document.getElementById('backup-progress-area')?.classList.remove('hidden');
+    const fill = document.getElementById('backup-progress-fill');
+    if (fill) fill.style.width = '0%';
+    const msg = document.getElementById('backup-progress-msg');
+    if (msg) msg.textContent = 'Starting…';
+}
+
+function hideGlobalProgress() {
+    if (globalProgressHideTimer) {
+        clearTimeout(globalProgressHideTimer);
+        globalProgressHideTimer = null;
+    }
+    document.getElementById('global-progress-bar')?.classList.add('hidden');
+}
+
+function failBackupUi(error) {
+    if (pendingBackupErrorToast) {
+        clearTimeout(pendingBackupErrorToast);
+        pendingBackupErrorToast = null;
+    }
+    hideGlobalProgress();
+    resetBackupMode();
+    document.querySelectorAll('.profile-progress').forEach((element) => element.classList.add('hidden'));
+    document.querySelectorAll('.profile-actions .btn-primary').forEach((button) => {
+        button.disabled = false;
+        button.textContent = '▶ Run Now';
+    });
+    handleRepositoryError(error);
+}
+
+function resetBackupMode() {
+    document.querySelector('.backup-options')?.classList.remove('hidden');
+    document.getElementById('backup-progress-area')?.classList.add('hidden');
+}
+
+// ────────────────────────────────────────────────────────────────
+// Backups List
+// ────────────────────────────────────────────────────────────────
+async function loadBackups() {
+    const tbody = document.getElementById('backups-tbody');
+    const folderGrid = document.getElementById('folder-grid');
+    if (!tbody) return;
+
+    try {
+        const data = await invoke('cmd_list_backups');
+        const allBackups = data.backups || [];
+
+        // Try loading folders
+        let folders = [];
+        try {
+            const folderData = await invoke('cmd_list_folders');
+            folders = folderData.folders || folderData || [];
+        } catch {
+            // cmd_list_folders may not exist yet - that's OK
+        }
+
+        // Store folder list globally for move/profile dropdowns
+        folderList = folders;
+        updateFolderDropdowns();
+
+        // Determine subfolders of currentFolder
+        const subfolders = [];
+        const seenFolders = new Set();
+
+        folders.forEach(f => {
+            const fPath = typeof f === 'string' ? f : f.path;
+            if (!fPath) return;
+            const normalized = fPath.startsWith('/') ? fPath : '/' + fPath;
+            const parts = normalized.split('/').filter(Boolean);
+            const currentParts = currentFolder === '/' ? [] : currentFolder.split('/').filter(Boolean);
+
+            if (parts.length > currentParts.length) {
+                const isChild = currentParts.every((p, i) => parts[i] === p);
+                if (isChild) {
+                    const childName = parts[currentParts.length];
+                    if (!seenFolders.has(childName)) {
+                        seenFolders.add(childName);
+                        const childPath = '/' + [...currentParts, childName].join('/');
+                        const itemCount = allBackups.filter(b => {
+                            const bFolder = b.folder || '/';
+                            return bFolder === childPath || bFolder.startsWith(childPath + '/');
+                        }).length;
+                        subfolders.push({ name: childName, path: childPath, itemCount });
+                    }
+                }
+            }
+        });
+
+        // Also check backups for implicit folders
+        allBackups.forEach(b => {
+            const bFolder = b.folder || '/';
+            const normalized = bFolder.startsWith('/') ? bFolder : '/' + bFolder;
+            const parts = normalized.split('/').filter(Boolean);
+            const currentParts = currentFolder === '/' ? [] : currentFolder.split('/').filter(Boolean);
+
+            if (parts.length > currentParts.length) {
+                const isChild = currentParts.every((p, i) => parts[i] === p);
+                if (isChild) {
+                    const childName = parts[currentParts.length];
+                    if (!seenFolders.has(childName)) {
+                        seenFolders.add(childName);
+                        const childPath = '/' + [...currentParts, childName].join('/');
+                        const itemCount = allBackups.filter(b2 => {
+                            const f2 = b2.folder || '/';
+                            return f2 === childPath || f2.startsWith(childPath + '/');
+                        }).length;
+                        subfolders.push({ name: childName, path: childPath, itemCount });
+                    }
+                }
+            }
+        });
+
+        // Render breadcrumb
+        renderBackupsBreadcrumb();
+
+        // Render folder grid
+        folderGrid.innerHTML = '';
+        subfolders.forEach(sf => {
+            const card = document.createElement('div');
+            card.className = 'folder-card';
+            card.innerHTML = `
+                <span class="folder-card-icon">📁</span>
+                <div class="folder-card-name" title="${escapeHtml(sf.name)}">${escapeHtml(sf.name)}</div>
+                <div class="folder-card-count">${sf.itemCount} item${sf.itemCount !== 1 ? 's' : ''}</div>
+            `;
+            card.addEventListener('click', (e) => {
+                if (e.target.closest('.folder-card-delete')) return;
+                navigateToFolder(sf.path);
+            });
+
+            // Delete folder button
+            const delBtn = document.createElement('button');
+            delBtn.className = 'folder-card-delete';
+            delBtn.textContent = '✕';
+            delBtn.title = 'Delete folder';
+            delBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const confirmed = await confirmDialog(
+                    `Delete the empty folder "${sf.name}"? Backups are never deleted with a folder.`,
+                    { title: 'Delete empty folder', kind: 'warning' },
+                );
+                if (!confirmed) return;
+                try {
+                    await invoke('cmd_delete_folder', { name: sf.path });
+                    showToast(`Folder "${sf.name}" deleted`, 'success');
+                    loadBackups();
+                } catch (err) {
+                    showToast('Failed to delete folder: ' + String(err), 'error');
+                }
+            });
+            card.appendChild(delBtn);
+            folderGrid.appendChild(card);
+        });
+
+        // Filter backups for current folder only (not subfolders)
+        const currentBackups = allBackups.filter(b => {
+            const bFolder = b.folder || '/';
+            return bFolder === currentFolder;
+        });
+
+        // Render backup table
+        tbody.innerHTML = '';
+        if (currentBackups.length === 0 && subfolders.length === 0) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 4;
+            td.className = 'text-muted text-center';
+            td.textContent = currentFolder === '/' ? 'No backups yet' : 'This folder is empty';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            return;
+        }
+
+        if (currentBackups.length === 0) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 4;
+            td.className = 'text-muted text-center';
+            td.textContent = 'No files in this folder';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            return;
+        }
+
+        currentBackups.forEach(b => {
+            const tr = document.createElement('tr');
+            const tdName = document.createElement('td');
+            tdName.textContent = b.filename;
+            const tdSize = document.createElement('td');
+            tdSize.textContent = b.sizeFormatted;
+            const tdDate = document.createElement('td');
+            tdDate.textContent = new Date(b.lastModified).toLocaleString();
+            const tdActions = document.createElement('td');
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'context-actions';
+
+            // Restore button
+            const restoreBtn = document.createElement('button');
+            restoreBtn.className = 'btn btn-primary btn-sm btn-icon';
+            restoreBtn.textContent = '↗';
+            restoreBtn.title = 'Restore backup';
+            restoreBtn.addEventListener('click', () => openRestoreModal(b.key, b.filename));
+
+            // Move button
+            const moveBtn = document.createElement('button');
+            moveBtn.className = 'btn btn-ghost btn-sm btn-icon';
+            moveBtn.textContent = '→';
+            moveBtn.title = 'Move to folder';
+            moveBtn.addEventListener('click', () => openMoveModal(b.key, b.filename));
+
+            // Delete button
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger btn-sm btn-icon';
+            deleteBtn.textContent = '🗑';
+            deleteBtn.title = 'Delete backup';
+            deleteBtn.addEventListener('click', async () => {
+                const confirmed = await confirmDialog(
+                    'Delete this backup permanently?',
+                    { title: 'Delete backup', kind: 'warning' },
+                );
+                if (confirmed) {
+                    try {
+                        deleteBtn.disabled = true;
+                        tr.remove();
+                        showToast('Deleting backup…', 'info');
+                        await invoke('cmd_delete_backup', { key: b.key });
+                        showToast('Backup deleted. Storage cleanup queued.', 'success');
+                        void loadBackups();
+                    } catch (err) {
+                        showToast(String(err), 'error');
+                        if (!tr.isConnected) {
+                            await loadBackups();
+                        } else {
+                            deleteBtn.disabled = false;
+                        }
+                    }
+                }
+            });
+
+            actionsDiv.appendChild(restoreBtn);
+            actionsDiv.appendChild(moveBtn);
+            actionsDiv.appendChild(deleteBtn);
+            tdActions.appendChild(actionsDiv);
+
+            tr.appendChild(tdName);
+            tr.appendChild(tdSize);
+            tr.appendChild(tdDate);
+            tr.appendChild(tdActions);
+            tbody.appendChild(tr);
+        });
+    } catch (e) {
+        tbody.innerHTML = '';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.className = 'text-muted text-center';
+        td.textContent = friendlyError(e);
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        handleRepositoryError(e);
+    }
+}
+
+function renderBackupsBreadcrumb() {
+    const container = document.getElementById('backups-breadcrumb');
+    container.innerHTML = '';
+
+    const parts = currentFolder === '/' ? [] : currentFolder.split('/').filter(Boolean);
+
+    // Root segment
+    const rootSeg = document.createElement('span');
+    rootSeg.className = 'breadcrumb-segment' + (parts.length === 0 ? ' active' : '');
+    rootSeg.textContent = '📂 / (root)';
+    rootSeg.dataset.path = '/';
+    rootSeg.addEventListener('click', () => navigateToFolder('/'));
+    container.appendChild(rootSeg);
+
+    // Path segments
+    parts.forEach((part, i) => {
+        const sep = document.createElement('span');
+        sep.className = 'breadcrumb-separator';
+        sep.textContent = '›';
+        container.appendChild(sep);
+
+        const seg = document.createElement('span');
+        const segPath = '/' + parts.slice(0, i + 1).join('/');
+        seg.className = 'breadcrumb-segment' + (i === parts.length - 1 ? ' active' : '');
+        seg.textContent = '📂 ' + part;
+        seg.dataset.path = segPath;
+        seg.addEventListener('click', () => navigateToFolder(segPath));
+        container.appendChild(seg);
+    });
+}
+
+function navigateToFolder(path) {
+    currentFolder = path;
+    loadBackups();
+}
+
+function openMoveModal(key, filename) {
+    const modal = document.getElementById('move-backup-modal');
+    modal.dataset.backupKey = key;
+    document.getElementById('move-backup-filename').textContent = `Moving: ${filename}`;
+
+    // Populate folder dropdown
+    const select = document.getElementById('move-dest-folder');
+    select.innerHTML = '<option value="/">/ (Root)</option>';
+    folderList.forEach(f => {
+        const fPath = typeof f === 'string' ? f : f.path;
+        if (fPath && fPath !== currentFolder) {
+            const opt = document.createElement('option');
+            opt.value = fPath;
+            opt.textContent = fPath;
+            select.appendChild(opt);
+        }
+    });
+
+    modal.classList.remove('hidden');
+}
+
+function updateFolderDropdowns() {
+    // Update the profile modal folder dropdown
+    const profileSelect = document.getElementById('profile-folder');
+    if (profileSelect) {
+        const currentVal = profileSelect.value;
+        profileSelect.innerHTML = '<option value="/">/ (Root)</option>';
+        folderList.forEach(f => {
+            const fPath = typeof f === 'string' ? f : f.path;
+            if (fPath) {
+                const opt = document.createElement('option');
+                opt.value = fPath;
+                opt.textContent = fPath;
+                profileSelect.appendChild(opt);
+            }
+        });
+        if (currentVal) profileSelect.value = currentVal;
+    }
+
+    // Update the quick backup folder dropdown
+    const quickSelect = document.getElementById('quick-backup-folder');
+    if (quickSelect) {
+        const currentVal = quickSelect.value;
+        quickSelect.innerHTML = '<option value="/">/ (Root)</option>';
+        folderList.forEach(f => {
+            const fPath = typeof f === 'string' ? f : f.path;
+            if (fPath) {
+                const opt = document.createElement('option');
+                opt.value = fPath;
+                opt.textContent = fPath;
+                quickSelect.appendChild(opt);
+            }
+        });
+        if (currentVal) quickSelect.value = currentVal;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Restore Modal (simplified — no passphrase)
+// ────────────────────────────────────────────────────────────────
+function openRestoreModal(key, filename) {
+    restoreTarget = { key, filename };
+    restoreInProgress = false;
+    restoreCancelRequested = false;
+    document.getElementById('restore-dest').value = '';
+    document.getElementById('restore-progress-wrap').classList.add('hidden');
+    document.getElementById('restore-progress-msg').classList.add('hidden');
+    document.getElementById('restore-modal').classList.remove('hidden');
+}
+
+function resetRestoreModal() {
+    document.getElementById('restore-modal').classList.add('hidden');
+    restoreInProgress = false;
+    restoreCancelRequested = false;
+    const cancelBtn = document.getElementById('btn-cancel-restore');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.disabled = false;
+    document.getElementById('btn-confirm-restore').disabled = false;
+    document.getElementById('btn-pick-restore-dest').disabled = false;
+    document.getElementById('restore-progress-wrap').classList.add('hidden');
+    document.getElementById('restore-progress-msg').classList.add('hidden');
+    restoreTarget = null;
+}
+
+// ────────────────────────────────────────────────────────────────
+// File Explorer
+// ────────────────────────────────────────────────────────────────
+async function openFileExplorer(key, filename) {
+    explorerTarget = { key, filename };
+    selectedExplorerFiles = new Set();
+    updateSelectedCount();
+
+    const container = document.getElementById('file-tree-container');
+    container.innerHTML = '<div class="empty-state"><p class="text-muted">Loading file tree…</p></div>';
+    document.getElementById('file-explorer-modal').classList.remove('hidden');
+
+    try {
+        const manifest = await invoke('cmd_get_backup_manifest', { key });
+        explorerManifest = manifest;
+        const files = manifest.files || [];
+        if (files.length === 0) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <p style="font-size: 2.5rem; margin-bottom: 1rem;">📦</p>
+                    <p class="text-muted">File browsing is unsupported for deduplicated backups.</p>
+                    <p class="text-muted text-sm" style="margin-top: 0.5rem;">Please click <strong>Restore All</strong> to restore your files.</p>
+                </div>
+            `;
+        } else if (files.length === 1 && !files[0].path.includes('/') && !files[0].path.includes('\\')) {
+            // Single file backup - show simple info
+            const f = files[0];
+            container.innerHTML = `
+                <div class="empty-state">
+                    <p style="font-size: 2rem; margin-bottom: 0.5rem;">📄</p>
+                    <p><strong>${escapeHtml(f.path)}</strong></p>
+                    <p class="text-muted text-sm">${formatBytes(f.size)}</p>
+                </div>
+            `;
+        } else {
+            renderFileTree(files);
+        }
+    } catch (err) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <p style="font-size: 2.5rem; margin-bottom: 1rem;">📦</p>
+                <p class="text-muted">This backup was created before file browsing was available.</p>
+                <p class="text-muted text-sm" style="margin-top: 0.5rem;">You can still <strong>Restore All</strong> to download and decrypt the entire backup.</p>
+            </div>
+        `;
+    }
+}
+
+function closeFileExplorer() {
+    document.getElementById('file-explorer-modal').classList.add('hidden');
+    explorerTarget = null;
+    explorerManifest = null;
+    selectedExplorerFiles = new Set();
+}
+
+function renderFileTree(files) {
+    const container = document.getElementById('file-tree-container');
+    if (!files || files.length === 0) {
+        container.innerHTML = '<div class="empty-state"><p class="text-muted">No files in this backup.</p></div>';
+        return;
+    }
+
+    // Build tree structure from flat paths
+    const root = {};
+    files.forEach(f => {
+        const parts = f.path.replace(/\\/g, '/').split('/');
+        let current = root;
+        parts.forEach((part, i) => {
+            if (!current[part]) {
+                current[part] = i === parts.length - 1
+                    ? { __file: true, __data: f }
+                    : {};
+            }
+            current = current[part];
+        });
+    });
+
+    container.innerHTML = '';
+    const ul = buildTreeUl(root, '');
+    container.appendChild(ul);
+}
+
+function buildTreeUl(node, prefix) {
+    const ul = document.createElement('ul');
+    ul.className = 'file-tree';
+
+    const entries = Object.entries(node).filter(([k]) => !k.startsWith('__'));
+    // Sort: folders first, then files
+    entries.sort(([aKey, aVal], [bKey, bVal]) => {
+        const aIsFile = aVal.__file;
+        const bIsFile = bVal.__file;
+        if (aIsFile && !bIsFile) return 1;
+        if (!aIsFile && bIsFile) return -1;
+        return aKey.localeCompare(bKey);
+    });
+
+    entries.forEach(([name, value]) => {
+        const li = document.createElement('li');
+        li.className = 'file-tree-item';
+
+        const fullPath = prefix ? `${prefix}/${name}` : name;
+
+        if (value.__file) {
+            // File
+            const label = document.createElement('label');
+            label.className = 'file-entry';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.dataset.path = fullPath;
+            cb.addEventListener('change', () => {
+                if (cb.checked) selectedExplorerFiles.add(fullPath);
+                else selectedExplorerFiles.delete(fullPath);
+                updateSelectedCount();
+            });
+            const icon = document.createElement('span');
+            icon.className = 'file-icon';
+            icon.textContent = '📄';
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'file-name';
+            nameSpan.textContent = name;
+            const sizeSpan = document.createElement('span');
+            sizeSpan.className = 'file-size';
+            sizeSpan.textContent = formatBytes(value.__data.size);
+
+            label.appendChild(cb);
+            label.appendChild(icon);
+            label.appendChild(nameSpan);
+            label.appendChild(sizeSpan);
+            li.appendChild(label);
+        } else {
+            // Folder
+            const header = document.createElement('div');
+            header.className = 'folder-header';
+            const chevron = document.createElement('span');
+            chevron.className = 'folder-chevron';
+            chevron.textContent = '▶';
+            const icon = document.createElement('span');
+            icon.className = 'folder-icon';
+            icon.textContent = '📁';
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'folder-name';
+            nameSpan.textContent = name;
+
+            header.appendChild(chevron);
+            header.appendChild(icon);
+            header.appendChild(nameSpan);
+            li.appendChild(header);
+
+            const childUl = buildTreeUl(value, fullPath);
+            childUl.classList.add('collapsed');
+            li.appendChild(childUl);
+
+            header.addEventListener('click', () => {
+                childUl.classList.toggle('collapsed');
+                chevron.textContent = childUl.classList.contains('collapsed') ? '▶' : '▼';
+            });
+        }
+
+        ul.appendChild(li);
+    });
+
+    return ul;
+}
+
+function updateSelectedCount() {
+    const btn = document.getElementById('btn-restore-selected');
+    const count = selectedExplorerFiles.size;
+    btn.textContent = `Restore Selected (${count})`;
+    btn.disabled = count === 0;
+}
+
+function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ────────────────────────────────────────────────────────────────
+// Profiles
+// ────────────────────────────────────────────────────────────────
+async function loadProfiles() {
+    const container = document.getElementById('profiles-list');
+    try {
+        const [profiles, unownedCount, authStatus] = await Promise.all([
+            invoke('cmd_list_profiles'),
+            invoke('cmd_count_unowned_profiles'),
+            invoke('cmd_get_auth_status'),
+        ]);
+        container.innerHTML = '';
+
+        if (Number(unownedCount) > 0) {
+            const migrationCard = document.createElement('div');
+            migrationCard.className = 'profile-card glass-card';
+            migrationCard.innerHTML = `
+                <div class="profile-card-header">
+                    <h3 class="profile-name">Existing profiles need an owner</h3>
+                    <span class="badge badge-neutral">Paused</span>
+                </div>
+                <p class="text-muted">
+                    ${Number(unownedCount)} profile${Number(unownedCount) === 1 ? '' : 's'} from an earlier SaveState version are hidden and cannot run until you assign them to the correct account.
+                    If these are not yours, sign out and use the account that created them.
+                </p>
+                <div class="profile-actions"></div>
+            `;
+            const claimButton = document.createElement('button');
+            claimButton.className = 'btn btn-primary btn-sm';
+            claimButton.textContent = 'Assign to this account';
+            claimButton.addEventListener('click', async () => {
+                const accountEmail = authStatus?.email || currentAccount?.email || 'this account';
+                const confirmed = await confirmDialog(
+                    `Assign all ${Number(unownedCount)} existing profile${Number(unownedCount) === 1 ? '' : 's'} on this Windows user to ${accountEmail}? Their schedules may become active immediately. Only continue if they belong to this account.`,
+                    { title: 'Assign existing profiles', kind: 'warning' },
+                );
+                if (!confirmed) return;
+                try {
+                    const claimed = await invoke('cmd_claim_unowned_profiles');
+                    showToast(`${claimed} profile${Number(claimed) === 1 ? '' : 's'} assigned to ${accountEmail}`, 'success');
+                    loadProfiles();
+                } catch (err) {
+                    showToast(String(err), 'error');
+                }
+            });
+            migrationCard.querySelector('.profile-actions').appendChild(claimButton);
+            container.appendChild(migrationCard);
+        }
+
+        if (!profiles || profiles.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-state glass-card';
+            empty.innerHTML = '<p class="text-muted">No backup profiles assigned to this account yet.</p>';
+            container.appendChild(empty);
+            return;
+        }
+
+        profiles.forEach(p => {
+            const card = document.createElement('div');
+            card.className = 'profile-card glass-card';
+            card.setAttribute('data-profile-id', p.id);
+
+            let scheduleLabel = 'Manual';
+            if (p.schedule) {
+                try {
+                    const sched = JSON.parse(p.schedule);
+                    const intervalDays = Number(sched.intervalDays || 0);
+                    if (intervalDays > 0 && Array.isArray(sched.times) && sched.times.length > 0) {
+                        const timesStr = sched.times.join(', ');
+                        const daysStr = intervalDays === 1 ? 'Daily' : `Every ${intervalDays} days`;
+                        scheduleLabel = `${timesStr} local - ${daysStr}`;
+                    }
+                } catch {
+                    // Legacy format fallback
+                    scheduleLabel = { hourly: 'Every hour', every_6h: 'Every 6h', daily: 'Daily', weekly: 'Weekly' }[p.schedule] || p.schedule;
+                }
+            }
+
+            const effectiveNextRun = p.schedule_state === 'retrying' && p.retry_at ? p.retry_at : p.next_run;
+            const nextRunLabel = effectiveNextRun ? formatLocalAndUtc(effectiveNextRun) : 'Manual only';
+
+            card.innerHTML = `
+                <div class="profile-card-header">
+                    <h3 class="profile-name">${escapeHtml(p.name)}</h3>
+                    <span class="badge ${p.enabled ? 'badge-success' : 'badge-neutral'}">${p.enabled ? 'Active' : 'Paused'}</span>
+                </div>
+                <div class="profile-meta">
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Source</span>
+                        <span class="meta-value" title="${escapeHtml(p.source_path)}">${escapeHtml(shortenPath(p.source_path))}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Schedule</span>
+                        <span class="meta-value" title="${escapeHtml(scheduleLabel)}">${escapeHtml(scheduleLabel)}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Retention</span>
+                        <span class="meta-value">${p.retention > 0 ? `Last ${p.retention}` : 'Unlimited'}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Folder</span>
+                        <span class="meta-value" title="${escapeHtml(p.folder || '/')}">${escapeHtml(p.folder || '/ (Root)')}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Last Run</span>
+                        <span class="meta-value">${p.last_run ? new Date(p.last_run).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : 'Never'}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">${p.schedule_state === 'retrying' ? 'Retry' : 'Next Run'}</span>
+                        <span class="meta-value" title="${escapeHtml(nextRunLabel)}">${escapeHtml(nextRunLabel)}</span>
+                    </div>
+                </div>
+                <div class="profile-progress hidden">
+                    <div class="profile-progress-info">
+                        <span class="profile-progress-msg text-sm">Starting…</span>
+                        <span class="profile-progress-pct text-sm font-bold">0%</span>
+                    </div>
+                    <div class="progress-bar" style="height: 4px;">
+                        <div class="progress-bar-fill profile-progress-fill" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="profile-actions"></div>
+            `;
+
+            const actions = card.querySelector('.profile-actions');
+
+            const runBtn = document.createElement('button');
+            runBtn.className = 'btn btn-primary btn-sm';
+            runBtn.textContent = '▶ Run Now';
+            runBtn.addEventListener('click', () => {
+                runBtn.disabled = true;
+                runBtn.textContent = 'Running…';
+                // Show inline progress bar on this card
+                const progressWrap = card.querySelector('.profile-progress');
+                if (progressWrap) progressWrap.classList.remove('hidden');
+
+                showToast(`Backup started for "${p.name}"`, 'success');
+
+                // Fire-and-forget — don't await
+                invoke('cmd_run_profile_backup', { profileId: p.id })
+                    .then(() => {
+                        // Backup finished — progress events already handle UI
+                    })
+                    .catch(err => {
+                        failBackupUi(err);
+                    });
+            });
+
+            const editBtn = document.createElement('button');
+            editBtn.className = 'btn btn-ghost btn-sm';
+            editBtn.textContent = '✏️ Edit';
+            editBtn.addEventListener('click', () => openProfileModal(p));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger btn-sm';
+            deleteBtn.textContent = '🗑️ Delete';
+            deleteBtn.addEventListener('click', async () => {
+                const confirmed = await confirmDialog(
+                    `Delete profile "${p.name}"?`,
+                    { title: 'Delete backup profile', kind: 'warning' },
+                );
+                if (!confirmed) return;
+                try {
+                    await invoke('cmd_delete_profile', { id: p.id });
+                    showToast('Profile deleted', 'success');
+                    loadProfiles();
+                } catch (err) {
+                    showToast(String(err), 'error');
+                }
+            });
+
+            actions.appendChild(runBtn);
+            actions.appendChild(editBtn);
+            actions.appendChild(deleteBtn);
+            container.appendChild(card);
+        });
+    } catch (err) {
+        container.innerHTML = `<div class="empty-state glass-card"><p class="text-muted">Error loading profiles: ${escapeHtml(String(err))}</p></div>`;
+    }
+}
+
+function openProfileModal(profile = null) {
+    const modal = document.getElementById('profile-modal');
+    const title = document.getElementById('profile-modal-title');
+    const form = document.getElementById('profile-form');
+
+    if (profile) {
+        title.textContent = 'Edit Backup Profile';
+        document.getElementById('profile-edit-id').value = profile.id;
+        document.getElementById('profile-name').value = profile.name;
+        document.getElementById('profile-source').value = profile.source_path;
+        // Parse schedule
+        if (profile.schedule) {
+            try {
+                const sched = JSON.parse(profile.schedule);
+                document.getElementById('profile-schedule-times').value = (sched.times || []).join(', ');
+                document.getElementById('profile-schedule-interval').value = sched.intervalDays || 0;
+            } catch {
+                // Legacy format
+                document.getElementById('profile-schedule-times').value = '';
+                document.getElementById('profile-schedule-interval').value = 1;
+            }
+        } else {
+            document.getElementById('profile-schedule-times').value = '';
+            document.getElementById('profile-schedule-interval').value = 1;
+        }
+        document.getElementById('profile-retention').value = profile.retention || 0;
+        if (document.getElementById('profile-folder')) {
+            document.getElementById('profile-folder').value = profile.folder || '/';
+        }
+    } else {
+        title.textContent = 'Create Backup Profile';
+        form.reset();
+        document.getElementById('profile-edit-id').value = '';
+        document.getElementById('profile-schedule-interval').value = 1;
+        if (document.getElementById('profile-folder')) {
+            document.getElementById('profile-folder').value = '/';
+        }
+    }
+
+    modal.classList.remove('hidden');
+    updateScheduleTimePreview();
+}
+
+function updateScheduleTimePreview() {
+    const intervalInput = document.getElementById('profile-schedule-interval');
+    const timesInput = document.getElementById('profile-schedule-times');
+    const help = document.getElementById('profile-schedule-time-help');
+    if (!intervalInput || !timesInput || !help) return;
+
+    const rawTimes = timesInput.value.split(',').map(value => value.trim()).filter(Boolean);
+    if (rawTimes.length === 0) {
+        help.textContent = 'Leave blank for a manual-only profile. UTC equivalents appear here after you enter a time.';
+        return;
+    }
+
+    const validTime = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    if (rawTimes.some(value => !validTime.test(value))) {
+        help.textContent = 'Use 24-hour HH:MM values separated by commas.';
+        return;
+    }
+
+    const intervalDays = Math.max(1, Math.min(365, Math.trunc(Number(intervalInput.value || 1))));
+    const now = new Date();
+    const nextCandidates = rawTimes.map(value => {
+        const [hour, minute] = value.split(':').map(Number);
+        const localMidnight = new Date(now);
+        localMidnight.setHours(0, 0, 0, 0);
+        for (let occurrence = 0; occurrence <= 8; occurrence += 1) {
+            const candidate = new Date(localMidnight);
+            candidate.setDate(candidate.getDate() + (occurrence * intervalDays));
+            candidate.setHours(hour, minute, 0, 0);
+            // JavaScript normalizes a nonexistent spring-DST time (for
+            // example 02:30) to a different wall-clock time. Skip that date,
+            // matching the Rust scheduler instead of promising a false 03:30.
+            if (candidate.getHours() !== hour || candidate.getMinutes() !== minute) continue;
+            if (candidate > now) return candidate;
+        }
+        return null;
+    }).filter(Boolean);
+    if (nextCandidates.length === 0) {
+        help.textContent = 'No valid local occurrence was found for these times.';
+        return;
+    }
+    const next = new Date(Math.min(...nextCandidates.map(value => value.getTime())));
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'machine local time';
+    const local = next.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    const utc = next.toLocaleString(undefined, {
+        timeZone: 'UTC',
+        dateStyle: 'medium',
+        timeStyle: 'short',
+    });
+    help.textContent = `Input uses ${zone}. Next occurrence: ${local} local / ${utc} UTC.`;
+}
+
+document.getElementById('profile-schedule-times')?.addEventListener('input', updateScheduleTimePreview);
+document.getElementById('profile-schedule-interval')?.addEventListener('input', updateScheduleTimePreview);
+
+function formatLocalAndUtc(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'Unknown';
+    const local = date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    const utc = date.toLocaleString(undefined, {
+        timeZone: 'UTC',
+        dateStyle: 'medium',
+        timeStyle: 'short',
+    });
+    return `${local} local / ${utc} UTC`;
+}
+
+function shortenPath(path) {
+    if (!path) return '';
+    if (path.length <= 40) return path;
+    const parts = path.replace(/\\/g, '/').split('/');
+    if (parts.length <= 3) return path;
+    return parts[0] + '/…/' + parts.slice(-2).join('/');
+}
+
+// ────────────────────────────────────────────────────────────────
+// Settings — Notifications
+// ────────────────────────────────────────────────────────────────
+async function loadSettings() {
+    try {
+        const settings = await invoke('cmd_get_settings');
+        document.getElementById('settings-webhook-url').value = settings.discordWebhookUrl || '';
+        document.getElementById('settings-channel-id').value = settings.discordChannelId || '';
+
+        const prefs = settings.notificationPrefs || {};
+        document.getElementById('pref-backup-success').checked = (prefs.backupSuccess ?? prefs.backup_success) !== false;
+        document.getElementById('pref-backup-failure').checked = (prefs.backupFailure ?? prefs.backup_failure) !== false;
+        document.getElementById('pref-restore-success').checked = (prefs.restoreSuccess ?? prefs.restore_success) !== false;
+        document.getElementById('pref-restore-failure').checked = (prefs.restoreFailure ?? prefs.restore_failure) !== false;
+        document.getElementById('pref-backup-scheduled').checked = (prefs.backupScheduled ?? prefs.backup_scheduled) !== false;
+    } catch {
+        // Settings may not exist yet — that's OK
+    }
+}
+
+function readNotificationSettings() {
+    return {
+        discordWebhookUrl: document.getElementById('settings-webhook-url').value.trim() || null,
+        discordChannelId: document.getElementById('settings-channel-id').value.trim() || null,
+        notificationPrefs: {
+            backupSuccess: document.getElementById('pref-backup-success').checked,
+            backupFailure: document.getElementById('pref-backup-failure').checked,
+            restoreSuccess: document.getElementById('pref-restore-success').checked,
+            restoreFailure: document.getElementById('pref-restore-failure').checked,
+            backupScheduled: document.getElementById('pref-backup-scheduled').checked,
+        },
+    };
+}
+
+async function saveSettings(showSuccess = true) {
+    try {
+        await invoke('cmd_save_settings', { settings: readNotificationSettings() });
+        if (showSuccess) showToast('Settings saved!', 'success');
+        return true;
+    } catch (err) {
+        showToast('Failed to save: ' + String(err), 'error');
+        return false;
+    }
+}
+
+async function testNotification() {
+    try {
+        // Test exactly what is currently visible in the form. This also makes
+        // the successful test destination the saved destination.
+        if (!await saveSettings(false)) return;
+        const result = await invoke('cmd_test_notification');
+        if (result && result.sent) {
+            const channels = (result.results || []).map(r => `${r.channel}: ${r.success ? 'OK' : 'FAILED'}`).join(', ');
+            showToast(`Test notification sent! (${channels})`, 'success');
+        } else if (result && !result.sent) {
+            const failures = (result.results || [])
+                .filter(channel => !channel.success)
+                .map(channel => `${channel.channel}: ${channel.error || 'delivery failed'}`)
+                .join(', ');
+            showToast(failures || result.reason || 'No notification destination is configured.', 'error');
+        } else {
+            showToast('Discord did not confirm notification delivery.', 'error');
+        }
+    } catch (err) {
+        showToast('Test failed: ' + String(err), 'error');
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Utilities
+// ────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+// Make navigateTo globally available for inline onclick handlers
+window.navigateTo = navigateTo;
+
+// ────────────────────────────────────────────────────────────────
+// Auto-Updater
+// ────────────────────────────────────────────────────────────────
+async function checkForUpdates() {
+    try {
+        const { check } = window.__TAURI__.updater;
+        const update = await check();
+        if (update) {
+            availableUpdateVersion = update.version;
+            await update.close();
+
+            if (dismissedUpdateVersion === availableUpdateVersion) return;
+
+            const banner = document.getElementById('update-banner');
+            const text = document.getElementById('update-banner-text');
+            text.textContent = `Version ${availableUpdateVersion} is ready to install`;
+            banner.classList.remove('hidden');
+            console.log('[Updater] New version available:', availableUpdateVersion);
+        } else {
+            console.log('[Updater] App is up to date.');
+        }
+    } catch (err) {
+        // Silently ignore update check failures — don't bother the user
+        console.warn('[Updater] Check failed:', err);
+    }
+}
+
+async function installUpdate() {
+    if (!availableUpdateVersion) return;
+
+    const btn = document.getElementById('btn-install-update');
+    const dismissBtn = document.getElementById('btn-dismiss-update');
+    const progressArea = document.getElementById('update-progress-area');
+    const progressFill = document.getElementById('update-progress-fill');
+    const progressPct = document.getElementById('update-progress-pct');
+    const bannerText = document.getElementById('update-banner-text');
+
+    btn.disabled = true;
+    btn.textContent = 'Downloading…';
+    dismissBtn.classList.add('hidden');
+    progressArea.classList.remove('hidden');
+
+    try {
+        bannerText.textContent = 'Checking that no backup or restore is running…';
+        await invoke('cmd_install_update');
+
+        // Windows exits when its installer starts. Relaunch platforms whose
+        // updater returns after installation.
+        const { relaunch } = window.__TAURI__.process;
+        await relaunch();
+    } catch (err) {
+        console.error('[Updater] Install failed:', err);
+        const message = String(err);
+        if (message.includes('UPDATE_BUSY:')) {
+            bannerText.textContent = 'A backup, restore, or cleanup is running. Update after it finishes.';
+            btn.textContent = 'Try Again';
+        } else {
+            bannerText.textContent = message;
+            btn.textContent = 'Retry';
+        }
+        btn.disabled = false;
+        dismissBtn.classList.remove('hidden');
+        progressArea.classList.add('hidden');
+        progressFill.style.width = '0%';
+        progressPct.textContent = '0%';
+    }
+}
