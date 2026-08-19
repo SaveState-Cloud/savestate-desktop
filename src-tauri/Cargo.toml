@@ -1,6 +1,6 @@
 [package]
 name = "savestate-app"
-version = "2.0.13"
+version = "2.0.14"
 edition = "2021"
 description = "SaveState Desktop — Encrypted Cloud Backup Agent"
 license = "GPL-3.0-only"
