@@ -10,16 +10,24 @@ The application communicates with `api.savestate.dk` over HTTPS to:
 
 - authenticate the account and maintain a session;
 - retrieve account, plan, usage, and backup metadata;
-- request short-lived, account-scoped storage credentials;
+- obtain an account-scoped encrypted-repository session;
 - report backup, restore, deletion, maintenance, and scheduled-job status;
 - synchronize privacy-limited schedule timing metadata;
 - manage folders, retention, notification settings, and subscription actions;
   and
 - check for application updates.
 
-Backup data is transferred directly to the storage endpoint authorized by the
-API. File contents are encrypted locally before upload. Restore operations
-download encrypted repository content before local decryption.
+File contents and repository metadata are encrypted on the user's device before
+upload. The current hosted service proxies that encrypted repository traffic
+through SaveState's ciphertext-only API gateway in the European Union to
+Backblaze B2 storage in the European Union. Restore operations follow the
+reverse route and are decrypted only on the user's device.
+
+The gateway authorizes the repository request and forwards encrypted objects;
+it does not receive the repository password, decrypted master key, or plaintext
+backup contents. As described in `SECURITY.md`, account authentication and key
+delivery still depend on the hosted SaveState API, so this is client-side
+encryption rather than a claim of strict zero-knowledge authentication.
 
 If a user configures Discord notifications, the destination is stored by the
 SaveState API and delivery is performed by the hosted service. The desktop
