@@ -173,22 +173,25 @@ repository.
    preparation. Deploy the API and exercise email, TOTP, recovery-code,
    session-revocation, envelope-initialize, and envelope-rotate paths against a
    disposable production test account.
-2. Merge and deploy website PR #11. Verify that a recovery bearer grant is read
-   only from the exact URL fragment and that the fragment is immediately
-   removed from browser history/state.
-3. Confirm the already-completed public source cutover (`savestate-desktop`
+2. Confirm the already-completed public source cutover (`savestate-desktop`
    merge `8d2743a`) still contains the exact reviewed runtime before releasing.
    Private PR #16 and public PR #9 are merged; private #14 and public dependency
    PRs #1-#7 are closed as superseded. Do not reopen or merge their old lockfile
    branches.
-4. Bump every desktop version field to the same next patch version. The first
+3. Bump every desktop version field to the same next patch version. The first
    authoritative public release should be `v2.0.15`; never overwrite or relabel
    existing `v2.0.14` assets.
-5. Create the stable `v2.0.15` tag on a commit contained in public `main`. Let
+4. Create the stable `v2.0.15` tag on a commit contained in public `main`. Let
    `.github/workflows/release.yml` build once and publish the exact same staged
    MSI/EXE bytes, updater signature, hashes, and provenance to the GitHub
    Release and immutable R2 version prefix. Verify read-back hashes and both
    updater/download manifests before announcing the release.
+5. Only after the compatible desktop release is available, merge and deploy
+   website PR #11 to expose account-reset controls broadly. Verify that a
+   recovery bearer grant is read only from the exact URL fragment and that the
+   fragment is immediately removed from browser history/state. This order
+   prevents users on an older desktop from resetting account login before their
+   client understands the separate vault-unlock and key-slot flow.
 
 The release workflow accepts only exact `vMAJOR.MINOR.PATCH` tags; prerelease or
 malformed tags do not participate in newest-stable selection.
