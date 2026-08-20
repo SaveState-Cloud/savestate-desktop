@@ -1,8 +1,8 @@
 use crate::db;
 use crate::state::AppStateWrapper;
 use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Nonce},
+    Aes256Gcm,
 };
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
@@ -41,10 +41,10 @@ pub fn encrypt_blob(data: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>> {
 
     let cipher =
         Aes256Gcm::new_from_slice(master_key).map_err(|e| anyhow!("Cipher init failed: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(&nonce, data)
         .map_err(|e| anyhow!("Encryption failed: {}", e))?;
 
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -73,10 +73,10 @@ pub fn encrypt_chunk_v2(
 
     let cipher =
         Aes256Gcm::new_from_slice(master_key).map_err(|e| anyhow!("Cipher init failed: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(&nonce, data)
         .map_err(|e| anyhow!("Encryption failed: {}", e))?;
 
     let mut output = Vec::new();
@@ -572,6 +572,7 @@ pub async fn cmd_backup_files(
             )
             .await
         }
+        Err(error) if error.to_string().contains("BACKUP_CANCELLED") => {}
         Err(_) => {
             crate::notifications::send_backup_notification(
                 &api,
@@ -622,6 +623,7 @@ pub async fn cmd_backup_folder(
             )
             .await
         }
+        Err(error) if error.to_string().contains("BACKUP_CANCELLED") => {}
         Err(_) => {
             crate::notifications::send_backup_notification(
                 &api,
@@ -713,6 +715,30 @@ pub async fn cmd_delete_folder(
         guard.api.clone()
     };
     api.delete_folder(&name).await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod crypto_compatibility_tests {
+    use super::encrypt_chunk_v2;
+
+    #[test]
+    fn aes_256_gcm_chunk_format_matches_the_standard_vector() {
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let plaintext = [0u8; 16];
+
+        let ciphertext = encrypt_chunk_v2(&plaintext, &nonce, 0, &key).unwrap();
+
+        // NIST AES-256-GCM vector: ciphertext followed by the 16-byte tag.
+        assert_eq!(
+            hex::encode(&ciphertext),
+            "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919"
+        );
+        assert_eq!(
+            crate::restore::decrypt_chunk_v2(&ciphertext, &nonce, 0, &key).unwrap(),
+            plaintext
+        );
+    }
 }
 
 #[tauri::command]

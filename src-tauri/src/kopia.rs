@@ -4,9 +4,9 @@
 // SaveState now acts as a UI + command wrapper around the Kopia backup
 // engine. Kopia gives us content-defined deduplication, zstd compression,
 // encrypted repositories, and policy-based retention natively. The agent
-// never holds long-lived storage credentials — it fetches short-lived,
-// prefix-scoped Backblaze B2 keys from the SaveState API (`/repo/session`)
-// for each operation.
+// never holds Backblaze provider credentials. For each operation it fetches
+// short-lived, account-scoped credentials for SaveState's ciphertext-only
+// repository gateway from `/repo/session`.
 //
 // Encryption stays user-controlled: the Kopia repository password is derived
 // from the per-user master key, so backup data is encrypted client-side
@@ -14,6 +14,7 @@
 // ────────────────────────────────────────────────────────────────────
 
 use crate::api::{EngineJobReporter, RepoSession, SaveStateClient};
+use crate::backup_operations::{self, AccountContext, BackupControl, BackupOperation};
 use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
@@ -30,14 +32,22 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, RwLockReadGuard, RwLockWriteGuard
 
 struct CachedBackupSession {
     session: RepoSession,
+    account_scope: String,
+    session_generation: u64,
     valid_until: Instant,
+}
+
+struct CachedRetention {
+    account_scope: String,
+    session_generation: u64,
+    keep_latest: u32,
 }
 
 static BACKUP_SESSION: OnceLock<Mutex<Option<CachedBackupSession>>> = OnceLock::new();
 static REPOSITORY_CONNECT_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 static CANCELLED_RESTORES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-static LAST_RETENTION: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+static LAST_RETENTION: OnceLock<Mutex<Option<CachedRetention>>> = OnceLock::new();
 static OPERATION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
 static CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
 static SESSION_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +69,7 @@ fn manifest_update_lock() -> &'static tokio::sync::Mutex<()> {
     MANIFEST_UPDATE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn last_retention() -> &'static Mutex<Option<u32>> {
+fn last_retention() -> &'static Mutex<Option<CachedRetention>> {
     LAST_RETENTION.get_or_init(|| Mutex::new(None))
 }
 
@@ -345,8 +355,8 @@ fn kopia_cache_dir(session: &RepoSession) -> PathBuf {
 // ────────────────────────────────────────────────────────────────────
 
 /// Run a kopia subcommand. `repo_password` is injected via `KOPIA_PASSWORD`
-/// and `session` (when present) supplies B2 credentials via the standard
-/// AWS env vars so secrets never appear in the process argument list.
+/// and `session` (when present) supplies repository-gateway credentials via
+/// standard AWS env vars so secrets never appear in the process argument list.
 fn build_kopia_command(
     app: &tauri::AppHandle,
     args: &[String],
@@ -403,6 +413,90 @@ fn run_kopia(
 
     cmd.output()
         .with_context(|| format!("Failed to execute kopia at {:?}", bin))
+}
+
+fn run_kopia_for_backup(
+    app: &tauri::AppHandle,
+    args: &[String],
+    repo_password: Option<&str>,
+    session: Option<&RepoSession>,
+    cancellation: Option<&Arc<BackupControl>>,
+) -> Result<Output> {
+    let Some(control) = cancellation else {
+        return run_kopia(app, args, repo_password, session);
+    };
+    if control.is_cancel_requested() {
+        return Err(backup_operations::cancelled_error());
+    }
+
+    let bin = kopia_binary(app);
+    let mut cmd = build_kopia_command(app, args, repo_password, session);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to execute kopia at {:?}", bin))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture kopia stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("Failed to capture kopia stderr")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.read_to_end(&mut output);
+        output
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stderr.read_to_end(&mut output);
+        output
+    });
+
+    let status = loop {
+        if control.is_cancel_requested() {
+            if let Err(error) = child.kill() {
+                if let Some(status) = child
+                    .try_wait()
+                    .context("Failed to re-check Kopia after cancellation")?
+                {
+                    break status;
+                }
+                let message = format!("Failed to stop Kopia process: {}", error);
+                control.record_cancellation_error(message.clone());
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(anyhow!("BACKUP_CANCEL_FAILED: {}", message));
+            }
+            let status = child
+                .wait()
+                .context("Failed to wait for stopped Kopia backup")?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!(
+                "BACKUP_CANCELLED: Kopia backup stopped (process status: {})",
+                status
+            ));
+        }
+        if let Some(status) = child.try_wait().context("Failed to poll Kopia backup")? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("Failed to collect kopia stdout"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("Failed to collect kopia stderr"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn run_kopia_cancellable(
@@ -513,15 +607,6 @@ fn classify_kopia_error(action: &str, stderr: &str) -> anyhow::Error {
 // Repository lifecycle
 // ────────────────────────────────────────────────────────────────────
 
-/// Derive the repository password from the master key (hex-encoded).
-fn repo_password_from_state(state: &AppStateWrapper) -> Result<String> {
-    let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
-    let key = guard
-        .master_key
-        .ok_or_else(|| anyhow!("Not authenticated"))?;
-    Ok(hex::encode(key))
-}
-
 fn api_from_state(state: &AppStateWrapper) -> Result<SaveStateClient> {
     let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
     Ok(guard.api.clone())
@@ -553,7 +638,21 @@ async fn ensure_repo(
     mode: &str,
     restore_grant_id: Option<&str>,
 ) -> Result<(RepoSession, String)> {
-    let password = repo_password_from_state(state)?;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
+    ensure_repo_with_context(app, &context, mode, restore_grant_id, None).await
+}
+
+async fn ensure_repo_with_context(
+    app: &tauri::AppHandle,
+    context: &AccountContext,
+    mode: &str,
+    restore_grant_id: Option<&str>,
+    cancellation: Option<&Arc<BackupControl>>,
+) -> Result<(RepoSession, String)> {
+    let password = context.repository_password.clone();
     let cacheable_backup_session = mode == "backup" && restore_grant_id.is_none();
 
     // Reuse a recently connected backup session in memory. This removes one
@@ -563,7 +662,10 @@ async fn ensure_repo(
     if cacheable_backup_session {
         if let Ok(cache) = backup_session_cache().lock() {
             if let Some(cached) = cache.as_ref() {
-                if Instant::now() < cached.valid_until {
+                if cached.account_scope == context.account_scope
+                    && cached.session_generation == context.session_generation
+                    && Instant::now() < cached.valid_until
+                {
                     return Ok((cached.session.clone(), password));
                 }
             }
@@ -574,14 +676,24 @@ async fn ensure_repo(
     // same time. Serialize backup repository connections, then check the cache
     // again so only one API session and one Kopia connect process are needed.
     let _connect_guard = if cacheable_backup_session {
-        Some(repository_connect_lock().lock().await)
+        if let Some(control) = cancellation {
+            Some(tokio::select! {
+                guard = repository_connect_lock().lock() => guard,
+                _ = control.wait_cancelled() => return Err(backup_operations::cancelled_error()),
+            })
+        } else {
+            Some(repository_connect_lock().lock().await)
+        }
     } else {
         None
     };
     if cacheable_backup_session {
         if let Ok(cache) = backup_session_cache().lock() {
             if let Some(cached) = cache.as_ref() {
-                if Instant::now() < cached.valid_until {
+                if cached.account_scope == context.account_scope
+                    && cached.session_generation == context.session_generation
+                    && Instant::now() < cached.valid_until
+                {
                     return Ok((cached.session.clone(), password));
                 }
             }
@@ -590,13 +702,26 @@ async fn ensure_repo(
 
     let cache_generation = SESSION_CACHE_GENERATION.load(Ordering::SeqCst);
 
-    let api = api_from_state(state)?;
-    let session = api.repo_session(mode, restore_grant_id).await?;
+    let session = if let Some(control) = cancellation {
+        tokio::select! {
+            session = context.api.repo_session(mode, restore_grant_id) => session?,
+            _ = control.wait_cancelled() => return Err(backup_operations::cancelled_error()),
+        }
+    } else {
+        context.api.repo_session(mode, restore_grant_id).await?
+    };
+    if cancellation
+        .map(|control| control.is_cancel_requested())
+        .unwrap_or(false)
+    {
+        return Err(backup_operations::cancelled_error());
+    }
 
     let app = app.clone();
     let session_cloned = session.clone();
     let password_cloned = password.clone();
     let mode_is_backup = mode == "backup";
+    let cancellation = cancellation.cloned();
 
     // Kopia CLI calls are blocking; run them off the async runtime.
     let session_for_blocking = session_cloned.clone();
@@ -606,11 +731,12 @@ async fn ensure_repo(
         // Try to connect to an existing repository.
         let mut connect = vec!["repository".to_string(), "connect".to_string()];
         connect.extend(base.clone());
-        let out = run_kopia(
+        let out = run_kopia_for_backup(
             &app,
             &connect,
             Some(&password_cloned),
             Some(&session_for_blocking),
+            cancellation.as_ref(),
         )?;
 
         if out.status.success() {
@@ -626,11 +752,12 @@ async fn ensure_repo(
         if mode_is_backup && repository_is_missing(&connect_error) {
             let mut create = vec!["repository".to_string(), "create".to_string()];
             create.extend(base.clone());
-            let out = run_kopia(
+            let out = run_kopia_for_backup(
                 &app,
                 &create,
                 Some(&password_cloned),
                 Some(&session_for_blocking),
+                cancellation.as_ref(),
             )?;
             ensure_success(&out, "repository create")?;
 
@@ -641,11 +768,12 @@ async fn ensure_repo(
                 "--global".to_string(),
                 "--compression=zstd".to_string(),
             ];
-            let _ = run_kopia(
+            let _ = run_kopia_for_backup(
                 &app,
                 &policy,
                 Some(&password_cloned),
                 Some(&session_for_blocking),
+                cancellation.as_ref(),
             );
             return Ok(());
         }
@@ -662,6 +790,8 @@ async fn ensure_repo(
         if let Ok(mut cache) = backup_session_cache().lock() {
             *cache = Some(CachedBackupSession {
                 session: session.clone(),
+                account_scope: context.account_scope.clone(),
+                session_generation: context.session_generation,
                 valid_until: Instant::now() + cache_lifetime,
             });
         }
@@ -699,6 +829,29 @@ pub async fn backup_paths_with_trigger(
     trigger: &'static str,
     folder: &str,
 ) -> Result<String> {
+    let display_name = if paths.len() == 1 {
+        std::path::Path::new(&paths[0])
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Quick backup")
+            .to_string()
+    } else {
+        format!("{} selected files", paths.len())
+    };
+    let operation = backup_operations::begin(state, display_name)?;
+    let result = backup_paths_with_operation(app, &operation, paths, trigger, folder).await;
+    operation.finish_tracking().await;
+    result
+}
+
+pub async fn backup_paths_with_operation(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+    paths: Vec<String>,
+    trigger: &'static str,
+    folder: &str,
+) -> Result<String> {
     let _operation_guard = begin_operation().await;
 
     if paths.is_empty() {
@@ -707,55 +860,163 @@ pub async fn backup_paths_with_trigger(
     let folder = normalize_snapshot_folder(folder)?;
 
     let op_id = uuid::Uuid::new_v4().to_string();
-    let mut engine_job =
-        EngineJobReporter::start(api_from_state(state)?, op_id.clone(), "backup", trigger);
+    let mut engine_job = EngineJobReporter::start(
+        operation.context.api.clone(),
+        op_id.clone(),
+        "backup",
+        trigger,
+    );
     let mut terminal_progress = TerminalProgressGuard::backup(app, &op_id);
     emit_progress(app, &op_id, "compressing", 0.1, "Connecting to repository…");
 
-    engine_job.progress("repository_connect");
-    let (session, password) = ensure_repo(app, state, "backup", None).await?;
+    let result: Result<KopiaSnapshot> = async {
+        operation.ensure_not_cancelled()?;
+        engine_job.progress("repository_connect");
+        let (session, password) = ensure_repo_with_context(
+            app, &operation.context, "backup", None, Some(&operation.control),
+        ).await?;
+        operation.ensure_not_cancelled()?;
 
-    emit_progress(app, &op_id, "uploading", 0.3, "Scanning and deduplicating…");
-    engine_job.progress("snapshot_create");
-
-    let app_c = app.clone();
-    let session_c = session.clone();
-    let snapshot = tokio::task::spawn_blocking(move || -> Result<KopiaSnapshot> {
-        let mut args = vec!["snapshot".to_string(), "create".to_string()];
-        args.extend(paths);
-        args.push("--json".to_string());
-        args.push("--no-progress".to_string());
-
-        let out = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
-        ensure_success(&out, "snapshot create")?;
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let value: serde_json::Value =
-            serde_json::from_str(stdout.trim()).context("Kopia returned invalid snapshot JSON")?;
-        let mut snapshot = parse_snapshot(&value);
+        emit_progress(app, &op_id, "uploading", 0.3, "Scanning and deduplicating…");
+        engine_job.progress("snapshot_create");
+        let app_c = app.clone();
+        let session_c = session.clone();
+        let control = Arc::clone(&operation.control);
+        let mut snapshot = tokio::task::spawn_blocking(move || -> Result<KopiaSnapshot> {
+            let mut args = vec!["snapshot".to_string(), "create".to_string()];
+            args.extend(paths);
+            args.push("--json".to_string());
+            args.push("--no-progress".to_string());
+            let out = run_kopia_for_backup(
+                &app_c, &args, Some(&password), Some(&session_c), Some(&control),
+            )?;
+            ensure_success(&out, "snapshot create")?;
+            let value: serde_json::Value = serde_json::from_str(
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ).context("Kopia returned invalid snapshot JSON")?;
+            let snapshot = parse_snapshot(&value);
+            if snapshot.id.is_empty() {
+                return Err(anyhow!("Kopia snapshot metadata was incomplete"));
+            }
+            Ok(snapshot)
+        }).await.context("kopia snapshot task panicked")??;
         snapshot.folder = folder;
-        if snapshot.id.is_empty() {
-            return Err(anyhow!("Kopia snapshot metadata was incomplete"));
+
+        if let Err(cancelled) = operation.ensure_not_cancelled() {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, false).await?;
+            return Err(cancelled);
+        }
+
+        engine_job.progress("manifest_sync");
+        if let Err(error) = upsert_manifest_snapshot(&operation.context.api, snapshot.clone()).await {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
+            return Err(error.context("Snapshot creation was rolled back because its server manifest could not be synchronized"));
+        }
+        if let Err(cancelled) = operation.control.mark_committed().await {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
+            return Err(cancelled);
         }
         Ok(snapshot)
-    })
-    .await
-    .context("kopia snapshot task panicked")??;
+    }.await;
 
-    engine_job.progress("manifest_sync");
-    upsert_manifest_snapshot(state, snapshot.clone())
-        .await
-        .context("Snapshot was created, but its server manifest could not be synchronized")?;
-    emit_progress(app, &op_id, "done", 1.0, "Backup complete");
-    terminal_progress.finish();
-    engine_job.finish(
-        "succeeded",
-        "completed",
-        Some(snapshot.size),
-        Some(snapshot.file_count),
-        None,
-    );
-    Ok(snapshot.id)
+    match result {
+        Ok(snapshot) => {
+            emit_progress(app, &op_id, "done", 1.0, "Backup complete");
+            terminal_progress.finish();
+            engine_job.finish(
+                "succeeded",
+                "completed",
+                Some(snapshot.size),
+                Some(snapshot.file_count),
+                None,
+            );
+            Ok(snapshot.id)
+        }
+        Err(error) if backup_operations::is_cancelled(&error) => {
+            emit_progress(
+                app,
+                &op_id,
+                "cancelled",
+                0.0,
+                "Backup stopped during sign-out",
+            );
+            terminal_progress.finish();
+            engine_job.finish("cancelled", "cancelled", None, None, Some("user_logout"));
+            Err(error)
+        }
+        Err(error) => {
+            engine_job.fail("backup_failed", None, None);
+            Err(error)
+        }
+    }
+}
+
+async fn rollback_uncommitted_snapshot(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+    session: &RepoSession,
+    snapshot_id: &str,
+    manifest_may_exist: bool,
+) -> Result<()> {
+    let app = app.clone();
+    let session = session.clone();
+    let password = operation.context.repository_password.clone();
+    let snapshot_id_owned = snapshot_id.to_string();
+    let result = execute_rollback_steps(
+        manifest_may_exist,
+        || async move {
+            let cleanup = tokio::task::spawn_blocking(move || -> Result<()> {
+                let args = vec![
+                    "snapshot".to_string(), "delete".to_string(), snapshot_id_owned,
+                    "--delete".to_string(),
+                ];
+                let output = run_kopia(&app, &args, Some(&password), Some(&session))?;
+                if output.status.success() { return Ok(()); }
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ).to_ascii_lowercase();
+                if combined.contains("no snapshots matched") { return Ok(()); }
+                ensure_success(&output, "cancelled snapshot delete")
+            }).await.context("cancelled snapshot cleanup task panicked")?;
+            cleanup.context("Could not remove cancelled Kopia snapshot safely")
+        },
+        || async {
+            remove_manifest_snapshot(&operation.context.api, snapshot_id)
+                .await
+                .context("Kopia removed the cancelled snapshot, but its metadata cleanup must be retried")
+        },
+    ).await;
+
+    if let Err(error) = result {
+        let message = error.to_string();
+        if operation.control.is_cancel_requested() {
+            operation.control.record_cancellation_error(message.clone());
+        }
+        return Err(anyhow!("BACKUP_CANCEL_FAILED: {}", message));
+    }
+    Ok(())
+}
+
+async fn execute_rollback_steps<Delete, DeleteFuture, Remove, RemoveFuture>(
+    manifest_may_exist: bool,
+    delete_snapshot: Delete,
+    remove_manifest: Remove,
+) -> Result<()>
+where
+    Delete: FnOnce() -> DeleteFuture,
+    DeleteFuture: std::future::Future<Output = Result<()>>,
+    Remove: FnOnce() -> RemoveFuture,
+    RemoveFuture: std::future::Future<Output = Result<()>>,
+{
+    // Kopia deletion always comes first. A failure leaves the manifest intact,
+    // so the retained snapshot remains discoverable and can be retried.
+    delete_snapshot().await?;
+    if manifest_may_exist {
+        remove_manifest().await?;
+    }
+    Ok(())
 }
 
 /// Create a deduplicated, compressed snapshot of `source_path`.
@@ -810,14 +1071,19 @@ pub async fn delete_snapshot(
     snapshot_id: &str,
 ) -> Result<()> {
     let _operation_guard = begin_operation().await;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
+    let api = context.api.clone();
     let mut engine_job = EngineJobReporter::start(
-        api_from_state(state)?,
+        api.clone(),
         uuid::Uuid::new_v4().to_string(),
         "delete",
         "manual",
     );
     engine_job.progress("repository_connect");
-    let (session, password) = ensure_repo(app, state, "backup", None).await?;
+    let (session, password) = ensure_repo_with_context(app, &context, "backup", None, None).await?;
     let app_c = app.clone();
     let session_c = session.clone();
 
@@ -854,7 +1120,7 @@ pub async fn delete_snapshot(
     .context("kopia delete task panicked")??;
 
     engine_job.progress("manifest_sync");
-    remove_manifest_snapshot(state, snapshot_id)
+    remove_manifest_snapshot(&api, snapshot_id)
         .await
         .context("Snapshot was deleted, but its server manifest could not be synchronized")?;
     engine_job.finish("succeeded", "completed", None, None, None);
@@ -874,9 +1140,9 @@ pub async fn list_snapshots(
 
 async fn list_snapshots_from_repository(
     app: &tauri::AppHandle,
-    state: &AppStateWrapper,
+    context: &AccountContext,
 ) -> Result<Vec<KopiaSnapshot>> {
-    let (session, password) = ensure_repo(app, state, "backup", None).await?;
+    let (session, password) = ensure_repo_with_context(app, context, "backup", None, None).await?;
     let app_c = app.clone();
     let session_c = session.clone();
     tokio::task::spawn_blocking(move || -> Result<Vec<KopiaSnapshot>> {
@@ -966,26 +1232,24 @@ async fn upload_manifest_with_retry(
     ))
 }
 
-async fn upsert_manifest_snapshot(state: &AppStateWrapper, snapshot: KopiaSnapshot) -> Result<()> {
+async fn upsert_manifest_snapshot(api: &SaveStateClient, snapshot: KopiaSnapshot) -> Result<()> {
     let _manifest_guard = manifest_update_lock().lock().await;
-    let api = api_from_state(state)?;
     let current = api.get_kopia_manifest().await?;
     let mut snapshots: Vec<KopiaSnapshot> =
         serde_json::from_value(current).context("Invalid Kopia snapshot manifest")?;
     snapshots.retain(|item| item.id != snapshot.id);
     snapshots.push(snapshot);
     snapshots.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-    upload_manifest_with_retry(&api, &snapshots).await
+    upload_manifest_with_retry(api, &snapshots).await
 }
 
-async fn remove_manifest_snapshot(state: &AppStateWrapper, snapshot_id: &str) -> Result<()> {
+async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> Result<()> {
     let _manifest_guard = manifest_update_lock().lock().await;
-    let api = api_from_state(state)?;
     let current = api.get_kopia_manifest().await?;
     let mut snapshots: Vec<KopiaSnapshot> =
         serde_json::from_value(current).context("Invalid Kopia snapshot manifest")?;
     snapshots.retain(|item| item.id != snapshot_id);
-    upload_manifest_with_retry(&api, &snapshots).await
+    upload_manifest_with_retry(api, &snapshots).await
 }
 
 /// Restore a snapshot to `target_path`. Enforces the 3x egress killswitch by
@@ -998,7 +1262,11 @@ pub async fn restore_snapshot(
 ) -> Result<()> {
     let _operation_guard = begin_operation().await;
     let op_id = uuid::Uuid::new_v4().to_string();
-    let api = api_from_state(state)?;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
+    let api = context.api.clone();
     let mut engine_job = EngineJobReporter::start(api.clone(), op_id.clone(), "restore", "manual");
     let mut terminal_progress = TerminalProgressGuard::restore(app, &op_id);
     clear_restore_cancellation(snapshot_id);
@@ -1006,7 +1274,9 @@ pub async fn restore_snapshot(
 
     // Determine the snapshot size so the backend can meter egress.
     engine_job.progress("manifest_lookup");
-    let snapshots = list_snapshots(app, state).await?;
+    let manifest = api.get_kopia_manifest().await?;
+    let snapshots: Vec<KopiaSnapshot> =
+        serde_json::from_value(manifest).context("Invalid kopia snapshot manifest")?;
     let snap = snapshots
         .iter()
         .find(|s| s.id == snapshot_id)
@@ -1044,8 +1314,14 @@ pub async fn restore_snapshot(
     // for the read-only repository session. Supporting both lets the client be
     // rolled out safely before the stricter API deployment.
     engine_job.progress("repository_connect");
-    let (session, password) =
-        ensure_repo(app, state, "restore", authorization.grant_id.as_deref()).await?;
+    let (session, password) = ensure_repo_with_context(
+        app,
+        &context,
+        "restore",
+        authorization.grant_id.as_deref(),
+        None,
+    )
+    .await?;
     if let Err(error) = ensure_restore_not_cancelled(snapshot_id) {
         emit_restore_progress(app, &op_id, "cancelled", 0.0, "Restore cancelled");
         terminal_progress.finish();
@@ -1135,18 +1411,56 @@ pub async fn set_retention(
     state: &AppStateWrapper,
     keep_latest: u32,
 ) -> Result<()> {
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
+    set_retention_with_context(app, &context, keep_latest, None).await
+}
+
+pub async fn set_retention_with_operation(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+    keep_latest: u32,
+) -> Result<()> {
+    set_retention_with_context(
+        app,
+        &operation.context,
+        keep_latest,
+        Some(&operation.control),
+    )
+    .await
+}
+
+async fn set_retention_with_context(
+    app: &tauri::AppHandle,
+    context: &AccountContext,
+    keep_latest: u32,
+    cancellation: Option<&Arc<BackupControl>>,
+) -> Result<()> {
     let _operation_guard = begin_operation().await;
     if last_retention()
         .lock()
-        .map(|retention| *retention == Some(keep_latest))
+        .map(|retention| {
+            retention
+                .as_ref()
+                .map(|cached| {
+                    cached.account_scope == context.account_scope
+                        && cached.session_generation == context.session_generation
+                        && cached.keep_latest == keep_latest
+                })
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
     {
         return Ok(());
     }
 
-    let (session, password) = ensure_repo(app, state, "backup", None).await?;
+    let (session, password) =
+        ensure_repo_with_context(app, context, "backup", None, cancellation).await?;
     let app_c = app.clone();
     let session_c = session.clone();
+    let cancellation = cancellation.cloned();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let args = vec![
@@ -1160,14 +1474,24 @@ pub async fn set_retention(
             "--keep-monthly=0".to_string(),
             "--keep-annual=0".to_string(),
         ];
-        let out = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
+        let out = run_kopia_for_backup(
+            &app_c,
+            &args,
+            Some(&password),
+            Some(&session_c),
+            cancellation.as_ref(),
+        )?;
         ensure_success(&out, "policy set")
     })
     .await
     .context("kopia policy task panicked")??;
 
     if let Ok(mut retention) = last_retention().lock() {
-        *retention = Some(keep_latest);
+        *retention = Some(CachedRetention {
+            account_scope: context.account_scope.clone(),
+            session_generation: context.session_generation,
+            keep_latest,
+        });
     }
 
     Ok(())
@@ -1196,14 +1520,18 @@ fn maintenance_owner_from_config(session: &RepoSession) -> Result<String> {
 /// backup, restore, deletion, or application update at the same time.
 pub async fn run_maintenance(app: &tauri::AppHandle, state: &AppStateWrapper) -> Result<()> {
     let _operation_guard = operation_gate().write().await;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
     let mut engine_job = EngineJobReporter::start(
-        api_from_state(state)?,
+        context.api.clone(),
         uuid::Uuid::new_v4().to_string(),
         "maintenance",
         "automatic",
     );
     engine_job.progress("repository_connect");
-    let (session, password) = ensure_repo(app, state, "backup", None).await?;
+    let (session, password) = ensure_repo_with_context(app, &context, "backup", None, None).await?;
     let app_c = app.clone();
     let session_c = session.clone();
 
@@ -1347,6 +1675,7 @@ pub async fn cmd_kopia_backup(
             )
             .await;
         }
+        Err(error) if error.to_string().contains("BACKUP_CANCELLED") => {}
         Err(_) => {
             crate::notifications::send_backup_notification(
                 &api,
@@ -1430,20 +1759,22 @@ pub fn cmd_schedule_storage_cleanup(app: tauri::AppHandle) -> String {
 
 pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper) -> Result<()> {
     let _manifest_guard = manifest_update_lock().lock().await;
-    let snapshots = list_snapshots_from_repository(app, state).await?;
-    let api = {
-        let guard = state.0.lock().map_err(|e| anyhow::anyhow!("Lock: {}", e))?;
-        guard.api.clone()
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
     };
-    upload_manifest_with_retry(&api, &snapshots).await
+    let snapshots = list_snapshots_from_repository(app, &context).await?;
+    upload_manifest_with_retry(&context.api, &snapshots).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         begin_operation, cancel_restore, classify_kopia_error, clear_restore_cancellation,
-        ensure_restore_not_cancelled, parse_snapshot, repository_is_missing, try_begin_update,
+        ensure_restore_not_cancelled, execute_rollback_steps, parse_snapshot,
+        repository_is_missing, try_begin_update,
     };
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn updater_cannot_reserve_engine_during_an_operation() {
@@ -1496,5 +1827,47 @@ mod tests {
         );
         assert!(error.to_string().starts_with("REPOSITORY_KEY_MISMATCH:"));
         assert!(!error.to_string().contains("stack trace"));
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_manifest_when_kopia_delete_fails() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let delete_calls = Arc::clone(&calls);
+        let manifest_calls = Arc::clone(&calls);
+        let result = execute_rollback_steps(
+            true,
+            move || async move {
+                delete_calls.lock().unwrap().push("delete");
+                Err(anyhow::anyhow!("delete failed"))
+            },
+            move || async move {
+                manifest_calls.lock().unwrap().push("manifest");
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), vec!["delete"]);
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_manifest_only_after_kopia_snapshot() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let delete_calls = Arc::clone(&calls);
+        let manifest_calls = Arc::clone(&calls);
+        execute_rollback_steps(
+            true,
+            move || async move {
+                delete_calls.lock().unwrap().push("delete");
+                Ok(())
+            },
+            move || async move {
+                manifest_calls.lock().unwrap().push("manifest");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["delete", "manifest"]);
     }
 }

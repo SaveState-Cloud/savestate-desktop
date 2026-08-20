@@ -40,6 +40,54 @@
                         <p id="login-error" class="error-text hidden"></p>
                     </form>
                 </div>
+
+                <div id="vault-recovery-setup" class="login-card glass-card hidden" aria-live="polite">
+                    <div class="vault-flow-heading">
+                        <h2>Save your vault recovery key</h2>
+                        <p class="text-muted">This 256-bit offline key can unlock encrypted backups when account access is recovered. It is shown once.</p>
+                    </div>
+                    <div class="vault-boundary-note">
+                        This is not an account recovery code. Email, authenticator codes, and account recovery codes restore account access but cannot decrypt your backups.
+                    </div>
+                    <code id="vault-recovery-key" class="vault-recovery-key" aria-label="Offline vault recovery key"></code>
+                    <button type="button" class="btn btn-ghost btn-full" id="btn-copy-vault-recovery-key">Copy vault recovery key</button>
+                    <div class="form-group vault-password-confirm">
+                        <label for="vault-setup-account-password">Confirm current account password</label>
+                        <input type="password" id="vault-setup-account-password" autocomplete="current-password" />
+                    </div>
+                    <label class="remember-row vault-ack-row" for="vault-recovery-ack">
+                        <input type="checkbox" id="vault-recovery-ack" />
+                        <span>I saved this offline vault recovery key somewhere safe.</span>
+                    </label>
+                    <button type="button" class="btn btn-primary btn-full" id="btn-confirm-vault-recovery-key">Continue to SaveState</button>
+                    <p id="vault-setup-error" class="error-text hidden"></p>
+                </div>
+
+                <div id="vault-locked-card" class="login-card glass-card hidden" aria-live="polite">
+                    <div class="vault-flow-heading">
+                        <h2>Account recovered, vault locked</h2>
+                        <p id="vault-locked-message" class="text-muted"></p>
+                    </div>
+                    <div class="vault-boundary-note">
+                        Account recovery proves who may sign in. Your client-owned vault key is separate, so the server cannot use email, MFA, or an account recovery code to decrypt backups.
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-unlock-method">Unlock with</label>
+                        <select id="vault-unlock-method" class="select-input"></select>
+                    </div>
+                    <div class="form-group">
+                        <label id="vault-unlock-secret-label" for="vault-unlock-secret">Previous vault password</label>
+                        <input type="password" id="vault-unlock-secret" autocomplete="off" />
+                    </div>
+                    <div class="form-group">
+                        <label for="vault-current-account-password">Current account password</label>
+                        <input type="password" id="vault-current-account-password" autocomplete="current-password" />
+                        <p class="field-help">Used only to create the new local password slot after the old vault is unlocked.</p>
+                    </div>
+                    <button type="button" class="btn btn-primary btn-full" id="btn-unlock-vault">Unlock vault</button>
+                    <button type="button" class="btn btn-ghost btn-full vault-switch-account" id="btn-abandon-vault-unlock">Use another account</button>
+                    <p id="vault-unlock-error" class="error-text hidden"></p>
+                </div>
             </div>
         </div>
 
@@ -537,6 +585,8 @@
     <!-- Toast container -->
     <div id="toast-container" class="toast-container"></div>
 
+    <script src="logout-flow.js"></script>
+    <script src="vault-recovery.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

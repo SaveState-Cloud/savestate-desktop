@@ -3,6 +3,7 @@
 mod api;
 mod auth;
 mod backup;
+mod backup_operations;
 mod db;
 mod incremental;
 mod kopia;
@@ -21,19 +22,55 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
+#[cfg(target_os = "windows")]
+use tauri_plugin_autostart::ManagerExt;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_AUTOSTART_INITIALIZED_KEY: &str = "windows_autostart_initialized_v1";
+
+fn launch_requests_minimized(args: &[String]) -> bool {
+    args.iter().any(|argument| argument == "--minimized")
+}
+
+/// Applies the Windows startup default exactly once.
+///
+/// The durable marker is written before changing Windows state. This ordering
+/// is deliberate: after SaveState has attempted the initial default, a later
+/// launch must never re-enable startup behind a user's back. If persisting the
+/// marker fails, the Windows startup setting is left untouched.
+#[cfg(target_os = "windows")]
+fn initialize_windows_autostart<F, E>(
+    conn: &rusqlite::Connection,
+    enable: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce() -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    if db::get_app_metadata(conn, WINDOWS_AUTOSTART_INITIALIZED_KEY)?.is_some() {
+        return Ok(false);
+    }
+
+    db::set_app_metadata(conn, WINDOWS_AUTOSTART_INITIALIZED_KEY, "attempted")?;
+    enable().map_err(|error| anyhow::anyhow!("failed to register Windows autostart: {error}"))?;
+    Ok(true)
+}
 
 fn main() {
     tauri::Builder::default()
         // ── Plugins ─────────────────────────────────────────────
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            Some(vec![]),
+            Some(vec!["--minimized".into()]),
         ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if launch_requests_minimized(&args) {
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -41,6 +78,15 @@ fn main() {
         }))
         // ── State ───────────────────────────────────────────────
         .setup(|app| {
+            // Autostart should keep schedules alive without flashing the main
+            // window during Windows sign-in.
+            #[cfg(target_os = "windows")]
+            if launch_requests_minimized(&std::env::args().collect::<Vec<_>>()) {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+            }
+
             // Determine data directory
             let data_dir = dirs::data_local_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -50,6 +96,15 @@ fn main() {
             let conn = db::init_db(&data_dir).expect("Failed to initialize database");
             profiles::migrate_schedule_times_to_local(&conn)
                 .expect("Failed to migrate scheduled backup times to machine-local time");
+
+            // Register SaveState as a Windows Startup App once. The durable
+            // marker is retained if the user later disables SaveState in
+            // Windows Settings or Task Manager, so a normal launch never
+            // overrides that Windows-managed choice.
+            #[cfg(target_os = "windows")]
+            if let Err(error) = initialize_windows_autostart(&conn, || app.autolaunch().enable()) {
+                eprintln!("Failed to initialize Windows autostart default: {error}");
+            }
 
             // Build shared state
             let installation_id = db::get_or_create_installation_id(&conn)
@@ -136,7 +191,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Auth
             auth::cmd_login,
+            auth::cmd_confirm_vault_recovery_key,
+            auth::cmd_unlock_vault,
+            auth::cmd_abandon_vault_unlock,
             auth::cmd_logout,
+            auth::cmd_prepare_logout,
+            auth::cmd_abort_logout,
             auth::cmd_get_auth_status,
             auth::cmd_get_account,
             auth::cmd_cancel_subscription,
@@ -182,6 +242,93 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running SaveState Vault");
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_autostart_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn metadata_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn minimized_autostart_does_not_request_a_visible_window() {
+        assert!(launch_requests_minimized(&[
+            "savestate-app.exe".into(),
+            "--minimized".into()
+        ]));
+        assert!(!launch_requests_minimized(&["savestate-app.exe".into()]));
+    }
+
+    #[test]
+    fn enables_once_and_persists_the_attempt_before_returning() {
+        let conn = metadata_connection();
+        let calls = Cell::new(0);
+
+        assert!(initialize_windows_autostart(&conn, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &str>(())
+        })
+        .unwrap());
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            db::get_app_metadata(&conn, WINDOWS_AUTOSTART_INITIALIZED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("attempted")
+        );
+
+        assert!(!initialize_windows_autostart(&conn, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &str>(())
+        })
+        .unwrap());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn an_enable_failure_is_not_retried_on_a_later_launch() {
+        let conn = metadata_connection();
+
+        assert!(
+            initialize_windows_autostart(&conn, || Err::<(), _>("registry unavailable")).is_err()
+        );
+        assert_eq!(
+            db::get_app_metadata(&conn, WINDOWS_AUTOSTART_INITIALIZED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("attempted")
+        );
+
+        assert!(
+            !initialize_windows_autostart(&conn, || -> Result<(), &str> {
+                panic!("the initial Windows startup choice must not be overwritten")
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn does_not_touch_windows_when_the_marker_cannot_be_persisted() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let called = Cell::new(false);
+
+        assert!(initialize_windows_autostart(&conn, || {
+            called.set(true);
+            Ok::<_, &str>(())
+        })
+        .is_err());
+        assert!(!called.get());
+    }
 }
 
 /// Scheduler tick: check all due profiles and run their backups.
@@ -268,6 +415,22 @@ async fn run_scheduler_tick(app_handle: &tauri::AppHandle) {
             }
             Err(e) => {
                 let error = e.to_string();
+                if error.contains("BACKUP_CANCELLED") {
+                    // Signing out is not a failed occurrence. Skip retries and
+                    // advance to the next normal cadence without changing the
+                    // last successful run timestamp.
+                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                    if let Ok(guard) = state.0.lock() {
+                        let _ = db::advance_profile_after_cancellation(
+                            &guard.db,
+                            &profile.id,
+                            &owner_account,
+                            next_regular.as_deref(),
+                        );
+                    }
+                    profiles::report_schedule_snapshot(&state);
+                    continue;
+                }
                 let classification = scheduler::classify_schedule_failure(&error);
                 let bounded_error: String = error.chars().take(1_000).collect();
                 let next_retry_number = previous_retry_count + 1;

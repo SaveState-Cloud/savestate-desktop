@@ -12,7 +12,9 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
+    "test:ui": "node --test test/*.test.cjs",
     "bundle:kopia": "node scripts/bundle-kopia.mjs",
+    "test:js": "node --test tests/*.test.cjs",
     "build": "node scripts/bundle-kopia.mjs && tauri build",
     "build:release": "node scripts/bundle-kopia.mjs && tauri build --config src-tauri/tauri.release.conf.json"
   },

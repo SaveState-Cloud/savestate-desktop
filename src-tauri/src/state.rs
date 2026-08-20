@@ -13,6 +13,7 @@ pub struct AppState {
     pub db: Connection,
     pub email: Option<String>,
     pub master_key: Option<[u8; 32]>,
+    pub session_generation: u64,
 }
 
 /// Wrapper to make AppState sendable via Tauri's state management.
@@ -25,6 +26,7 @@ impl AppState {
             db,
             email: None,
             master_key: None,
+            session_generation: 0,
         }
     }
 

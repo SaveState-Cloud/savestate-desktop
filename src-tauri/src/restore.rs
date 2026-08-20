@@ -1,8 +1,8 @@
 use crate::api::SaveStateClient;
 use crate::state::AppStateWrapper;
 use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Nonce},
+    Aes256Gcm,
 };
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
@@ -72,10 +72,11 @@ pub fn decrypt_blob(encrypted: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>> 
 
     let cipher =
         Aes256Gcm::new_from_slice(master_key).map_err(|e| anyhow!("Cipher init failed: {}", e))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+        .map_err(|_| anyhow!("Encrypted data has an invalid nonce length"))?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| anyhow!("Decryption failed — wrong key or corrupted data"))
 }
 
@@ -93,10 +94,10 @@ pub fn decrypt_chunk_v2(
 
     let cipher =
         Aes256Gcm::new_from_slice(master_key).map_err(|e| anyhow!("Cipher init failed: {}", e))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
 
     cipher
-        .decrypt(nonce, encrypted_chunk)
+        .decrypt(&nonce, encrypted_chunk)
         .map_err(|_| anyhow!("V2 Chunk Decryption failed — part {}", chunk_index))
 }
 

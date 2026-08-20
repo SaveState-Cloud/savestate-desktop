@@ -372,6 +372,7 @@ pub async fn cmd_run_profile_backup(
             )
             .await;
         }
+        Err(error) if error.to_string().contains("BACKUP_CANCELLED") => {}
         Err(_) => {
             crate::notifications::send_backup_notification(
                 &api,
@@ -398,61 +399,51 @@ pub async fn run_profile_backup_inner(
     // and recording the next run time.
     let _operation_guard = crate::kopia::begin_operation().await;
 
-    // 1. Load the profile
-    let (profile, owner_account) = {
-        let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
-        let owner_account = guard
-            .account_scope()
-            .ok_or_else(|| anyhow!("Sign in before running a backup profile"))?;
-        let profile = db::get_profile_for_account(&guard.db, profile_id, &owner_account)?;
-        (profile, owner_account)
-    };
-
-    // 2. Verify source path exists
-    let source = std::path::PathBuf::from(&profile.source_path);
-    if !source.exists() {
-        return Err(anyhow!(
-            "Source path does not exist: {}",
-            profile.source_path
-        ));
-    }
-
-    // 3. Run Kopia backup pipeline (dedup + compression + B2 upload)
-    let backup_id = crate::kopia::backup_path_with_trigger(
-        &app,
-        state,
-        &profile.source_path,
-        trigger,
-        &profile.folder,
-    )
-    .await?;
-
-    if profile.retention > 0 {
-        crate::kopia::set_retention(&app, state, profile.retention as u32).await?;
-    }
-
-    {
-        let api = {
+    let operation = crate::backup_operations::begin(state, "Backup profile")?;
+    let result: Result<String> = async {
+        let profile = {
             let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
-            guard.api.clone()
+            db::get_profile_for_account(&guard.db, profile_id, operation.account_scope())?
         };
-        let _ = api.enforce_retention().await;
-    }
+        operation.set_name(profile.name.clone());
 
-    // 5. Update profile run times
-    let now = chrono::Utc::now().to_rfc3339();
-    let next = compute_next_run(profile.schedule.as_deref());
-    {
-        let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
-        if guard.account_scope().as_deref() != Some(owner_account.as_str()) {
+        let source = std::path::PathBuf::from(&profile.source_path);
+        if !source.exists() {
             return Err(anyhow!(
-                "The signed-in account changed while the profile was running"
+                "Source path does not exist: {}",
+                profile.source_path
             ));
         }
-        db::update_profile_run_times(&guard.db, profile_id, &owner_account, &now, next.as_deref())?;
-    }
 
-    Ok(backup_id)
+        let backup_id = crate::kopia::backup_paths_with_operation(
+            &app,
+            &operation,
+            vec![profile.source_path.clone()],
+            trigger,
+            &profile.folder,
+        )
+        .await?;
+        if profile.retention > 0 {
+            crate::kopia::set_retention_with_operation(&app, &operation, profile.retention as u32)
+                .await?;
+        }
+        let _ = operation.api().enforce_retention().await;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next = compute_next_run(profile.schedule.as_deref());
+        let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
+        db::update_profile_run_times(
+            &guard.db,
+            profile_id,
+            operation.account_scope(),
+            &now,
+            next.as_deref(),
+        )?;
+        Ok(backup_id)
+    }
+    .await;
+    operation.finish_tracking().await;
+    result
 }
 
 pub fn get_dir_size(path: &std::path::Path) -> u64 {
