@@ -234,6 +234,9 @@ jobs:
           if ($releaseLookup -notmatch 'HTTP 404') {
             throw "Unable to confirm that the GitHub Release is new: $releaseLookup"
           }
+          # The 404 is the expected result, but gh leaves its native exit code at
+          # 1. Reset it so a successful preflight does not fail the Actions step.
+          $global:LASTEXITCODE = 0
 
           $publicBase = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
           foreach ($name in @($env:MSI_NAME, $env:EXE_NAME, $env:SIG_NAME)) {
