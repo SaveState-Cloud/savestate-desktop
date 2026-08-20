@@ -1623,8 +1623,8 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
             ),
             Err(error) => emit_storage_cleanup(
                 &app,
-                "pending",
-                &format!("Cleanup will retry safely later: {}", error),
+                "failed",
+                &format!("Storage cleanup could not finish: {}", error),
             ),
         }
     });
