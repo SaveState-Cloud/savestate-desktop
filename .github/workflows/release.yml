@@ -218,11 +218,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
-          R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+          MSI_NAME: ${{ steps.stage.outputs.msi_name }}
+          EXE_NAME: ${{ steps.stage.outputs.exe_name }}
+          SIG_NAME: ${{ steps.stage.outputs.sig_name }}
         run: |
           $ErrorActionPreference = "Stop"
           $releaseLookup = (
@@ -236,10 +235,18 @@ jobs:
             throw "Unable to confirm that the GitHub Release is new: $releaseLookup"
           }
 
-          $prefix = "$env:GITHUB_REF_NAME/windows/"
-          $existing = & aws s3 ls "s3://$env:R2_RELEASE_BUCKET/$prefix" --endpoint-url $env:R2_ENDPOINT_URL
-          if ($LASTEXITCODE -ne 0) { throw "Unable to check the R2 release prefix" }
-          if ($existing) { throw "R2 release prefix $prefix is not empty; refusing to overwrite it" }
+          $publicBase = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
+          foreach ($name in @($env:MSI_NAME, $env:EXE_NAME, $env:SIG_NAME)) {
+            $url = "$publicBase/$env:GITHUB_REF_NAME/windows/$([Uri]::EscapeDataString($name))"
+            $response = Invoke-WebRequest -Uri $url -Method Head -SkipHttpErrorCheck
+            $status = [int]$response.StatusCode
+            if ($status -eq 200) {
+              throw "R2 release object already exists and is immutable: $url"
+            }
+            if ($status -ne 404) {
+              throw "Unable to prove that the R2 release object is new: $url returned HTTP $status"
+            }
+          }
 
       - name: Create draft GitHub Release from staged bytes
         shell: pwsh
@@ -274,6 +281,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
           R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
           MSI_NAME: ${{ steps.stage.outputs.msi_name }}
           EXE_NAME: ${{ steps.stage.outputs.exe_name }}
@@ -295,16 +303,27 @@ jobs:
             )
           }
 
-          # Read the immutable objects back before exposing a latest manifest.
+          # Read each immutable object back through the exact public distribution
+          # path before exposing a latest manifest. This validates the customer-
+          # visible bytes without requiring bucket-list permissions.
           $verify = New-Item -ItemType Directory -Path r2-verify -Force
           foreach ($name in @($env:MSI_NAME, $env:EXE_NAME, $env:SIG_NAME)) {
-            Invoke-Aws @(
-              "s3", "cp", "s3://$env:R2_RELEASE_BUCKET/$prefix/$name", (Join-Path $verify $name),
-              "--endpoint-url", $env:R2_ENDPOINT_URL,
-              "--only-show-errors"
-            )
+            $url = "$($env:R2_PUBLIC_BASE_URL.TrimEnd('/'))/$env:GITHUB_REF_NAME/windows/$([Uri]::EscapeDataString($name))"
+            $downloadPath = Join-Path $verify $name
+            $downloaded = $false
+            for ($attempt = 1; $attempt -le 6; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $downloadPath -ErrorAction Stop
+                $downloaded = $true
+                break
+              } catch {
+                if ($attempt -eq 6) { throw }
+                Start-Sleep -Seconds 2
+              }
+            }
+            if (-not $downloaded) { throw "Unable to read back published R2 object: $url" }
             $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$name").Hash
-            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $verify $name)).Hash
+            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadPath).Hash
             if ($localHash -ne $remoteHash) { throw "R2 verification failed for $name" }
           }
 
