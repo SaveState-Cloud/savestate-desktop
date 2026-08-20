@@ -23,10 +23,14 @@ services and are not included here.
 ## Security model
 
 - Backup data is encrypted on the device before it is uploaded.
-- A random per-account master key is wrapped locally with a key derived from
-  the account password.
+- A random per-account master key is wrapped locally in a versioned envelope
+  with a password slot and a one-time offline vault-recovery slot. The hosted
+  API stores the encrypted envelope and a one-way possession verifier, not the
+  plaintext master key.
 - When **Remember me** is enabled, the session and decrypted master key are
-  stored in the operating system credential vault.
+  stored in Windows Credential Manager. Explicit sign-out removes both; an
+  expired or invalidated account session preserves the remembered key so the
+  client can safely recover the existing vault after reauthentication.
 - Storage access uses short-lived, account-scoped credentials issued by the
   SaveState API.
 - The account password is sent to the SaveState API over HTTPS for account
@@ -35,7 +39,8 @@ services and are not included here.
 
 See [SECURITY.md](SECURITY.md) for the supported security boundary and private
 vulnerability reporting process. Network behavior is documented in
-[PRIVACY.md](PRIVACY.md).
+[PRIVACY.md](PRIVACY.md), and the key hierarchy and recovery invariants are
+documented in [docs/VAULT_RECOVERY.md](docs/VAULT_RECOVERY.md).
 
 ## Technology
 

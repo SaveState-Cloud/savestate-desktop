@@ -27,7 +27,8 @@ The desktop client is responsible for:
 - encrypting backup data before upload;
 - storing remembered credentials in the operating system credential vault;
 - accepting only authenticated account-scoped API responses; and
-- using short-lived storage credentials for the requested operation.
+- using short-lived, account-scoped credentials for SaveState's encrypted
+  repository gateway; Backblaze provider credentials do not reach the client.
 
 The hosted SaveState services are responsible for authentication,
 authorization, account ownership, quotas, billing, storage credential scope,

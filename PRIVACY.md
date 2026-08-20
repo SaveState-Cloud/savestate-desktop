@@ -54,8 +54,21 @@ plaintext, and the TOTP seed is encrypted at rest.
 Email access, a TOTP authenticator, and recovery codes authenticate control of
 the SaveState account. They are not the vault master key and cannot themselves
 decrypt a backup. Access to existing encrypted backups still depends on the
-separately protected, client-owned master-key envelope or key slot. Account
-recovery does not create a server-side plaintext copy of that key.
+separately protected, client-owned master-key envelope and one of its local
+unlock factors: the previous vault password, the one-time offline vault
+recovery key, or a matching remembered-device key. The API stores the encrypted
+envelope, key identifier, and a one-way verifier used to prove possession during
+rotation; it does not receive a plaintext copy of the vault master key. Account
+recovery does not create a replacement key or make old backup ciphertext
+decryptable with an email, TOTP value, or account recovery code.
+
+When **Remember me** is selected, the bearer session and decrypted vault master
+key are stored in Windows Credential Manager. Explicit sign-out removes that
+remembered material after any active backups have been stopped or the user has
+cancelled sign-out. By contrast, an `auth_version` or unauthorized-session
+invalidation clears in-memory authentication and repository caches without
+deleting the remembered master key, so a legitimate password-recovery flow can
+still prove and unlock the existing vault.
 
 ## Information intentionally excluded from job telemetry
 
@@ -75,7 +88,8 @@ during a developer or CI build and is verified against a pinned SHA-256 hash.
 
 ## User control
 
-Users can sign out to remove the remembered session, disable schedules, remove
-notification settings, and request account management through the SaveState
-service. Network access is required for cloud backup, restore, account, usage,
-and update features.
+Users can sign out to remove the remembered session and remembered vault master
+key, disable schedules, remove notification settings, and request account
+management through the SaveState service. If a backup is active, sign-out asks
+before stopping and cleaning up that uncommitted snapshot. Network access is
+required for cloud backup, restore, account, usage, and update features.
