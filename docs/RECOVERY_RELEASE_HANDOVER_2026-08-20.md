@@ -90,23 +90,28 @@ The rollout is a set; review it as one security boundary even though the
 repositories deploy independently:
 
 - API: [SaveState-Cloud/savestate-api PR #19](https://github.com/SaveState-Cloud/savestate-api/pull/19),
-  branch `codex/account-recovery-api`, prepared commit `9185d71`. This owns D1
+  branch `codex/account-recovery-api`, current head `bf2e84b`. This owns D1
   migration `0008_account_recovery.sql`, recovery factors, `auth_version`, the
-  envelope/verifier endpoints, and the account-recovery service contract.
+  envelope/verifier endpoints, the account-recovery service contract, and a
+  pull-request gate for all tests plus the Wrangler dry-run. It remains a draft
+  until the production prerequisites below are satisfied.
 - Website: [SaveState-Cloud/savestate-website PR #11](https://github.com/SaveState-Cloud/savestate-website/pull/11),
-  branch `codex/account-recovery-website`, prepared commits `a12afc3` and
-  `dbbb209`. This owns account-recovery/TOTP UI, fragment-token handling, and
-  matching privacy copy.
+  branch `codex/account-recovery-website`, current head `04ab577`. This owns
+  account-recovery/TOTP UI, fragment-token handling, matching privacy copy, and
+  an independent test/typecheck/production-build pull-request gate. It remains
+  a draft until the API is safely deployed.
 - Private migration source: [SaveState-Cloud/savestate-app PR #16](https://github.com/SaveState-Cloud/savestate-app/pull/16),
-  branch `codex/security-recovery-integration`, validated commit `df36332`.
+  merged as `a66b3e1` after validating head `796361b`.
   The older startup-only [PR #14](https://github.com/SaveState-Cloud/savestate-app/pull/14)
-  is superseded by #16; #16 preserves its one-time default and hardening.
-- Public authoritative client: branch `codex/public-authoritative-parity` in
-  `SaveState-Cloud/savestate-desktop`. Its runtime sources, recovery tests,
-  logout tests, capability source, and Cargo lock are copied from validated
-  private commit `df36332`, while GPL, public contribution/security/privacy
+  was updated without force-push, its conflicts were resolved, its focused
+  startup tests passed, and it was then closed as superseded by #16.
+- Public authoritative client: [SaveState-Cloud/savestate-desktop PR #9](https://github.com/SaveState-Cloud/savestate-desktop/pull/9)
+  merged as `8d2743a` after Windows CI and RustSec passed. Its runtime sources,
+  recovery tests, logout tests, capability source, and Cargo lock match the
+  validated private client, while GPL, public contribution/security/privacy
   documents, public release configuration, and repository metadata remain
-  public-specific.
+  public-specific. Public `main` is now the source for future Windows releases;
+  no `v2.0.15` release has been created by this source cutover.
 - Public dependency PRs
   [#1](https://github.com/SaveState-Cloud/savestate-desktop/pull/1),
   [#2](https://github.com/SaveState-Cloud/savestate-desktop/pull/2),
@@ -115,11 +120,11 @@ repositories deploy independently:
   [#5](https://github.com/SaveState-Cloud/savestate-desktop/pull/5),
   [#6](https://github.com/SaveState-Cloud/savestate-desktop/pull/6), and
   [#7](https://github.com/SaveState-Cloud/savestate-desktop/pull/7) are
-  integrated together in the authoritative branch. PRs #1 (`rusqlite`) and #2
+  integrated together in public PR #9 and closed as superseded after it merged.
+  PRs #1 (`rusqlite`) and #2
   (`aes-gcm`) require source migrations, and recovery plus `sha2` 0.11 requires
   `hmac` 0.13. Do not merge the independent lockfile PRs one by one after the
-  integration branch; close them as superseded after the combined branch
-  passes required checks and merges.
+  integration branch.
 
 The public repository becomes the release source after this cutover. Do not
 create a post-cutover Windows release from the private repository.
@@ -141,6 +146,13 @@ Before deploying API PR #19:
    not prove that a dashboard-managed production email binding exists.
 5. Confirm `/health` reports the expanded recovery schema before enabling the
    website UI.
+6. Remove or disable the obsolete Cloudflare **Workers Builds** integration for
+   `savestate-website`, or reconfigure it deliberately if a second Worker-hosted
+   site is actually wanted. The website is deployed by Cloudflare Pages and its
+   Pages preview plus GitHub Website CI pass; the duplicate Workers hook fails
+   because it runs `wrangler versions upload` without a Worker entry point or
+   assets directory. Do not add an accidental second production host merely to
+   turn that unrelated check green.
 
 Before tagging a public desktop release, configure the GitHub release
 environment without placing values in the repository:
@@ -164,10 +176,11 @@ repository.
 2. Merge and deploy website PR #11. Verify that a recovery bearer grant is read
    only from the exact URL fragment and that the fragment is immediately
    removed from browser history/state.
-3. Merge the public authoritative desktop branch after Windows CI, RustSec, and
-   the matrix below pass. Mark private PR #16/#14 and public dependency PRs
-   #1-#7 as superseded only after their replacement commit is on the target
-   branch.
+3. Confirm the already-completed public source cutover (`savestate-desktop`
+   merge `8d2743a`) still contains the exact reviewed runtime before releasing.
+   Private PR #16 and public PR #9 are merged; private #14 and public dependency
+   PRs #1-#7 are closed as superseded. Do not reopen or merge their old lockfile
+   branches.
 4. Bump every desktop version field to the same next patch version. The first
    authoritative public release should be `v2.0.15`; never overwrite or relabel
    existing `v2.0.14` assets.
@@ -249,9 +262,9 @@ Expected: npm audit reports zero vulnerabilities; logout tests pass 3/3;
 recovery UI tests pass 5/5; Kopia 0.23.1 downloads and passes its pinned SHA-256
 check; Rust tests pass 50/50; formatting and optimized Windows checks are clean.
 Also lint `.github/workflows/release.yml`, run a tracked-file secret scan, and
-confirm that the functional paths still match private integration commit
-`df36332` exactly. Generated Tauri schema changes created by local checks are
-build output and must not be committed.
+confirm that the functional paths still match private validated head `796361b`
+apart from documented public-only files and metadata. Generated Tauri schema
+changes created by local checks are build output and must not be committed.
 
 ## GPL and Windows SmartScreen
 
