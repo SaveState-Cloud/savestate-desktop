@@ -15,6 +15,10 @@ pub struct LoginResponse {
     #[serde(default)]
     pub email: Option<String>,
     pub encrypted_master_key: Option<String>,
+    #[serde(default)]
+    pub encrypted_master_key_envelope: Option<String>,
+    #[serde(default)]
+    pub master_key_requires_original_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +107,27 @@ pub struct MasterKeyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MasterKeyEnvelopeResponse {
+    pub envelope: Option<String>,
+    pub version: Option<u32>,
+    pub revision: Option<u64>,
+    pub legacy_encrypted_master_key: Option<String>,
+    #[serde(default)]
+    pub account_recovery_changed_password: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterKeyEnvelopeWriteResponse {
+    pub success: bool,
+    pub version: u32,
+    pub revision: u64,
+    #[serde(default)]
+    pub initialized: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationPrefs {
     #[serde(default = "default_true")]
     pub backup_success: bool,
@@ -173,6 +198,25 @@ struct ApiError {
     message: Option<String>,
 }
 
+async fn parse_api_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&text) {
+            let message = api_err
+                .message
+                .or(api_err.error)
+                .unwrap_or_else(|| format!("{} failed ({})", operation, status));
+            return Err(anyhow!(message));
+        }
+        return Err(anyhow!("{} failed: {} — {}", operation, status, text));
+    }
+    serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", operation))
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Client
 // ────────────────────────────────────────────────────────────────────
@@ -200,9 +244,9 @@ pub struct MultipartPart {
     pub etag: String,
 }
 
-/// Short-lived, prefix-scoped Backblaze B2 credentials for the Kopia engine.
-/// Issued per-operation by the SaveState API so the agent never holds
-/// long-lived storage keys.
+/// Short-lived credentials for SaveState's ciphertext-only repository gateway.
+/// They authorize one account-scoped operation; Backblaze provider credentials
+/// never reach the desktop agent.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoSession {
@@ -431,7 +475,8 @@ impl SaveStateClient {
 
     // ── Phase 1: Kopia repository session (short-lived B2 creds) ─────
 
-    /// Request short-lived, prefix-scoped B2 credentials for the Kopia engine.
+    /// Request short-lived, account-scoped repository-gateway credentials for
+    /// the Kopia engine. These are not Backblaze provider credentials.
     /// `mode` is "backup" (read/write) or "restore" (read-only).
     pub async fn repo_session(&self, mode: &str, grant_id: Option<&str>) -> Result<RepoSession> {
         let url = format!("{}/repo/session", self.base_url);
@@ -1009,6 +1054,72 @@ impl SaveStateClient {
             .context("Failed to parse master key response")
     }
 
+    /// Initialize the client-owned, versioned key-slot envelope. The server
+    /// stores only opaque slot ciphertext plus a hash of the AMK verifier.
+    pub async fn initialize_master_key_envelope(
+        &self,
+        current_password: &str,
+        envelope: &str,
+        verifier: &str,
+    ) -> Result<MasterKeyEnvelopeWriteResponse> {
+        let url = format!("{}/auth/master-key-envelope", self.base_url);
+        let auth = self.auth_header()?;
+        let envelope_value: serde_json::Value =
+            serde_json::from_str(envelope).context("Invalid master-key envelope JSON")?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({
+                "currentPassword": current_password,
+                "verifier": verifier,
+                "envelope": envelope_value,
+            }))
+            .send()
+            .await
+            .context("Failed to initialize the vault recovery envelope")?;
+        parse_api_json(resp, "Initialize vault recovery envelope").await
+    }
+
+    /// Rotate the password slot only after proving possession of the AMK.
+    pub async fn rotate_master_key_envelope(
+        &self,
+        expected_revision: u64,
+        envelope: &str,
+        verifier: &str,
+    ) -> Result<MasterKeyEnvelopeWriteResponse> {
+        let url = format!("{}/auth/master-key-envelope", self.base_url);
+        let auth = self.auth_header()?;
+        let envelope_value: serde_json::Value =
+            serde_json::from_str(envelope).context("Invalid master-key envelope JSON")?;
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({
+                "expectedRevision": expected_revision,
+                "verifier": verifier,
+                "envelope": envelope_value,
+            }))
+            .send()
+            .await
+            .context("Failed to rotate the vault password slot")?;
+        parse_api_json(resp, "Rotate vault password slot").await
+    }
+
+    pub async fn get_master_key_envelope(&self) -> Result<MasterKeyEnvelopeResponse> {
+        let url = format!("{}/auth/master-key-envelope", self.base_url);
+        let auth = self.auth_header()?;
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .context("Failed to get the vault recovery envelope")?;
+        parse_api_json(resp, "Get vault recovery envelope").await
+    }
+
     // ── User Settings ───────────────────────────────────────────────
 
     /// Persist notification / webhook settings server-side.
@@ -1265,6 +1376,50 @@ impl SaveStateClient {
             return Err(anyhow!("Fetch manifest failed: {} — {}", status, text));
         }
         resp.json().await.context("Failed to parse kopia manifest")
+    }
+}
+
+#[cfg(test)]
+mod account_recovery_contract_tests {
+    use super::{LoginResponse, MasterKeyEnvelopeResponse};
+
+    #[test]
+    fn login_response_matches_account_recovery_api_contract() {
+        let parsed: LoginResponse = serde_json::from_value(serde_json::json!({
+            "token": "jwt",
+            "email": "owner@example.com",
+            "encryptedMasterKey": "legacy:cipher:text",
+            "encryptedMasterKeyEnvelope": "{\"version\":1}",
+            "masterKeyRequiresOriginalPassword": true
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.encrypted_master_key.as_deref(),
+            Some("legacy:cipher:text")
+        );
+        assert_eq!(
+            parsed.encrypted_master_key_envelope.as_deref(),
+            Some("{\"version\":1}")
+        );
+        assert!(parsed.master_key_requires_original_password);
+    }
+
+    #[test]
+    fn envelope_get_response_keeps_legacy_and_account_recovery_boundary() {
+        let parsed: MasterKeyEnvelopeResponse = serde_json::from_value(serde_json::json!({
+            "envelope": "{\"version\":1}",
+            "version": 1,
+            "revision": 4,
+            "legacyEncryptedMasterKey": "legacy",
+            "accountRecoveryChangedPassword": true
+        }))
+        .unwrap();
+        assert_eq!(parsed.revision, Some(4));
+        assert_eq!(
+            parsed.legacy_encrypted_master_key.as_deref(),
+            Some("legacy")
+        );
+        assert!(parsed.account_recovery_changed_password);
     }
 }
 

@@ -27,7 +27,8 @@ The desktop client is responsible for:
 - encrypting backup data before upload;
 - storing remembered credentials in the operating system credential vault;
 - accepting only authenticated account-scoped API responses; and
-- using short-lived storage credentials for the requested operation.
+- using short-lived, account-scoped credentials for SaveState's encrypted
+  repository gateway; Backblaze provider credentials do not reach the client.
 
 The hosted SaveState services are responsible for authentication,
 authorization, account ownership, quotas, billing, storage credential scope,
@@ -45,3 +46,34 @@ Release artifacts must be built from this public repository through the
 documented CI and code-signing process. Updater signing keys and infrastructure
 credentials must only exist in protected CI secret storage and must never be
 committed to the repository.
+
+Production Windows releases are created only by
+`.github/workflows/release.yml` from a semantic-version tag contained in
+`main`. The workflow builds the installers once, publishes the exact same MSI
+and EXE bytes to GitHub Releases and the versioned R2 download path, and emits
+SHA-256 checksums plus build metadata. Published version paths are immutable;
+fixes use a new version rather than replacing an existing release.
+
+### Interrupted release recovery
+
+The workflow deliberately refuses to overwrite either an existing GitHub
+Release or a non-empty versioned R2 prefix. If a run stops after creating its
+draft release or after uploading only part of its R2 objects, do not rerun it
+and do not rebuild that version.
+
+An administrator may complete the interrupted release manually only when all
+of the following are true:
+
+1. the draft release's `release-provenance.json` names the same repository,
+   tag, and commit as the immutable versioned R2 prefix;
+2. every existing R2 object downloads to the SHA-256 value recorded in the
+   draft release's `SHA256SUMS`;
+3. any missing R2 object is copied from that same draft release without
+   replacing an existing object; and
+4. the latest manifests are published only after the MSI, EXE, and updater
+   signature have all been verified.
+
+The draft may then be published. Record the manual recovery in the repository's
+security audit trail. If the provenance, hashes, or source commit cannot be
+verified, leave that version unpublished and issue a new patch version; never
+delete or replace artifacts in order to reuse the failed version number.

@@ -7,7 +7,6 @@
     "core:event:default",
     "dialog:default",
     "dialog:allow-confirm",
-    "autostart:default",
     "shell:default",
     "process:default",
     "updater:default"

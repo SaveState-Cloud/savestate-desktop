@@ -23,10 +23,14 @@ services and are not included here.
 ## Security model
 
 - Backup data is encrypted on the device before it is uploaded.
-- A random per-account master key is wrapped locally with a key derived from
-  the account password.
+- A random per-account master key is wrapped locally in a versioned envelope
+  with a password slot and a one-time offline vault-recovery slot. The hosted
+  API stores the encrypted envelope and a one-way possession verifier, not the
+  plaintext master key.
 - When **Remember me** is enabled, the session and decrypted master key are
-  stored in the operating system credential vault.
+  stored in Windows Credential Manager. Explicit sign-out removes both; an
+  expired or invalidated account session preserves the remembered key so the
+  client can safely recover the existing vault after reauthentication.
 - Storage access uses short-lived, account-scoped credentials issued by the
   SaveState API.
 - The account password is sent to the SaveState API over HTTPS for account
@@ -35,7 +39,11 @@ services and are not included here.
 
 See [SECURITY.md](SECURITY.md) for the supported security boundary and private
 vulnerability reporting process. Network behavior is documented in
-[PRIVACY.md](PRIVACY.md).
+[PRIVACY.md](PRIVACY.md), and the key hierarchy and recovery invariants are
+documented in [docs/VAULT_RECOVERY.md](docs/VAULT_RECOVERY.md).
+The coordinated service prerequisites, deployment order, rollback policy, and
+validation matrix are recorded in
+[docs/RECOVERY_RELEASE_HANDOVER_2026-08-20.md](docs/RECOVERY_RELEASE_HANDOVER_2026-08-20.md).
 
 ## Technology
 
@@ -63,18 +71,22 @@ npm run build
 `bundle:kopia` downloads the pinned Kopia release and verifies its SHA-256
 checksum before it is included in the application bundle.
 
-`npm run build` creates reproducible unsigned local installers. Protected
-release automation uses `npm run build:release`, which additionally creates
-Tauri updater artifacts and therefore requires the private updater signing key
-from CI secret storage.
+`npm run build` creates unsigned local installers. It does not promise that two
+independent builds will be bit-for-bit identical. Protected release automation
+instead builds once, stages those exact installer bytes for every release
+destination, and records their SHA-256 hashes and provenance. It uses
+`npm run build:release`, which additionally creates Tauri updater artifacts and
+therefore requires the private updater signing key from CI secret storage.
 
 ## Code signing
 
 The project intends to use free code signing provided by
 [SignPath.io](https://about.signpath.io/), with a certificate from
 [SignPath Foundation](https://signpath.org/). Until that application is
-approved and the release workflow is connected, public installers may remain
-unsigned. The signing policy is documented in
+approved and a SignPath workflow is connected, public installers may remain
+unsigned by Windows Authenticode and SmartScreen may warn. Tauri's separate
+updater signature still protects automatic-update artifacts. The signing
+policy is documented in
 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md).
 
 ## Contributing

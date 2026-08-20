@@ -515,12 +515,15 @@ pub fn get_profile_for_account(
 }
 
 pub fn count_unowned_profiles(conn: &Connection) -> Result<u64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM backup_profiles WHERE owner_account IS NULL",
-        [],
-        |row| row.get(0),
-    )
-    .context("Failed to count legacy profiles")
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM backup_profiles WHERE owner_account IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count legacy profiles")?;
+
+    u64::try_from(count).context("Legacy profile count was negative")
 }
 
 pub fn claim_unowned_profiles(conn: &Connection, owner_account: &str) -> Result<u64> {
@@ -550,6 +553,31 @@ pub fn update_profile_run_times(
             params![last_run, next_run, id, owner_account],
         )
         .context("Failed to update profile run times")?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+/// Advance a cancelled scheduled occurrence without recording a successful
+/// last run or treating the user-confirmed logout as a failure/retry.
+pub fn advance_profile_after_cancellation(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+    next_run: Option<&str>,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE backup_profiles
+            SET next_run = ?1, retry_count = 0, retry_at = NULL,
+                last_error = NULL, last_error_code = NULL, schedule_state = 'scheduled'
+          WHERE id = ?2 AND owner_account = ?3",
+            params![next_run, id, owner_account],
+        )
+        .context("Failed to advance cancelled profile schedule")?;
     if changed != 1 {
         return Err(anyhow!(
             "Profile is not available for the signed-in account"
@@ -799,6 +827,30 @@ mod tests {
         assert_eq!(recovered.schedule_state, "scheduled");
         assert!(recovered.last_error.is_none());
         assert!(recovered.last_error_code.is_none());
+    }
+
+    #[test]
+    fn logout_cancellation_advances_cadence_without_claiming_success_or_retry() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let mut profile = test_profile();
+        profile.last_run = Some("2026-08-19T11:00:00Z".to_string());
+        create_profile(&conn, &profile).unwrap();
+
+        advance_profile_after_cancellation(
+            &conn,
+            "profile-1",
+            "owner@example.com",
+            Some("2026-08-21T12:00:00Z"),
+        )
+        .unwrap();
+
+        let saved = get_profile(&conn, "profile-1").unwrap();
+        assert_eq!(saved.last_run.as_deref(), Some("2026-08-19T11:00:00Z"));
+        assert_eq!(saved.next_run.as_deref(), Some("2026-08-21T12:00:00Z"));
+        assert_eq!(saved.retry_count, 0);
+        assert!(saved.retry_at.is_none());
+        assert_eq!(saved.schedule_state, "scheduled");
     }
 
     #[test]

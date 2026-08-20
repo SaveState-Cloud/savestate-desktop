@@ -5,6 +5,7 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open, confirm: confirmDialog } = window.__TAURI__.dialog;
+const vaultRecoveryUi = window.SaveStateVaultRecovery;
 
 // ── Auto-updater state ───────────────────────────────────────────
 let availableUpdateVersion = null;
@@ -40,6 +41,7 @@ let authenticatedSessionActive = false;
 let repositoryWarmupPromise = null;
 let repositorySessionGeneration = 0;
 let legacyProfileNoticeShown = false;
+let pendingVaultLoginResult = null;
 const EMPTY_REPOSITORY_DISPLAY_THRESHOLD_BYTES = 5 * 1024 * 1024;
 
 // ────────────────────────────────────────────────────────────────
@@ -112,8 +114,9 @@ function setupEventListeners() {
         errorEl.classList.add('hidden');
 
         try {
-            await invoke('cmd_login', { email, password, rememberMe });
-            await checkAuthStatus();
+            const result = await invoke('cmd_login', { email, password, rememberMe });
+            document.getElementById('login-password').value = '';
+            await handleVaultLoginResult(result);
         } catch (err) {
             errorEl.textContent = friendlyError(err);
             errorEl.classList.remove('hidden');
@@ -124,11 +127,114 @@ function setupEventListeners() {
         }
     });
 
-    // Logout
+    document.getElementById('btn-copy-vault-recovery-key').addEventListener('click', async () => {
+        const recoveryKey = document.getElementById('vault-recovery-key').textContent.trim();
+        if (!recoveryKey) return;
+        try {
+            await navigator.clipboard.writeText(recoveryKey);
+            showToast('Vault recovery key copied. Store it offline.', 'success');
+        } catch {
+            showToast('Could not copy automatically. Select the vault recovery key and copy it manually.', 'error');
+        }
+    });
+
+    document.getElementById('btn-confirm-vault-recovery-key').addEventListener('click', async () => {
+        const button = document.getElementById('btn-confirm-vault-recovery-key');
+        const errorEl = document.getElementById('vault-setup-error');
+        const accountPassword = document.getElementById('vault-setup-account-password').value;
+        const acknowledged = document.getElementById('vault-recovery-ack').checked;
+        errorEl.classList.add('hidden');
+        if (!accountPassword) {
+            errorEl.textContent = 'Enter your current account password.';
+            errorEl.classList.remove('hidden');
+            return;
+        }
+        button.disabled = true;
+        try {
+            const result = await invoke('cmd_confirm_vault_recovery_key', { accountPassword, acknowledged });
+            clearVaultFlowSecrets();
+            await handleVaultLoginResult(result);
+        } catch (error) {
+            errorEl.textContent = friendlyError(error);
+            errorEl.classList.remove('hidden');
+        } finally {
+            button.disabled = false;
+        }
+    });
+
+    document.getElementById('vault-unlock-method').addEventListener('change', updateVaultUnlockLabel);
+
+    document.getElementById('btn-unlock-vault').addEventListener('click', async () => {
+        const button = document.getElementById('btn-unlock-vault');
+        const errorEl = document.getElementById('vault-unlock-error');
+        const method = document.getElementById('vault-unlock-method').value;
+        const secret = document.getElementById('vault-unlock-secret').value;
+        const accountPassword = document.getElementById('vault-current-account-password').value;
+        errorEl.classList.add('hidden');
+        if (!secret || !accountPassword) {
+            errorEl.textContent = 'Enter both the vault unlock factor and your current account password.';
+            errorEl.classList.remove('hidden');
+            return;
+        }
+        button.disabled = true;
+        try {
+            const result = await invoke('cmd_unlock_vault', { method, secret, accountPassword });
+            clearVaultFlowSecrets();
+            await handleVaultLoginResult(result);
+        } catch (error) {
+            errorEl.textContent = friendlyError(error);
+            errorEl.classList.remove('hidden');
+        } finally {
+            button.disabled = false;
+        }
+    });
+
+    document.getElementById('btn-abandon-vault-unlock').addEventListener('click', async () => {
+        await invoke('cmd_abandon_vault_unlock');
+        clearVaultFlowSecrets();
+        pendingVaultLoginResult = null;
+        showLoginAuthCard();
+    });
+
+    // Logou
     document.getElementById('btn-logout').addEventListener('click', async () => {
-        endAuthenticatedSession();
-        await invoke('cmd_logout');
-        showView('login');
+        const button = document.getElementById('btn-logout');
+        button.disabled = true;
+        let preparedLogout = null;
+        try {
+            preparedLogout = await invoke('cmd_prepare_logout');
+            const activeBackups = preparedLogout.activeBackups || [];
+            const confirmed = await window.SaveStateLogout.confirmActiveBackups(
+                activeBackups,
+                confirmDialog,
+            );
+            if (!confirmed) {
+                await invoke('cmd_abort_logout', { logoutToken: preparedLogout.token });
+                preparedLogout = null;
+                return;
+            }
+            button.textContent = activeBackups.length > 0 ? 'Stopping backups…' : 'Signing out…';
+            const result = await invoke('cmd_logout', { logoutToken: preparedLogout.token });
+            preparedLogout = null;
+            endAuthenticatedSession();
+            pendingVaultLoginResult = null;
+            clearVaultFlowSecrets();
+            showLoginAuthCard();
+            resetBackupMode();
+            hideGlobalProgress();
+            showView('login');
+            if (Number(result?.cancelledBackups) > 0) {
+                showToast('Active backups were stopped safely.', 'info');
+            }
+        } catch (error) {
+            if (preparedLogout) {
+                await invoke('cmd_abort_logout', { logoutToken: preparedLogout.token }).catch(() => {});
+            }
+            showToast('Could not sign out: ' + friendlyError(error), 'error');
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Sign Out';
+        }
     });
 
     // ── Quick Backup ──────────────────────────────────────────
@@ -304,7 +410,7 @@ function setupEventListeners() {
 
         if (!name || !sourcePath) { showToast('Name and source path required', 'error'); return; }
 
-        // Validate time format
+        // Validate time forma
         let schedule = null;
         if (timesRaw) {
             intervalDays = Math.max(1, Math.min(365, intervalDays));
@@ -398,6 +504,70 @@ function setupEventListeners() {
     });
 }
 
+async function handleVaultLoginResult(result) {
+    const mode = vaultRecoveryUi.classifyLoginResult(result);
+    if (mode === 'ready') {
+        const message = result && result.message;
+        pendingVaultLoginResult = null;
+        clearVaultFlowSecrets();
+        showLoginAuthCard();
+        await checkAuthStatus();
+        if (message) showToast(message, 'info');
+        return;
+    }
+    if (mode === 'setup') {
+        pendingVaultLoginResult = result;
+        const recoveryKey = vaultRecoveryUi.consumeOneTimeVaultRecoveryKey(result);
+        if (!recoveryKey) throw new Error('The one-time vault recovery key was not returned. Vault setup was not committed.');
+        document.querySelector('.login-card:not(#vault-recovery-setup):not(#vault-locked-card)').classList.add('hidden');
+        document.getElementById('vault-locked-card').classList.add('hidden');
+        document.getElementById('vault-recovery-key').textContent = recoveryKey;
+        document.getElementById('vault-recovery-setup').classList.remove('hidden');
+        return;
+    }
+    if (mode === 'locked') {
+        pendingVaultLoginResult = result;
+        document.querySelector('.login-card:not(#vault-recovery-setup):not(#vault-locked-card)').classList.add('hidden');
+        document.getElementById('vault-recovery-setup').classList.add('hidden');
+        document.getElementById('vault-locked-message').textContent = result.message || 'Your account is signed in, but the encrypted vault still needs a client-owned unlock factor.';
+        const select = document.getElementById('vault-unlock-method');
+        select.replaceChildren(...vaultRecoveryUi.unlockOptions(result).map((option) => {
+            const element = document.createElement('option');
+            element.value = option.value;
+            element.textContent = option.label;
+            return element;
+        }));
+        updateVaultUnlockLabel();
+        document.getElementById('vault-locked-card').classList.remove('hidden');
+        return;
+    }
+    throw new Error('The desktop returned an unknown vault state. No encrypted key was changed.');
+}
+
+function updateVaultUnlockLabel() {
+    const method = document.getElementById('vault-unlock-method').value;
+    const label = document.getElementById('vault-unlock-secret-label');
+    const input = document.getElementById('vault-unlock-secret');
+    const isRecoveryKey = method === 'vault_recovery_key';
+    label.textContent = isRecoveryKey ? 'Offline vault recovery key' : 'Previous vault password';
+    input.type = isRecoveryKey ? 'text' : 'password';
+    input.placeholder = isRecoveryKey ? 'Paste the 256-bit offline key' : 'Password that previously unlocked this vault';
+}
+
+function clearVaultFlowSecrets() {
+    vaultRecoveryUi.clearSensitiveValue(document.getElementById('vault-recovery-key'));
+    vaultRecoveryUi.clearSensitiveValue(document.getElementById('vault-setup-account-password'));
+    vaultRecoveryUi.clearSensitiveValue(document.getElementById('vault-unlock-secret'));
+    vaultRecoveryUi.clearSensitiveValue(document.getElementById('vault-current-account-password'));
+    document.getElementById('vault-recovery-ack').checked = false;
+}
+
+function showLoginAuthCard() {
+    document.querySelector('.login-card:not(#vault-recovery-setup):not(#vault-locked-card)').classList.remove('hidden');
+    document.getElementById('vault-recovery-setup').classList.add('hidden');
+    document.getElementById('vault-locked-card').classList.add('hidden');
+}
+
 // ────────────────────────────────────────────────────────────────
 // Tauri Event Listeners
 // ────────────────────────────────────────────────────────────────
@@ -430,7 +600,7 @@ function setupTauriListeners() {
 
             if (p.stage === 'done') {
                 globalProgressHideTimer = setTimeout(hideGlobalProgress, 2000);
-            } else if (p.stage === 'error') {
+            } else if (p.stage === 'error' || p.stage === 'cancelled') {
                 hideGlobalProgress();
             }
         }
@@ -462,6 +632,18 @@ function setupTauriListeners() {
                     btn.textContent = '▶ Run Now';
                 });
             }
+        } else if (p.stage === 'cancelled') {
+            if (pendingBackupErrorToast) {
+                clearTimeout(pendingBackupErrorToast);
+                pendingBackupErrorToast = null;
+            }
+            resetBackupMode();
+            showToast('Backup stopped. No cancelled backup was added.', 'info');
+            document.querySelectorAll('.profile-progress').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.profile-actions .btn-primary').forEach(btn => {
+                btn.disabled = false;
+                btn.textContent = '▶ Run Now';
+            });
         } else if (p.stage === 'error') {
             resetBackupMode();
             if (pendingBackupErrorToast) clearTimeout(pendingBackupErrorToast);
@@ -626,7 +808,7 @@ function warmRepositoryInBackground() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// View / Page Management
+// View / Page Managemen
 // ────────────────────────────────────────────────────────────────
 function showView(viewId) {
     document.getElementById('view-login').classList.toggle('active', viewId === 'login');
@@ -649,7 +831,7 @@ function navigateTo(pageId) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Toast
+// Toas
 // ────────────────────────────────────────────────────────────────
 function friendlyError(error) {
     const raw = String(error ?? '').replace(/\\n/g, ' ').replace(/[\r\n\t]+/g, ' ').trim();
@@ -696,6 +878,7 @@ async function handleRepositoryError(error) {
     showToast(error, 'error');
     if (repositoryRecoveryPromptOpen) return;
     repositoryRecoveryPromptOpen = true;
+    let preparedLogout = null;
 
     try {
         const signInAgain = await confirmDialog(
@@ -704,14 +887,32 @@ async function handleRepositoryError(error) {
         );
         if (!signInAgain) return;
 
+        preparedLogout = await invoke('cmd_prepare_logout');
+        const activeBackups = preparedLogout.activeBackups || [];
+        const stopBackups = await window.SaveStateLogout.confirmActiveBackups(
+            activeBackups,
+            confirmDialog,
+        );
+        if (!stopBackups) {
+            await invoke('cmd_abort_logout', { logoutToken: preparedLogout.token });
+            preparedLogout = null;
+            return;
+        }
+        await invoke('cmd_logout', { logoutToken: preparedLogout.token });
+        preparedLogout = null;
         endAuthenticatedSession();
-        await invoke('cmd_logout');
+        pendingVaultLoginResult = null;
+        clearVaultFlowSecrets();
+        showLoginAuthCard();
         document.getElementById('login-password').value = '';
         const errorEl = document.getElementById('login-error');
         errorEl.textContent = 'Sign in again to reconnect your encrypted backup repository.';
         errorEl.classList.remove('hidden');
         showView('login');
     } catch (recoveryError) {
+        if (preparedLogout) {
+            await invoke('cmd_abort_logout', { logoutToken: preparedLogout.token }).catch(() => {});
+        }
         showToast('Could not restart sign-in: ' + String(recoveryError), 'error');
     } finally {
         repositoryRecoveryPromptOpen = false;
@@ -841,6 +1042,12 @@ async function loadDashboard() {
     } catch (e) {
         console.error('loadDashboard error:', e);
         if (String(e).includes('401') || String(e).includes('Unauthorized') || String(e).includes('Not authenticated')) {
+            // Do not invoke cmd_logout here. An auth_version change invalidates
+            // the token, but Credential Manager may hold the only AMK capable
+            // of recovering this client-owned vault after account reset.
+            await invoke('cmd_abandon_vault_unlock').catch(() => {});
+            endAuthenticatedSession();
+            showLoginAuthCard();
             showView('login');
         } else {
             showToast('Failed to load account: ' + String(e), 'error');
@@ -888,6 +1095,7 @@ function failBackupUi(error) {
         button.disabled = false;
         button.textContent = '▶ Run Now';
     });
+    if (String(error ?? '').toLowerCase().includes('backup_cancelled')) return;
     handleRepositoryError(error);
 }
 
@@ -897,7 +1105,7 @@ function resetBackupMode() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Backups List
+// Backups Lis
 // ────────────────────────────────────────────────────────────────
 async function loadBackups() {
     const tbody = document.getElementById('backups-tbody');
@@ -1130,7 +1338,7 @@ function renderBackupsBreadcrumb() {
 
     const parts = currentFolder === '/' ? [] : currentFolder.split('/').filter(Boolean);
 
-    // Root segment
+    // Root segmen
     const rootSeg = document.createElement('span');
     rootSeg.className = 'breadcrumb-segment' + (parts.length === 0 ? ' active' : '');
     rootSeg.textContent = '📂 / (root)';
@@ -1561,7 +1769,7 @@ async function loadProfiles() {
 
                 showToast(`Backup started for "${p.name}"`, 'success');
 
-                // Fire-and-forget — don't await
+                // Fire-and-forget — don't awai
                 invoke('cmd_run_profile_backup', { profileId: p.id })
                     .then(() => {
                         // Backup finished — progress events already handle UI
@@ -1621,7 +1829,7 @@ function openProfileModal(profile = null) {
                 document.getElementById('profile-schedule-times').value = (sched.times || []).join(', ');
                 document.getElementById('profile-schedule-interval').value = sched.intervalDays || 0;
             } catch {
-                // Legacy format
+                // Legacy forma
                 document.getElementById('profile-schedule-times').value = '';
                 document.getElementById('profile-schedule-interval').value = 1;
             }
