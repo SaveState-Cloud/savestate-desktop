@@ -794,7 +794,7 @@ async function loadDashboard() {
 
         const restoreMeta = document.getElementById('usage-restore-meta');
         if (account.egress?.paidOverageEnabled) {
-            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage US$${account.egress.overageUsdPerGB || '0.0205'}/GB`;
+            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage US$${account.egress.overageUsdPerGB || '—'}/GB`;
         } else {
             restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · paid overage off`;
         }

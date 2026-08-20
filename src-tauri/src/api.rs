@@ -457,7 +457,7 @@ impl SaveStateClient {
             .context("Failed to parse repo session response")
     }
 
-    // ── Phase 3: restore egress authorization (3x killswitch) ────────
+    // ── Restore egress authorization (plan-specific allowance) ─────
 
     /// Ask the backend to authorize and meter a restore of `bytes` against the
     /// monthly egress allowance. Returns the fair-use error message on a 403.
