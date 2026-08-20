@@ -33,6 +33,21 @@ If a user configures Discord notifications, the destination is stored by the
 SaveState API and delivery is performed by the hosted service. The desktop
 client does not contact Discord directly.
 
+## Account recovery and multi-factor authentication
+
+For accounts that enable TOTP or use recovery, the hosted service processes the
+account email address, an encrypted TOTP authenticator seed, and hashed
+account-recovery tokens or recovery codes. It also retains limited
+security-audit metadata and a one-way request fingerprint to rate-limit abuse
+and investigate recovery activity. Recovery tokens and codes are not stored in
+plaintext, and the TOTP seed is encrypted at rest.
+
+Email access, a TOTP authenticator, and recovery codes authenticate control of
+the SaveState account. They are not the vault master key and cannot themselves
+decrypt a backup. Access to existing encrypted backups still depends on the
+separately protected, client-owned master-key envelope or key slot. Account
+recovery does not create a server-side plaintext copy of that key.
+
 ## Information intentionally excluded from job telemetry
 
 Engine job events identify the authenticated installation and operation, but
