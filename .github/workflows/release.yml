@@ -1,0 +1,347 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+# A single tagged job builds the installers once, then publishes those exact
+# files to both GitHub Releases and R2. Releases are serialized so an older job
+# cannot update the shared latest manifests after a newer tag.
+concurrency:
+  group: savestate-desktop-production-release
+  cancel-in-progress: false
+
+jobs:
+  build-sign-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag and package versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -ne "tag" -or $env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Releases require a stable semantic-version tag such as v2.0.15"
+          }
+
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag must point to a commit contained in public main"
+          }
+
+          $expectedVersion = $env:GITHUB_REF_NAME.Substring(1)
+          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $cargoVersion = (
+            Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+              Select-Object -First 1
+          ).Matches[0].Groups[1].Value
+
+          foreach ($entry in @{
+            "package.json" = $packageVersion
+            "src-tauri/Cargo.toml" = $cargoVersion
+            "src-tauri/tauri.conf.json" = $tauriVersion
+          }.GetEnumerator()) {
+            if ($entry.Value -ne $expectedVersion) {
+              throw "$($entry.Key) version $($entry.Value) does not match tag $env:GITHUB_REF_NAME"
+            }
+          }
+
+      - name: Verify release configuration is available
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+          R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @(
+            "TAURI_SIGNING_PRIVATE_KEY",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+            "R2_ENDPOINT_URL",
+            "R2_PUBLIC_BASE_URL",
+            "R2_RELEASE_BUCKET"
+          )) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Required release secret or variable is not configured: $name"
+            }
+          }
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Rust stable
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install and audit frontend dependencies
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+
+      - name: Bundle pinned Kopia
+        run: npm run bundle:kopia
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Check frontend JavaScript
+        shell: pwsh
+        run: |
+          node --check src/app.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check scripts/bundle-kopia.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Tauri updater artifacts once
+        run: npm run build:release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Stage immutable release artifacts and manifests
+        id: stage
+        shell: pwsh
+        env:
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1)
+          $bundle = Resolve-Path "src-tauri/target/release/bundle"
+          $msiFiles = @(Get-ChildItem (Join-Path $bundle "msi") -Filter "*.msi" -File)
+          $exeFiles = @(Get-ChildItem (Join-Path $bundle "nsis") -Filter "*.exe" -File)
+
+          if ($msiFiles.Count -ne 1) { throw "Expected exactly one MSI, found $($msiFiles.Count)" }
+          if ($exeFiles.Count -ne 1) { throw "Expected exactly one NSIS EXE, found $($exeFiles.Count)" }
+
+          $signaturePath = "$($exeFiles[0].FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) {
+            throw "Missing Tauri updater signature: $signaturePath"
+          }
+          $signature = (Get-Content -Raw -LiteralPath $signaturePath).Trim()
+          if ([string]::IsNullOrWhiteSpace($signature)) {
+            throw "Tauri updater signature is empty"
+          }
+
+          $dist = New-Item -ItemType Directory -Path dist -Force
+          $msi = Copy-Item -LiteralPath $msiFiles[0].FullName -Destination $dist.FullName -PassThru
+          $exe = Copy-Item -LiteralPath $exeFiles[0].FullName -Destination $dist.FullName -PassThru
+          $sig = Copy-Item -LiteralPath $signaturePath -Destination $dist.FullName -PassThru
+
+          $publicBase = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
+          $versionBase = "$publicBase/$tag/windows"
+          $msiUrl = "$versionBase/$([Uri]::EscapeDataString($msi.Name))"
+          $exeUrl = "$versionBase/$([Uri]::EscapeDataString($exe.Name))"
+          $commitTime = (git show -s --format=%cI $env:GITHUB_SHA).Trim()
+          $publicationTime = [DateTimeOffset]::Parse($commitTime).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          @{
+            url = $msiUrl
+            version = $version
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $dist "download-windows.json")
+
+          @{
+            version = $version
+            notes = "Update to $tag"
+            pub_date = $publicationTime
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $signature
+                url = $exeUrl
+              }
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $dist "windows-x86_64.json")
+
+          $artifacts = @($msi, $exe, $sig)
+          $checksums = foreach ($artifact in $artifacts) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+            "$hash  $($artifact.Name)"
+          }
+          $checksums | Set-Content -Encoding ascii (Join-Path $dist "SHA256SUMS")
+
+          $provenanceArtifacts = @{}
+          foreach ($artifact in $artifacts) {
+            $provenanceArtifacts[$artifact.Name] = @{
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+              size = $artifact.Length
+            }
+          }
+          @{
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            tag = $tag
+            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            artifacts = $provenanceArtifacts
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $dist "release-provenance.json")
+
+          "msi_name=$($msi.Name)" >> $env:GITHUB_OUTPUT
+          "exe_name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          "sig_name=$($sig.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Confirm this version has never been published
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseLookup = (
+            & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME" 2>&1 |
+              Out-String
+          )
+          if ($LASTEXITCODE -eq 0) {
+            throw "GitHub Release $env:GITHUB_REF_NAME already exists; release assets are immutable"
+          }
+          if ($releaseLookup -notmatch 'HTTP 404') {
+            throw "Unable to confirm that the GitHub Release is new: $releaseLookup"
+          }
+
+          $prefix = "$env:GITHUB_REF_NAME/windows/"
+          $existing = & aws s3 ls "s3://$env:R2_RELEASE_BUCKET/$prefix" --endpoint-url $env:R2_ENDPOINT_URL
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check the R2 release prefix" }
+          if ($existing) { throw "R2 release prefix $prefix is not empty; refusing to overwrite it" }
+
+      - name: Create draft GitHub Release from staged bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(
+            "dist/$($env:MSI_NAME)",
+            "dist/$($env:EXE_NAME)",
+            "dist/$($env:SIG_NAME)",
+            "dist/SHA256SUMS",
+            "dist/release-provenance.json",
+            "dist/download-windows.json",
+            "dist/windows-x86_64.json"
+          )
+          gh release create $env:GITHUB_REF_NAME @assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag `
+            --draft `
+            --generate-notes `
+            --title "SaveState Vault $env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to create the draft GitHub Release" }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSI_NAME: ${{ steps.stage.outputs.msi_name }}
+          EXE_NAME: ${{ steps.stage.outputs.exe_name }}
+          SIG_NAME: ${{ steps.stage.outputs.sig_name }}
+
+      - name: Upload the same installer bytes to immutable R2 paths
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+          MSI_NAME: ${{ steps.stage.outputs.msi_name }}
+          EXE_NAME: ${{ steps.stage.outputs.exe_name }}
+          SIG_NAME: ${{ steps.stage.outputs.sig_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Invoke-Aws([string[]] $Arguments) {
+            & aws @Arguments
+            if ($LASTEXITCODE -ne 0) { throw "AWS CLI failed with exit code $LASTEXITCODE" }
+          }
+
+          $prefix = "$env:GITHUB_REF_NAME/windows"
+          foreach ($name in @($env:MSI_NAME, $env:EXE_NAME, $env:SIG_NAME)) {
+            Invoke-Aws @(
+              "s3", "cp", "dist/$name", "s3://$env:R2_RELEASE_BUCKET/$prefix/$name",
+              "--endpoint-url", $env:R2_ENDPOINT_URL,
+              "--only-show-errors"
+            )
+          }
+
+          # Read the immutable objects back before exposing a latest manifest.
+          $verify = New-Item -ItemType Directory -Path r2-verify -Force
+          foreach ($name in @($env:MSI_NAME, $env:EXE_NAME, $env:SIG_NAME)) {
+            Invoke-Aws @(
+              "s3", "cp", "s3://$env:R2_RELEASE_BUCKET/$prefix/$name", (Join-Path $verify $name),
+              "--endpoint-url", $env:R2_ENDPOINT_URL,
+              "--only-show-errors"
+            )
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$name").Hash
+            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $verify $name)).Hash
+            if ($localHash -ne $remoteHash) { throw "R2 verification failed for $name" }
+          }
+
+      - name: Determine whether this is the newest tag
+        id: latest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git fetch --force --tags origin
+          $stableTags = @(
+            git tag --list "v*" |
+              Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+              Sort-Object { [Version]$_.Substring(1) } -Descending
+          )
+          if ($stableTags.Count -eq 0) { throw "No stable semantic-version tags were found" }
+          $latestTag = $stableTags[0]
+          "publish=$($latestTag -eq $env:GITHUB_REF_NAME)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+
+      - name: Publish latest manifests from the verified R2 bytes
+        if: steps.latest.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          R2_RELEASE_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & aws s3 cp dist/download-windows.json "s3://$env:R2_RELEASE_BUCKET/latest/download-windows.json" --endpoint-url $env:R2_ENDPOINT_URL --content-type application/json --cache-control "no-cache" --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish the Windows download manifest" }
+          & aws s3 cp dist/windows-x86_64.json "s3://$env:R2_RELEASE_BUCKET/updater/windows-x86_64.json" --endpoint-url $env:R2_ENDPOINT_URL --content-type application/json --cache-control "no-cache" --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish the Windows updater manifest" }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_LATEST: ${{ steps.latest.outputs.publish }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arguments = @(
+            "release", "edit", $env:GITHUB_REF_NAME,
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--draft=false"
+          )
+          if ($env:IS_LATEST -eq "true") { $arguments += "--latest" }
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish the GitHub Release" }
