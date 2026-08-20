@@ -17,11 +17,20 @@ The application communicates with `api.savestate.dk` over HTTPS to:
   and
 - check for application updates.
 
-File contents and repository metadata are encrypted on the user's device before
-upload. The current hosted service proxies that encrypted repository traffic
-through SaveState's ciphertext-only API gateway in the European Union to
-Backblaze B2 storage in the European Union. Restore operations follow the
-reverse route and are decrypted only on the user's device.
+Backup contents and Kopia repository objects are encrypted on the user's device
+before upload. The current hosted service proxies that encrypted repository
+traffic through SaveState's ciphertext-only API gateway to Backblaze B2 EU
+Central, where the backup objects are stored. Restore operations follow the
+reverse route and are decrypted only on the user's device. This EU-residency
+statement applies to stored backup objects; it does not claim that every
+transient gateway processing or network-routing location is in the EU.
+
+To provide the dashboard, scheduling, and job history, the SaveState API
+separately processes limited readable operational metadata. Depending on the
+operation, that can include a snapshot identifier, source path, timestamp,
+size, file count, folder, schedule timing, and job status. This operational
+metadata is not part of the encrypted Kopia repository, and it does not contain
+backup file contents or the decrypted vault master key.
 
 The gateway authorizes the repository request and forwards encrypted objects;
 it does not receive the repository password, decrypted master key, or plaintext
@@ -53,7 +62,10 @@ recovery does not create a server-side plaintext copy of that key.
 Engine job events identify the authenticated installation and operation, but
 the client is designed not to send source-folder paths, restored destination
 paths, profile names, filenames, file contents, repository passwords, or the
-decrypted master key as job telemetry.
+decrypted master key in those job-event payloads. This job-telemetry exclusion
+does not apply to the limited dashboard and schedule metadata described above;
+for example, a snapshot source path may be processed separately for display in
+the dashboard.
 
 ## Third-party requests
 
