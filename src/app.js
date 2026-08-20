@@ -107,12 +107,12 @@ function setupEventListeners() {
         const rememberMe = document.getElementById('login-remember').checked;
         const btn = document.getElementById('login-btn');
         const errorEl = document.getElementById('login-error');
-        
+
         btn.querySelector('.btn-text').textContent = 'Signing in…';
         btn.querySelector('.spinner').classList.remove('hidden');
         btn.disabled = true;
         errorEl.classList.add('hidden');
-        
+
         try {
             const result = await invoke('cmd_login', { email, password, rememberMe });
             document.getElementById('login-password').value = '';
@@ -196,7 +196,7 @@ function setupEventListeners() {
         showLoginAuthCard();
     });
 
-    // Logout
+    // Logou
     document.getElementById('btn-logout').addEventListener('click', async () => {
         const button = document.getElementById('btn-logout');
         button.disabled = true;
@@ -410,7 +410,7 @@ function setupEventListeners() {
 
         if (!name || !sourcePath) { showToast('Name and source path required', 'error'); return; }
 
-        // Validate time format
+        // Validate time forma
         let schedule = null;
         if (timesRaw) {
             intervalDays = Math.max(1, Math.min(365, intervalDays));
@@ -575,7 +575,7 @@ function setupTauriListeners() {
     listen('backup-progress', (event) => {
         const p = event.payload;
         const pct = Math.round(p.progress * 100);
-        
+
         // Quick backup specific UI
         const fill = document.getElementById('backup-progress-fill');
         const msg = document.getElementById('backup-progress-msg');
@@ -587,7 +587,7 @@ function setupTauriListeners() {
         const globalFill = document.getElementById('global-progress-fill');
         const globalMsg = document.getElementById('global-progress-msg');
         const globalPct = document.getElementById('global-progress-pct');
-        
+
         if (globalBar && globalFill && globalMsg && globalPct) {
             if (globalProgressHideTimer) {
                 clearTimeout(globalProgressHideTimer);
@@ -597,7 +597,7 @@ function setupTauriListeners() {
             globalFill.style.width = `${pct}%`;
             globalMsg.textContent = p.message;
             globalPct.textContent = `${pct}%`;
-            
+
             if (p.stage === 'done') {
                 globalProgressHideTimer = setTimeout(hideGlobalProgress, 2000);
             } else if (p.stage === 'error' || p.stage === 'cancelled') {
@@ -808,7 +808,7 @@ function warmRepositoryInBackground() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// View / Page Management
+// View / Page Managemen
 // ────────────────────────────────────────────────────────────────
 function showView(viewId) {
     document.getElementById('view-login').classList.toggle('active', viewId === 'login');
@@ -831,7 +831,7 @@ function navigateTo(pageId) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Toast
+// Toas
 // ────────────────────────────────────────────────────────────────
 function friendlyError(error) {
     const raw = String(error ?? '').replace(/\\n/g, ' ').replace(/[\r\n\t]+/g, ' ').trim();
@@ -1105,7 +1105,7 @@ function resetBackupMode() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Backups List
+// Backups Lis
 // ────────────────────────────────────────────────────────────────
 async function loadBackups() {
     const tbody = document.getElementById('backups-tbody');
@@ -1312,7 +1312,7 @@ async function loadBackups() {
             actionsDiv.appendChild(moveBtn);
             actionsDiv.appendChild(deleteBtn);
             tdActions.appendChild(actionsDiv);
-            
+
             tr.appendChild(tdName);
             tr.appendChild(tdSize);
             tr.appendChild(tdDate);
@@ -1338,7 +1338,7 @@ function renderBackupsBreadcrumb() {
 
     const parts = currentFolder === '/' ? [] : currentFolder.split('/').filter(Boolean);
 
-    // Root segment
+    // Root segmen
     const rootSeg = document.createElement('span');
     rootSeg.className = 'breadcrumb-segment' + (parts.length === 0 ? ' active' : '');
     rootSeg.textContent = '📂 / (root)';
@@ -1769,7 +1769,7 @@ async function loadProfiles() {
 
                 showToast(`Backup started for "${p.name}"`, 'success');
 
-                // Fire-and-forget — don't await
+                // Fire-and-forget — don't awai
                 invoke('cmd_run_profile_backup', { profileId: p.id })
                     .then(() => {
                         // Backup finished — progress events already handle UI
@@ -1829,7 +1829,7 @@ function openProfileModal(profile = null) {
                 document.getElementById('profile-schedule-times').value = (sched.times || []).join(', ');
                 document.getElementById('profile-schedule-interval').value = sched.intervalDays || 0;
             } catch {
-                // Legacy format
+                // Legacy forma
                 document.getElementById('profile-schedule-times').value = '';
                 document.getElementById('profile-schedule-interval').value = 1;
             }
