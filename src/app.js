@@ -992,7 +992,9 @@ async function loadDashboard() {
 
         const restoreMeta = document.getElementById('usage-restore-meta');
         if (account.egress?.paidOverageEnabled) {
-            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage US$${account.egress.overageUsdPerGB || '—'}/GB`;
+            const dkkRate = Number(account.egress.overageDkkPerGB);
+            const displayedRate = Number.isFinite(dkkRate) ? dkkRate.toFixed(4) : '—';
+            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage DKK ${displayedRate}/GB`;
         } else {
             restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · paid overage off`;
         }
