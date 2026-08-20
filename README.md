@@ -41,6 +41,9 @@ See [SECURITY.md](SECURITY.md) for the supported security boundary and private
 vulnerability reporting process. Network behavior is documented in
 [PRIVACY.md](PRIVACY.md), and the key hierarchy and recovery invariants are
 documented in [docs/VAULT_RECOVERY.md](docs/VAULT_RECOVERY.md).
+The coordinated service prerequisites, deployment order, rollback policy, and
+validation matrix are recorded in
+[docs/RECOVERY_RELEASE_HANDOVER_2026-08-20.md](docs/RECOVERY_RELEASE_HANDOVER_2026-08-20.md).
 
 ## Technology
 
