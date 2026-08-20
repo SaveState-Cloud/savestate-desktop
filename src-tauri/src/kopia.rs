@@ -1252,7 +1252,7 @@ async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> R
     upload_manifest_with_retry(api, &snapshots).await
 }
 
-/// Restore a snapshot to `target_path`. Enforces the 3x egress killswitch by
+/// Restore a snapshot to `target_path`. Enforces the plan's egress allowance by
 /// asking the backend to authorize the snapshot's size BEFORE pulling data.
 pub async fn restore_snapshot(
     app: &tauri::AppHandle,
@@ -1623,8 +1623,8 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
             ),
             Err(error) => emit_storage_cleanup(
                 &app,
-                "pending",
-                &format!("Cleanup will retry safely later: {}", error),
+                "failed",
+                &format!("Storage cleanup could not finish: {}", error),
             ),
         }
     });

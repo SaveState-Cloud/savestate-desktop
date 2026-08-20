@@ -6,6 +6,7 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open, confirm: confirmDialog } = window.__TAURI__.dialog;
 const vaultRecoveryUi = window.SaveStateVaultRecovery;
+const storageUsageUi = window.SaveStateStorageUsage;
 
 // ── Auto-updater state ───────────────────────────────────────────
 let availableUpdateVersion = null;
@@ -42,7 +43,6 @@ let repositoryWarmupPromise = null;
 let repositorySessionGeneration = 0;
 let legacyProfileNoticeShown = false;
 let pendingVaultLoginResult = null;
-const EMPTY_REPOSITORY_DISPLAY_THRESHOLD_BYTES = 5 * 1024 * 1024;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -716,6 +716,8 @@ function setupTauriListeners() {
                     loadDashboard();
                 }
             }, 1200);
+        } else if (cleanup.status === 'failed') {
+            showToast(friendlyError(cleanup.message), 'error');
         }
     });
 
@@ -844,7 +846,7 @@ function friendlyError(error) {
         return 'This backup repository cannot be decrypted with the account key stored on this PC. No data was changed. Sign in again to reconnect it.';
     }
     if (lower.includes('designated user')) {
-        return 'Storage cleanup is waiting for repository ownership to be updated. Backups remain safe; cleanup will retry automatically.';
+        return 'Storage cleanup could not take ownership of this older repository. Your backups remain safe; install the latest update and try again.';
     }
     if (lower.includes('missing required key name') || lower.includes("invalid args `name`")) {
         return 'The folder name could not be sent to the app. Install the latest update and try again.';
@@ -961,12 +963,7 @@ async function loadDashboard() {
         document.getElementById('stat-plan').textContent = account.plan || 'No plan';
 
         const usage = Math.max(0, Math.trunc(Number(account.usage?.bytes || 0)));
-        const backupCount = Array.isArray(backupState?.backups)
-            ? backupState.backups.length
-            : (Number.isFinite(Number(backupState?.count)) ? Number(backupState.count) : null);
-        const displayedUsage = backupCount === 0 && usage < EMPTY_REPOSITORY_DISPLAY_THRESHOLD_BYTES
-            ? 0
-            : usage;
+        const displayedUsage = storageUsageUi.customerVisibleUsage(usage, backupState);
         const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
         const limitBytes = limitGB * 1024 * 1024 * 1024;
         const pct = limitBytes > 0 ? Math.min(100, (displayedUsage / limitBytes) * 100) : 0;
@@ -995,13 +992,17 @@ async function loadDashboard() {
 
         const restoreMeta = document.getElementById('usage-restore-meta');
         if (account.egress?.paidOverageEnabled) {
-            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage US$${account.egress.overageUsdPerGB || '0.0205'}/GB`;
+            const dkkRate = Number(account.egress.overageDkkPerGB);
+            const displayedRate = Number.isFinite(dkkRate) ? dkkRate.toFixed(4) : '—';
+            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage DKK ${displayedRate}/GB`;
         } else {
             restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · paid overage off`;
         }
 
-        const inferredCleanup = backupCount === 0 && usage >= 1024 * 1024;
-        setStorageCleanupState(storageCleanupPending || inferredCleanup);
+        const inferredCleanup = storageUsageUi.shouldScheduleCleanup(usage, backupState);
+        // A maintenance hint is not a customer-facing storage state. Only show
+        // the badge while a native cleanup job is actually queued or running.
+        setStorageCleanupState(storageCleanupPending);
         if (inferredCleanup) {
             invoke('cmd_schedule_storage_cleanup').catch((error) => {
                 console.warn('Could not schedule storage cleanup:', error);
