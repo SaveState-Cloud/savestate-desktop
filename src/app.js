@@ -43,6 +43,7 @@ let repositoryWarmupPromise = null;
 let repositorySessionGeneration = 0;
 let legacyProfileNoticeShown = false;
 let pendingVaultLoginResult = null;
+let discordWebhookConfigured = false;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -447,6 +448,8 @@ function setupEventListeners() {
     // ── Settings ──────────────────────────────────────────────
     document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
     document.getElementById('btn-test-notification').addEventListener('click', testNotification);
+    document.getElementById('btn-remove-webhook').addEventListener('click', removeWebhook);
+    document.getElementById('btn-toggle-webhook-visibility').addEventListener('click', toggleWebhookVisibility);
 
     // ── Folder Management ─────────────────────────────────────────
     document.getElementById('btn-create-folder').addEventListener('click', () => {
@@ -1936,8 +1939,12 @@ function shortenPath(path) {
 async function loadSettings() {
     try {
         const settings = await invoke('cmd_get_settings');
-        document.getElementById('settings-webhook-url').value = settings.discordWebhookUrl || '';
-        document.getElementById('settings-channel-id').value = settings.discordChannelId || '';
+        const webhookInput = document.getElementById('settings-webhook-url');
+        webhookInput.value = '';
+        webhookInput.type = 'password';
+        discordWebhookConfigured = settings.discordWebhookConfigured === true
+            || Boolean(settings.discordWebhookUrl);
+        updateWebhookStatus();
 
         const prefs = settings.notificationPrefs || {};
         document.getElementById('pref-backup-success').checked = (prefs.backupSuccess ?? prefs.backup_success) !== false;
@@ -1950,10 +1957,10 @@ async function loadSettings() {
     }
 }
 
-function readNotificationSettings() {
+function readNotificationSettings(clearDiscordWebhook = false) {
     return {
         discordWebhookUrl: document.getElementById('settings-webhook-url').value.trim() || null,
-        discordChannelId: document.getElementById('settings-channel-id').value.trim() || null,
+        clearDiscordWebhook,
         notificationPrefs: {
             backupSuccess: document.getElementById('pref-backup-success').checked,
             backupFailure: document.getElementById('pref-backup-failure').checked,
@@ -1967,7 +1974,13 @@ function readNotificationSettings() {
 async function saveSettings(showSuccess = true) {
     try {
         await invoke('cmd_save_settings', { settings: readNotificationSettings() });
-        if (showSuccess) showToast('Settings saved!', 'success');
+        const webhookInput = document.getElementById('settings-webhook-url');
+        if (webhookInput.value.trim()) {
+            discordWebhookConfigured = true;
+            webhookInput.value = '';
+            updateWebhookStatus();
+        }
+        if (showSuccess) showToast('Notification settings saved.', 'success');
         return true;
     } catch (err) {
         showToast('Failed to save: ' + String(err), 'error');
@@ -1975,10 +1988,47 @@ async function saveSettings(showSuccess = true) {
     }
 }
 
+function updateWebhookStatus() {
+    const status = document.getElementById('settings-webhook-status');
+    const input = document.getElementById('settings-webhook-url');
+    status.textContent = discordWebhookConfigured
+        ? 'A webhook is configured. Paste a new URL to replace it, or leave this field empty to keep it.'
+        : 'No webhook is configured.';
+    input.placeholder = discordWebhookConfigured
+        ? 'Webhook configured — paste a new URL to replace it'
+        : 'https://discord.com/api/webhooks/...';
+}
+
+function toggleWebhookVisibility() {
+    const input = document.getElementById('settings-webhook-url');
+    const button = document.getElementById('btn-toggle-webhook-visibility');
+    const reveal = input.type === 'password';
+    input.type = reveal ? 'url' : 'password';
+    button.textContent = reveal ? 'Hide' : 'Show';
+    button.setAttribute('aria-pressed', String(reveal));
+}
+
+async function removeWebhook() {
+    if (!discordWebhookConfigured && !document.getElementById('settings-webhook-url').value.trim()) {
+        showToast('No Discord webhook is configured.', 'info');
+        return;
+    }
+    if (!window.confirm('Remove the saved Discord webhook? Notifications will stop until a new webhook is configured.')) return;
+    try {
+        await invoke('cmd_save_settings', { settings: readNotificationSettings(true) });
+        discordWebhookConfigured = false;
+        document.getElementById('settings-webhook-url').value = '';
+        updateWebhookStatus();
+        showToast('Discord webhook removed.', 'success');
+    } catch (err) {
+        showToast('Failed to remove webhook: ' + String(err), 'error');
+    }
+}
+
 async function testNotification() {
     try {
-        // Test exactly what is currently visible in the form. This also makes
-        // the successful test destination the saved destination.
+        // A newly pasted URL is saved before testing. If the field is blank,
+        // the API tests the existing write-only destination.
         if (!await saveSettings(false)) return;
         const result = await invoke('cmd_test_notification');
         if (result && result.sent) {

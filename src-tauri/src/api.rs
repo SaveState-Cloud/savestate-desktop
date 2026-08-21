@@ -161,7 +161,10 @@ impl Default for NotificationPrefs {
 #[serde(rename_all = "camelCase")]
 pub struct UserSettings {
     pub discord_webhook_url: Option<String>,
-    pub discord_channel_id: Option<String>,
+    #[serde(default)]
+    pub clear_discord_webhook: bool,
+    #[serde(default)]
+    pub discord_webhook_configured: bool,
     pub notification_prefs: NotificationPrefs,
 }
 
