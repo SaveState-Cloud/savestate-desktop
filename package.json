@@ -1,6 +1,6 @@
 {
   "name": "savestate-desktop",
-  "version": "2.0.17",
+  "version": "2.0.18",
   "description": "Official open-source Windows client for SaveState encrypted backups",
   "private": true,
   "license": "GPL-3.0-only",

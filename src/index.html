@@ -436,30 +436,22 @@
                         <div class="badge badge-success">Client-Side Encryption Active</div>
                     </div>
 
-                    <!-- Discord Notifications -->
+                    <!-- Discord Webhook Notifications -->
                     <div class="settings-section glass-card">
                         <h3>🔔 Notifications</h3>
-                        <p class="text-muted">Get alerts in Discord when backups and restores succeed or fail.</p>
+                        <p class="text-muted">Send backup and restore alerts to a Discord webhook. SaveState does not require a server bot.</p>
 
                         <div class="settings-subsection">
                             <h4>Discord Webhook</h4>
-                            <p class="text-muted text-sm">In Discord, open Server Settings → Integrations → Webhooks, create a webhook, and copy its URL here. Test Notification saves the current settings first and reports Discord's actual result.</p>
+                            <p class="text-muted text-sm">In Discord, open Server Settings → Integrations → Webhooks, create a webhook, and paste its URL here. The credential is write-only after saving. Test Notification saves a newly pasted URL first and reports Discord's actual result.</p>
                             <div class="form-group">
-                                <input type="url" id="settings-webhook-url" placeholder="https://discord.com/api/webhooks/..." />
+                                <label for="settings-webhook-url">Webhook URL</label>
+                                <div class="input-row">
+                                    <input type="password" id="settings-webhook-url" autocomplete="off" spellcheck="false" placeholder="https://discord.com/api/webhooks/..." />
+                                    <button class="btn btn-ghost btn-sm" type="button" id="btn-toggle-webhook-visibility" aria-pressed="false">Show</button>
+                                </div>
+                                <p class="text-muted text-sm" id="settings-webhook-status">No webhook is configured.</p>
                             </div>
-                        </div>
-
-                        <div class="settings-subsection">
-                            <h4>Discord Bot</h4>
-                            <p class="text-muted text-sm">Invite the SaveState bot and use <code>/setup</code> in your server to get your Channel ID.</p>
-                            <div class="form-group">
-                                <label>Channel ID</label>
-                                <input type="text" id="settings-channel-id" placeholder="e.g. 1234567890123456789" />
-                            </div>
-                            <a href="#" class="btn btn-ghost btn-sm" id="btn-invite-bot" target="_blank">
-                                <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                                Invite Bot to Server
-                            </a>
                         </div>
 
                         <div class="settings-subsection">
@@ -491,6 +483,7 @@
                         <div class="settings-actions">
                             <button class="btn btn-primary btn-sm" id="btn-save-settings">Save Notification Settings</button>
                             <button class="btn btn-ghost btn-sm" id="btn-test-notification">Test Notification</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-remove-webhook">Remove Webhook</button>
                         </div>
                     </div>
 
