@@ -630,6 +630,32 @@ fn s3_connect_args(session: &RepoSession) -> Vec<String> {
     ]
 }
 
+fn backup_reliability_policy_args(
+    new_repository: bool,
+    enable_volume_shadow_copy: bool,
+) -> Option<Vec<String>> {
+    if !new_repository && !enable_volume_shadow_copy {
+        return None;
+    }
+    let mut args = vec![
+        "policy".to_string(),
+        "set".to_string(),
+        "--global".to_string(),
+    ];
+    if new_repository {
+        args.push("--compression=zstd".to_string());
+    }
+    if enable_volume_shadow_copy {
+        // Kopia's native VSS integration snapshots a stable Windows volume
+        // view before it reads files that may be locked by running services.
+        // `when-available` falls back to normal traversal without prompting for
+        // elevation if this process cannot create a shadow copy. Read errors
+        // remain fatal, so the fallback cannot silently produce a partial backup.
+        args.push("--enable-volume-shadow-copy=when-available".to_string());
+    }
+    Some(args)
+}
+
 /// Connect to the repository, creating it first if it does not yet exist
 /// (only in backup mode, where we hold write capability).
 async fn ensure_repo(
@@ -739,46 +765,50 @@ async fn ensure_repo_with_context(
             cancellation.as_ref(),
         )?;
 
-        if out.status.success() {
-            return Ok(());
+        let mut new_repository = false;
+        if !out.status.success() {
+            let connect_error = String::from_utf8_lossy(&out.stderr);
+
+            // Creating over an existing repository after an authentication,
+            // decryption, or network failure can make recovery harder. Only
+            // initialize storage when Kopia explicitly reports that no
+            // repository exists there yet.
+            if mode_is_backup && repository_is_missing(&connect_error) {
+                let mut create = vec!["repository".to_string(), "create".to_string()];
+                create.extend(base);
+                let out = run_kopia_for_backup(
+                    &app,
+                    &create,
+                    Some(&password_cloned),
+                    Some(&session_for_blocking),
+                    cancellation.as_ref(),
+                )?;
+                ensure_success(&out, "repository create")?;
+                new_repository = true;
+            } else {
+                return Err(classify_kopia_error("repository connect", &connect_error));
+            }
         }
 
-        let connect_error = String::from_utf8_lossy(&out.stderr);
-
-        // Creating over an existing repository after an authentication,
-        // decryption, or network failure can make recovery harder. Only
-        // initialize storage when Kopia explicitly reports that no repository
-        // exists there yet.
-        if mode_is_backup && repository_is_missing(&connect_error) {
-            let mut create = vec!["repository".to_string(), "create".to_string()];
-            create.extend(base.clone());
-            let out = run_kopia_for_backup(
-                &app,
-                &create,
-                Some(&password_cloned),
-                Some(&session_for_blocking),
-                cancellation.as_ref(),
-            )?;
-            ensure_success(&out, "repository create")?;
-
-            // Apply global compression + maintenance defaults on first create.
-            let policy = vec![
-                "policy".to_string(),
-                "set".to_string(),
-                "--global".to_string(),
-                "--compression=zstd".to_string(),
-            ];
-            let _ = run_kopia_for_backup(
-                &app,
-                &policy,
-                Some(&password_cloned),
-                Some(&session_for_blocking),
-                cancellation.as_ref(),
-            );
-            return Ok(());
+        if mode_is_backup {
+            if let Some(policy) =
+                backup_reliability_policy_args(new_repository, cfg!(target_os = "windows"))
+            {
+                // Reapply the idempotent policy after connecting so repositories
+                // created by older SaveState versions gain Windows VSS support as
+                // soon as the updated client performs its first backup warm-up.
+                let out = run_kopia_for_backup(
+                    &app,
+                    &policy,
+                    Some(&password_cloned),
+                    Some(&session_for_blocking),
+                    cancellation.as_ref(),
+                )?;
+                ensure_success(&out, "backup reliability policy")?;
+            }
         }
 
-        Err(classify_kopia_error("repository connect", &connect_error))
+        Ok(())
     })
     .await
     .context("kopia connect task panicked")??;
@@ -1770,9 +1800,9 @@ pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper
 #[cfg(test)]
 mod tests {
     use super::{
-        begin_operation, cancel_restore, classify_kopia_error, clear_restore_cancellation,
-        ensure_restore_not_cancelled, execute_rollback_steps, parse_snapshot,
-        repository_is_missing, try_begin_update,
+        backup_reliability_policy_args, begin_operation, cancel_restore, classify_kopia_error,
+        clear_restore_cancellation, ensure_restore_not_cancelled, execute_rollback_steps,
+        parse_snapshot, repository_is_missing, try_begin_update,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1817,6 +1847,49 @@ mod tests {
             "decrypt: unable to decrypt content: cipher: message authentication failed"
         ));
         assert!(!repository_is_missing("request timed out"));
+    }
+
+    #[test]
+    fn existing_windows_repository_gets_only_kopias_native_vss_upgrade() {
+        let args = backup_reliability_policy_args(false, true).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "policy",
+                "set",
+                "--global",
+                "--enable-volume-shadow-copy=when-available",
+            ]
+        );
+    }
+
+    #[test]
+    fn new_windows_repository_gets_compression_and_vss_defaults() {
+        let args = backup_reliability_policy_args(true, true).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "policy",
+                "set",
+                "--global",
+                "--compression=zstd",
+                "--enable-volume-shadow-copy=when-available",
+            ]
+        );
+    }
+
+    #[test]
+    fn existing_non_windows_repository_needs_no_policy_migration() {
+        assert!(backup_reliability_policy_args(false, false).is_none());
+    }
+
+    #[test]
+    fn new_non_windows_repository_keeps_the_compression_default() {
+        let args = backup_reliability_policy_args(true, false).unwrap();
+        assert_eq!(
+            args,
+            vec!["policy", "set", "--global", "--compression=zstd"]
+        );
     }
 
     #[test]

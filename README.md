@@ -33,6 +33,12 @@ services and are not included here.
   client can safely recover the existing vault after reauthentication.
 - Storage access uses short-lived, account-scoped credentials issued by the
   SaveState API.
+- On Windows, the client enables Kopia's native Volume Shadow Copy policy in
+  `when-available` mode before backups. This gives Kopia a stable view of files
+  opened by running services when VSS is available and falls back to normal
+  traversal without an elevation prompt when it is not. File and directory
+  read errors still fail the snapshot rather than making an incomplete backup
+  appear successful.
 - The account password is sent to the SaveState API over HTTPS for account
   authentication. For that reason, this project describes its protection as
   **client-side encryption**, not strict zero-knowledge authentication.
