@@ -17,6 +17,32 @@ struct ScheduleReportState {
 static SCHEDULE_REPORT_STATE: OnceLock<Mutex<ScheduleReportState>> = OnceLock::new();
 const LOCAL_SCHEDULE_MIGRATION_KEY: &str = "schedule_times_machine_local_v1";
 
+fn is_automated_profile(profile: &BackupProfile) -> bool {
+    profile.enabled
+        && profile
+            .schedule
+            .as_deref()
+            .is_some_and(|schedule| !schedule.trim().is_empty())
+}
+
+fn ensure_automated_profile_capacity(
+    profiles: &[BackupProfile],
+    profile_limit: usize,
+    excluded_profile_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    let automated = profiles
+        .iter()
+        .filter(|profile| excluded_profile_id != Some(profile.id.as_str()))
+        .filter(|profile| is_automated_profile(profile))
+        .count();
+    if automated >= profile_limit {
+        return Err(format!(
+            "AUTOMATED_PROFILE_LIMIT_REACHED: Your plan allows up to {profile_limit} enabled scheduled backup profiles. Keep this profile manual-only, pause another schedule, or upgrade your plan."
+        ));
+    }
+    Ok(())
+}
+
 /// Existing JSON schedules were previously interpreted as UTC even though the
 /// UI described ordinary wall-clock times. Recompute them once on upgrade so
 /// an existing 14:15 profile does not remain stuck at 14:15 UTC until edited.
@@ -82,11 +108,12 @@ pub async fn cmd_create_profile(
     retention: i64,
     folder: Option<String>,
 ) -> std::result::Result<BackupProfile, String> {
-    let owner_account = {
+    let (owner_account, api) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
-        guard
+        let owner_account = guard
             .account_scope()
-            .ok_or_else(|| "Sign in before creating a backup profile".to_string())?
+            .ok_or_else(|| "Sign in before creating a backup profile".to_string())?;
+        (owner_account, guard.api.clone())
     };
     let profile = BackupProfile {
         id: uuid::Uuid::new_v4().to_string(),
@@ -107,8 +134,30 @@ pub async fn cmd_create_profile(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
+    let profile_limit = if is_automated_profile(&profile) {
+        Some(
+            api.get_entitlements()
+                .await
+                .map_err(|error| {
+                    format!("Could not verify your automated-profile allowance: {error}")
+                })?
+                .profile_limit
+                .unwrap_or(2) as usize,
+        )
+    } else {
+        None
+    };
+
     {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+        if let Some(profile_limit) = profile_limit {
+            let profiles = db::list_profiles_for_account(
+                &guard.db,
+                profile.owner_account.as_deref().unwrap_or_default(),
+            )
+            .map_err(|e| e.to_string())?;
+            ensure_automated_profile_capacity(&profiles, profile_limit, None)?;
+        }
         db::create_profile(&guard.db, &profile).map_err(|e| e.to_string())?;
     }
 
@@ -129,6 +178,32 @@ pub async fn cmd_update_profile(
     enabled: bool,
     folder: Option<String>,
 ) -> std::result::Result<BackupProfile, String> {
+    let requested_is_automated = enabled
+        && schedule
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let (was_automated, api) = {
+        let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+        let owner_account = guard
+            .account_scope()
+            .ok_or_else(|| "Sign in before editing a backup profile".to_string())?;
+        let existing = db::get_profile_for_account(&guard.db, &id, &owner_account)
+            .map_err(|e| e.to_string())?;
+        (is_automated_profile(&existing), guard.api.clone())
+    };
+    let profile_limit = if requested_is_automated && !was_automated {
+        Some(
+            api.get_entitlements()
+                .await
+                .map_err(|error| {
+                    format!("Could not verify your automated-profile allowance: {error}")
+                })?
+                .profile_limit
+                .unwrap_or(2) as usize,
+        )
+    } else {
+        None
+    };
     let profile = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
@@ -136,6 +211,15 @@ pub async fn cmd_update_profile(
             .ok_or_else(|| "Sign in before editing a backup profile".to_string())?;
         let mut existing = db::get_profile_for_account(&guard.db, &id, &owner_account)
             .map_err(|e| e.to_string())?;
+        if requested_is_automated && !is_automated_profile(&existing) {
+            let profiles = db::list_profiles_for_account(&guard.db, &owner_account)
+                .map_err(|e| e.to_string())?;
+            ensure_automated_profile_capacity(
+                &profiles,
+                profile_limit.unwrap_or(2),
+                Some(id.as_str()),
+            )?;
+        }
         existing.name = name;
         existing.source_path = source_path;
         existing.schedule = schedule.clone();
@@ -195,6 +279,25 @@ pub async fn cmd_list_profiles(
     Ok(profiles)
 }
 
+#[tauri::command]
+pub async fn cmd_get_profile_limit(
+    state: tauri::State<'_, AppStateWrapper>,
+) -> std::result::Result<u32, String> {
+    let api = {
+        let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+        guard
+            .account_scope()
+            .ok_or_else(|| "Sign in before checking profile limits".to_string())?;
+        guard.api.clone()
+    };
+    Ok(api
+        .get_entitlements()
+        .await
+        .map_err(|error| format!("Could not verify your automated-profile allowance: {error}"))?
+        .profile_limit
+        .unwrap_or(2))
+}
+
 /// Count profiles created before account ownership was introduced. They stay
 /// hidden and cannot be scheduled until the user explicitly claims them.
 #[tauri::command]
@@ -214,12 +317,59 @@ pub async fn cmd_count_unowned_profiles(
 pub async fn cmd_claim_unowned_profiles(
     state: tauri::State<'_, AppStateWrapper>,
 ) -> std::result::Result<u64, String> {
+    let api = {
+        let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+        guard.api.clone()
+    };
+    let profile_limit = api
+        .get_entitlements()
+        .await
+        .map_err(|error| format!("Could not verify your automated-profile allowance: {error}"))?
+        .profile_limit
+        .unwrap_or(2) as usize;
     let claimed = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
             .account_scope()
             .ok_or_else(|| "Sign in before claiming legacy profiles".to_string())?;
-        db::claim_unowned_profiles(&guard.db, &owner_account).map_err(|e| e.to_string())?
+        let legacy_ids: std::collections::HashSet<String> = db::list_profiles(&guard.db)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|profile| profile.owner_account.is_none())
+            .map(|profile| profile.id)
+            .collect();
+        let transaction = guard
+            .db
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let claimed =
+            db::claim_unowned_profiles(&transaction, &owner_account).map_err(|e| e.to_string())?;
+        let mut automated_remaining = profile_limit.saturating_sub(
+            db::list_profiles_for_account(&transaction, &owner_account)
+                .map_err(|e| e.to_string())?
+                .iter()
+                .filter(|profile| !legacy_ids.contains(&profile.id))
+                .filter(|profile| is_automated_profile(profile))
+                .count(),
+        );
+        for mut profile in db::list_profiles_for_account(&transaction, &owner_account)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|profile| legacy_ids.contains(&profile.id))
+        {
+            if is_automated_profile(&profile) {
+                if automated_remaining == 0 {
+                    profile.enabled = false;
+                    profile.next_run = None;
+                    profile.schedule_state = "disabled".to_string();
+                    db::update_profile(&transaction, &profile).map_err(|e| e.to_string())?;
+                } else {
+                    automated_remaining -= 1;
+                }
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        claimed
     };
     report_schedule_snapshot(&state);
     Ok(claimed)
@@ -1089,6 +1239,37 @@ mod schedule_time_tests {
             schedule_state: "scheduled".to_string(),
             created_at: "2026-08-18T10:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn automated_profile_capacity_counts_only_enabled_schedules() {
+        let mut scheduled_one = migration_profile("scheduled-1", "2026-08-19T12:15:00Z");
+        let mut scheduled_two = migration_profile("scheduled-2", "2026-08-19T12:15:00Z");
+        let mut manual = migration_profile("manual", "2026-08-19T12:15:00Z");
+        manual.schedule = None;
+        manual.next_run = None;
+        let mut paused = migration_profile("paused", "2026-08-19T12:15:00Z");
+        paused.enabled = false;
+        scheduled_one.enabled = true;
+        scheduled_two.enabled = true;
+
+        let profiles = vec![scheduled_one, manual, paused];
+        assert!(ensure_automated_profile_capacity(&profiles, 2, None).is_ok());
+        let profiles = vec![
+            profiles[0].clone(),
+            profiles[1].clone(),
+            profiles[2].clone(),
+            scheduled_two,
+        ];
+        assert!(ensure_automated_profile_capacity(&profiles, 2, None).is_err());
+    }
+
+    #[test]
+    fn editing_an_existing_automated_profile_can_exclude_it_from_capacity() {
+        let first = migration_profile("first", "2026-08-19T12:15:00Z");
+        let second = migration_profile("second", "2026-08-19T12:15:00Z");
+        let profiles = vec![first, second];
+        assert!(ensure_automated_profile_capacity(&profiles, 2, Some("second")).is_ok());
     }
 
     #[test]

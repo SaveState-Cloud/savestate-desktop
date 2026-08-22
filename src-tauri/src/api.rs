@@ -31,6 +31,8 @@ pub struct AccountResponse {
         alias = "storage_limit_gb"
     )]
     pub storage_limit_gb: Option<f64>,
+    #[serde(default, alias = "profileLimit", alias = "profile_limit")]
+    pub profile_limit: Option<u32>,
     pub usage: Option<serde_json::Value>,
     #[serde(default)]
     pub ingress: Option<serde_json::Value>,
@@ -45,6 +47,12 @@ pub struct AccountResponse {
     pub trial_ends_at: Option<String>,
     #[serde(default, alias = "currentPeriodEnd")]
     pub current_period_end: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntitlementResponse {
+    #[serde(default, alias = "profileLimit", alias = "profile_limit")]
+    pub profile_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,6 +482,19 @@ impl SaveStateClient {
         resp.json()
             .await
             .context("Failed to parse account response")
+    }
+
+    pub async fn get_entitlements(&self) -> Result<EntitlementResponse> {
+        let url = format!("{}/account/entitlements", self.base_url);
+        let auth = self.auth_header()?;
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .context("Failed to fetch account entitlements")?;
+        parse_api_json(response, "Get account entitlements").await
     }
 
     // ── Phase 1: Kopia repository session (short-lived B2 creds) ─────

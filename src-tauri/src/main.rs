@@ -230,6 +230,7 @@ fn main() {
             profiles::cmd_update_profile,
             profiles::cmd_delete_profile,
             profiles::cmd_list_profiles,
+            profiles::cmd_get_profile_limit,
             profiles::cmd_count_unowned_profiles,
             profiles::cmd_claim_unowned_profiles,
             profiles::cmd_run_profile_backup,

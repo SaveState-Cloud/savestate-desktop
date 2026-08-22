@@ -1641,11 +1641,18 @@ function formatBytes(bytes) {
 async function loadProfiles() {
     const container = document.getElementById('profiles-list');
     try {
-        const [profiles, unownedCount, authStatus] = await Promise.all([
+        const [profiles, unownedCount, authStatus, profileLimitValue] = await Promise.all([
             invoke('cmd_list_profiles'),
             invoke('cmd_count_unowned_profiles'),
             invoke('cmd_get_auth_status'),
+            invoke('cmd_get_profile_limit'),
         ]);
+        const profileLimit = Number(profileLimitValue ?? 2);
+        const automatedCount = (profiles || []).filter((profile) => profile.enabled && String(profile.schedule || '').trim()).length;
+        const profileLimitSummary = document.getElementById('profile-limit-summary');
+        if (profileLimitSummary) {
+            profileLimitSummary.textContent = `${automatedCount} of ${profileLimit} automated backup profiles in use. Manual-only profiles do not count.`;
+        }
         container.innerHTML = '';
 
         if (Number(unownedCount) > 0) {
@@ -1668,7 +1675,7 @@ async function loadProfiles() {
             claimButton.addEventListener('click', async () => {
                 const accountEmail = authStatus?.email || currentAccount?.email || 'this account';
                 const confirmed = await confirmDialog(
-                    `Assign all ${Number(unownedCount)} existing profile${Number(unownedCount) === 1 ? '' : 's'} on this Windows user to ${accountEmail}? Their schedules may become active immediately. Only continue if they belong to this account.`,
+                    `Assign all ${Number(unownedCount)} existing profile${Number(unownedCount) === 1 ? '' : 's'} on this Windows user to ${accountEmail}? Scheduled profiles within your allowance may become active immediately; any extras remain paused. Only continue if they belong to this account.`,
                     { title: 'Assign existing profiles', kind: 'warning' },
                 );
                 if (!confirmed) return;
