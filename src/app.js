@@ -11,6 +11,12 @@ const storageUsageUi = window.SaveStateStorageUsage;
 // ── Auto-updater state ───────────────────────────────────────────
 let availableUpdateVersion = null;
 let dismissedUpdateVersion = null;
+let currentAppVersion = null;
+let updateCheckPromise = null;
+let updateInstallInProgress = false;
+let updatePhase = 'idle';
+let updateStatusMessage = 'Update status is loading…';
+let updateProgressPercent = 0;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // ── Page map ──────────────────────────────────────────────────────
@@ -51,10 +57,15 @@ let discordWebhookConfigured = false;
 async function init() {
     setupEventListeners();
     setupTauriListeners();
+
+    // Start both local version lookup and the network update check immediately.
+    // Neither should delay remembered sign-in or repository warm-up.
+    renderUpdaterUi();
+    void loadCurrentAppVersion();
+    void checkForUpdates({ revealAvailable: true });
+
     await checkAuthStatus();
-    // Check for updates in the background (non-blocking)
-    checkForUpdates();
-    setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+    setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
 }
 
 document.addEventListener('DOMContentLoaded', init);
@@ -95,6 +106,10 @@ function setupEventListeners() {
 
     // Auto-updater banner buttons
     document.getElementById('btn-install-update').addEventListener('click', () => installUpdate());
+    document.getElementById('btn-settings-install-update').addEventListener('click', () => installUpdate());
+    document.getElementById('btn-check-updates').addEventListener('click', () => {
+        void checkForUpdates({ revealAvailable: true });
+    });
     document.getElementById('btn-dismiss-update').addEventListener('click', () => {
         dismissedUpdateVersion = availableUpdateVersion;
         document.getElementById('update-banner').classList.add('hidden');
@@ -729,22 +744,31 @@ function setupTauriListeners() {
         const progressArea = document.getElementById('update-progress-area');
         const progressFill = document.getElementById('update-progress-fill');
         const progressPct = document.getElementById('update-progress-pct');
-        const bannerText = document.getElementById('update-banner-text');
 
         progressArea.classList.remove('hidden');
         if (progress.stage === 'started') {
-            bannerText.textContent = `Downloading v${progress.version}…`;
+            updatePhase = 'downloading';
+            updateProgressPercent = 0;
+            updateStatusMessage = `Downloading version ${progress.version}…`;
+            renderUpdaterUi();
             return;
         }
 
         if (progress.stage === 'progress' && progress.total > 0) {
             const pct = Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
+            updatePhase = 'downloading';
+            updateProgressPercent = pct;
+            updateStatusMessage = `Downloading version ${progress.version}, ${pct}%`;
             progressFill.style.width = `${pct}%`;
             progressPct.textContent = `${pct}%`;
+            renderUpdaterUi();
         } else if (progress.stage === 'downloaded') {
+            updatePhase = 'verifying';
+            updateProgressPercent = 100;
+            updateStatusMessage = 'Download complete. Verifying the update…';
             progressFill.style.width = '100%';
             progressPct.textContent = '100%';
-            bannerText.textContent = 'Download complete. Verifying update…';
+            renderUpdaterUi();
         }
     });
 }
@@ -857,6 +881,9 @@ function friendlyError(error) {
     if (lower.includes('folder_not_empty')) {
         return 'This folder is not empty. Move its backups and remove nested folders first.';
     }
+    if (lower.includes('source_quota_exceeded') || lower.includes('backup data allowance exceeded')) {
+        return 'This backup would exceed your plan’s original-data allowance. Remove an older backup or choose a larger plan, then try again.';
+    }
 
     let message = raw;
     const jsonMatch = raw.match(/\{\s*"(?:error|message)"\s*:\s*"([^"]+)"/i);
@@ -966,40 +993,26 @@ async function loadDashboard() {
         document.getElementById('stat-plan').textContent = account.plan || 'No plan';
 
         const usage = Math.max(0, Math.trunc(Number(account.usage?.bytes || 0)));
-        const displayedUsage = storageUsageUi.customerVisibleUsage(usage, backupState);
-        const sourceStatistics = storageUsageUi.sourceStatistics(account.usage);
-        const sourceValue = document.getElementById('usage-source');
-        const sourceMeta = document.getElementById('usage-source-meta');
-        const sourceSavings = document.getElementById('usage-source-savings');
-        if (sourceStatistics.sourceBytes === null) {
-            sourceValue.textContent = 'Not measured';
-            sourceValue.title = 'Source data statistics are not available yet';
-            sourceMeta.textContent = 'Original, uncompressed size across retained backups';
-            sourceSavings.textContent = 'Refresh after the next backup';
-        } else {
-            sourceValue.textContent = formatBytes(sourceStatistics.sourceBytes);
-            sourceValue.title = `${sourceStatistics.sourceBytes.toLocaleString()} original source bytes`;
-            const retained = sourceStatistics.snapshotCount === null
-                ? 'retained backups'
-                : `${sourceStatistics.snapshotCount.toLocaleString()} retained ${sourceStatistics.snapshotCount === 1 ? 'backup' : 'backups'}`;
-            const files = sourceStatistics.fileCount === null
-                ? ''
-                : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
-            sourceMeta.textContent = `${retained}${files}`;
-            sourceSavings.textContent = sourceStatistics.spaceSavedBytes === null
-                ? 'Savings not measured'
-                : `${formatBytes(sourceStatistics.spaceSavedBytes)} saved · ${sourceStatistics.savingsPercent?.toFixed(2) || '0.00'}%`;
-        }
+        const sourceStatistics = storageUsageUi.sourceStatistics(account.usage, backupState);
+        const sourceUsage = sourceStatistics.sourceBytes;
         const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
         const limitBytes = limitGB * 1024 * 1024 * 1024;
-        const pct = limitBytes > 0 ? Math.min(100, (displayedUsage / limitBytes) * 100) : 0;
-        const storageValue = document.getElementById('usage-storage');
-        storageValue.textContent = `${formatBytes(displayedUsage)} of ${formatBytes(limitBytes)}`;
-        storageValue.title = `${displayedUsage.toLocaleString()} of ${limitBytes.toLocaleString()} bytes`;
-        document.getElementById('usage-storage-meta').textContent =
-            `${displayedUsage.toLocaleString()} bytes stored · counts toward your plan`;
-        document.getElementById('storage-fill').style.width = `${pct}%`;
-        document.getElementById('storage-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
+        const pct = limitBytes > 0 ? Math.min(100, (sourceUsage / limitBytes) * 100) : 0;
+        const backupValue = document.getElementById('usage-backup');
+        backupValue.textContent = limitBytes > 0
+            ? `${formatBytes(sourceUsage)} of ${formatBytes(limitBytes)}`
+            : formatBytes(sourceUsage);
+        backupValue.title = `${sourceUsage.toLocaleString()} original bytes${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+        const retained = sourceStatistics.snapshotCount === null
+            ? 'retained backups'
+            : `${sourceStatistics.snapshotCount.toLocaleString()} retained ${sourceStatistics.snapshotCount === 1 ? 'backup' : 'backups'}`;
+        const files = sourceStatistics.fileCount === null
+            ? ''
+            : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
+        document.getElementById('usage-backup-meta').textContent =
+            `${sourceUsage.toLocaleString()} original bytes · ${retained}${files}`;
+        document.getElementById('backup-fill').style.width = `${pct}%`;
+        document.getElementById('backup-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
 
         const uploadUsed = Math.max(0, Math.trunc(Number(account.ingress?.used || 0)));
         const uploadValue = document.getElementById('usage-upload');
@@ -2093,47 +2106,131 @@ window.navigateTo = navigateTo;
 // ────────────────────────────────────────────────────────────────
 // Auto-Updater
 // ────────────────────────────────────────────────────────────────
-async function checkForUpdates() {
+async function loadCurrentAppVersion() {
+    try {
+        currentAppVersion = await window.__TAURI__.app.getVersion();
+    } catch (err) {
+        currentAppVersion = 'Unknown';
+        console.warn('[Updater] Could not read current app version:', err);
+    }
+    if (updatePhase === 'upToDate') {
+        updateStatusMessage = `You're up to date${currentAppVersion ? ` on version ${currentAppVersion}` : ''}.`;
+    }
+    renderUpdaterUi();
+}
+
+function renderUpdaterUi() {
+    const currentVersion = document.getElementById('settings-current-version');
+    const settingsStatus = document.getElementById('settings-update-status');
+    const settingsInstallButton = document.getElementById('btn-settings-install-update');
+    const checkButton = document.getElementById('btn-check-updates');
+    const bannerInstallButton = document.getElementById('btn-install-update');
+    const bannerText = document.getElementById('update-banner-text');
+
+    if (currentVersion) currentVersion.textContent = currentAppVersion || 'Loading…';
+    if (settingsStatus) settingsStatus.textContent = updateStatusMessage;
+    if (bannerText) bannerText.textContent = updateStatusMessage;
+
+    const updateAvailable = Boolean(availableUpdateVersion);
+    const busy = updateInstallInProgress || ['preparing', 'downloading', 'verifying'].includes(updatePhase);
+    const installLabel = updatePhase === 'downloading'
+        ? `Downloading${updateProgressPercent > 0 ? ` ${updateProgressPercent}%` : '…'}`
+        : updatePhase === 'verifying'
+            ? 'Installing…'
+            : ['busy', 'installFailed'].includes(updatePhase)
+                ? 'Try again'
+                : updateAvailable
+                    ? `Update to v${availableUpdateVersion}`
+                    : 'Update';
+
+    if (settingsInstallButton) {
+        settingsInstallButton.classList.toggle('hidden', !updateAvailable);
+        settingsInstallButton.disabled = busy;
+        settingsInstallButton.textContent = installLabel;
+    }
+    if (bannerInstallButton) {
+        bannerInstallButton.disabled = busy;
+        bannerInstallButton.textContent = installLabel;
+    }
+    if (checkButton) {
+        checkButton.disabled = updatePhase === 'checking' || busy;
+        checkButton.textContent = updatePhase === 'checking' ? 'Checking…' : 'Check again';
+    }
+}
+
+function showAvailableUpdateBanner(force = false) {
+    if (!availableUpdateVersion) return;
+    if (!force && (updateInstallInProgress || dismissedUpdateVersion === availableUpdateVersion)) return;
+    document.getElementById('update-banner').classList.remove('hidden');
+}
+
+async function performUpdateCheck(revealAvailable) {
+    const previouslyAvailableVersion = availableUpdateVersion;
+    updatePhase = 'checking';
+    updateStatusMessage = 'Checking for updates…';
+    renderUpdaterUi();
+
     try {
         const { check } = window.__TAURI__.updater;
-        const update = await check();
+        const update = await check({ timeout: 30_000 });
         if (update) {
             availableUpdateVersion = update.version;
             await update.close();
 
-            if (dismissedUpdateVersion === availableUpdateVersion) return;
-
-            const banner = document.getElementById('update-banner');
-            const text = document.getElementById('update-banner-text');
-            text.textContent = `Version ${availableUpdateVersion} is ready to install`;
-            banner.classList.remove('hidden');
+            updatePhase = 'available';
+            updateStatusMessage = `Version ${availableUpdateVersion} is ready. Updating waits until backups and restores are idle.`;
+            showAvailableUpdateBanner(revealAvailable);
             console.log('[Updater] New version available:', availableUpdateVersion);
         } else {
+            availableUpdateVersion = null;
+            dismissedUpdateVersion = null;
+            updatePhase = 'upToDate';
+            updateStatusMessage = `You're up to date${currentAppVersion ? ` on version ${currentAppVersion}` : ''}.`;
+            document.getElementById('update-banner').classList.add('hidden');
             console.log('[Updater] App is up to date.');
         }
     } catch (err) {
-        // Silently ignore update check failures — don't bother the user
+        if (previouslyAvailableVersion) {
+            availableUpdateVersion = previouslyAvailableVersion;
+            updatePhase = 'available';
+            updateStatusMessage = `Version ${availableUpdateVersion} is ready. Updating waits until backups and restores are idle.`;
+        } else {
+            updatePhase = 'checkFailed';
+            updateStatusMessage = 'Could not check for updates. Check your connection and try again.';
+        }
         console.warn('[Updater] Check failed:', err);
+    } finally {
+        renderUpdaterUi();
     }
 }
 
-async function installUpdate() {
-    if (!availableUpdateVersion) return;
+function checkForUpdates({ revealAvailable = false } = {}) {
+    if (updateCheckPromise) return updateCheckPromise;
 
-    const btn = document.getElementById('btn-install-update');
+    updateCheckPromise = performUpdateCheck(revealAvailable)
+        .finally(() => {
+            updateCheckPromise = null;
+        });
+    return updateCheckPromise;
+}
+
+async function installUpdate() {
+    if (!availableUpdateVersion || updateInstallInProgress) return;
+
     const dismissBtn = document.getElementById('btn-dismiss-update');
     const progressArea = document.getElementById('update-progress-area');
     const progressFill = document.getElementById('update-progress-fill');
     const progressPct = document.getElementById('update-progress-pct');
-    const bannerText = document.getElementById('update-banner-text');
-
-    btn.disabled = true;
-    btn.textContent = 'Downloading…';
+    updateInstallInProgress = true;
+    dismissedUpdateVersion = null;
+    updatePhase = 'preparing';
+    updateStatusMessage = 'Checking that no backup, restore, or cleanup is running…';
+    showAvailableUpdateBanner(true);
     dismissBtn.classList.add('hidden');
     progressArea.classList.remove('hidden');
+    renderUpdaterUi();
 
     try {
-        bannerText.textContent = 'Checking that no backup or restore is running…';
         await invoke('cmd_install_update');
 
         // Windows exits when its installer starts. Relaunch platforms whose
@@ -2144,16 +2241,18 @@ async function installUpdate() {
         console.error('[Updater] Install failed:', err);
         const message = String(err);
         if (message.includes('UPDATE_BUSY:')) {
-            bannerText.textContent = 'A backup, restore, or cleanup is running. Update after it finishes.';
-            btn.textContent = 'Try Again';
+            updatePhase = 'busy';
+            updateStatusMessage = 'A backup, restore, or cleanup is running. Update after it finishes.';
         } else {
-            bannerText.textContent = message;
-            btn.textContent = 'Retry';
+            updatePhase = 'installFailed';
+            updateStatusMessage = 'The update could not be installed. Try again, or restart the app and retry.';
         }
-        btn.disabled = false;
+        updateInstallInProgress = false;
         dismissBtn.classList.remove('hidden');
         progressArea.classList.add('hidden');
         progressFill.style.width = '0%';
         progressPct.textContent = '0%';
+        updateProgressPercent = 0;
+        renderUpdaterUi();
     }
 }

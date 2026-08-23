@@ -1248,7 +1248,15 @@ async fn upload_manifest_with_retry(
         match api.upload_kopia_manifest(&json).await {
             Ok(()) => return Ok(()),
             Err(error) => {
-                last_error = Some(error.to_string());
+                let message = error.to_string();
+                // A source-data allowance rejection is deterministic. Retrying
+                // only delays rollback and leaves the progress UI running.
+                if message.contains("SOURCE_QUOTA_EXCEEDED")
+                    || message.contains("507 Insufficient Storage")
+                {
+                    return Err(error);
+                }
+                last_error = Some(message);
                 if attempt < 3 {
                     tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
                 }

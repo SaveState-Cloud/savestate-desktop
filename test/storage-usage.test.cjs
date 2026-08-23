@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
     customerVisibleUsage,
@@ -32,23 +34,43 @@ test('source statistics preserve original bytes and retained backup counts', () 
         sourceBytes: 9_000_000,
         snapshotCount: 2,
         fileCount: 200,
-        spaceSavedBytes: 7_000_000,
-        savingsPercent: 77.78,
     }), {
         sourceBytes: 9_000_000,
         snapshotCount: 2,
         fileCount: 200,
-        spaceSavedBytes: 7_000_000,
-        savingsPercent: 77.78,
     });
 });
 
-test('source statistics remain unavailable with an older API response', () => {
-    assert.deepEqual(sourceStatistics({ bytes: 2_000_000 }), {
-        sourceBytes: null,
+test('older API responses fall back to their visible usage without exposing empty overhead', () => {
+    assert.deepEqual(sourceStatistics({ bytes: 2_000_000 }, { backups: [{ id: 'snapshot' }] }), {
+        sourceBytes: 2_000_000,
         snapshotCount: null,
         fileCount: null,
-        spaceSavedBytes: null,
-        savingsPercent: null,
     });
+    assert.equal(sourceStatistics({ bytes: 2_000_000 }, { backups: [] }).sourceBytes, 0);
+});
+
+test('customer source statistics never derive or expose compression savings', () => {
+    assert.deepEqual(sourceStatistics({
+        bytes: 9_000_000,
+        sourceBytes: 9_000_000,
+        spaceSavedBytes: 7_000_000,
+        savingsPercent: 77.78,
+    }), {
+        sourceBytes: 9_000_000,
+        snapshotCount: null,
+        fileCount: null,
+    });
+});
+
+test('the customer dashboard presents only original backup data usage', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.html'), 'utf8');
+    const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'app.js'), 'utf8');
+    assert.match(html, /Backup data used/);
+    assert.match(html, /original size of your retained backups/i);
+    assert.doesNotMatch(html, /Storage saved/);
+    assert.doesNotMatch(html, /compressed, deduplicated, and plan-limited/i);
+    assert.doesNotMatch(app, /spaceSavedBytes|savingsPercent/);
+    assert.match(app, /source_quota_exceeded/);
+    assert.match(app, /exceed your plan’s original-data allowance/);
 });
