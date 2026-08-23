@@ -967,6 +967,29 @@ async function loadDashboard() {
 
         const usage = Math.max(0, Math.trunc(Number(account.usage?.bytes || 0)));
         const displayedUsage = storageUsageUi.customerVisibleUsage(usage, backupState);
+        const sourceStatistics = storageUsageUi.sourceStatistics(account.usage);
+        const sourceValue = document.getElementById('usage-source');
+        const sourceMeta = document.getElementById('usage-source-meta');
+        const sourceSavings = document.getElementById('usage-source-savings');
+        if (sourceStatistics.sourceBytes === null) {
+            sourceValue.textContent = 'Not measured';
+            sourceValue.title = 'Source data statistics are not available yet';
+            sourceMeta.textContent = 'Original, uncompressed size across retained backups';
+            sourceSavings.textContent = 'Refresh after the next backup';
+        } else {
+            sourceValue.textContent = formatBytes(sourceStatistics.sourceBytes);
+            sourceValue.title = `${sourceStatistics.sourceBytes.toLocaleString()} original source bytes`;
+            const retained = sourceStatistics.snapshotCount === null
+                ? 'retained backups'
+                : `${sourceStatistics.snapshotCount.toLocaleString()} retained ${sourceStatistics.snapshotCount === 1 ? 'backup' : 'backups'}`;
+            const files = sourceStatistics.fileCount === null
+                ? ''
+                : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
+            sourceMeta.textContent = `${retained}${files}`;
+            sourceSavings.textContent = sourceStatistics.spaceSavedBytes === null
+                ? 'Savings not measured'
+                : `${formatBytes(sourceStatistics.spaceSavedBytes)} saved · ${sourceStatistics.savingsPercent?.toFixed(2) || '0.00'}%`;
+        }
         const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
         const limitBytes = limitGB * 1024 * 1024 * 1024;
         const pct = limitBytes > 0 ? Math.min(100, (displayedUsage / limitBytes) * 100) : 0;
@@ -974,16 +997,16 @@ async function loadDashboard() {
         storageValue.textContent = `${formatBytes(displayedUsage)} of ${formatBytes(limitBytes)}`;
         storageValue.title = `${displayedUsage.toLocaleString()} of ${limitBytes.toLocaleString()} bytes`;
         document.getElementById('usage-storage-meta').textContent =
-            `${displayedUsage.toLocaleString()} bytes currently stored`;
+            `${displayedUsage.toLocaleString()} bytes stored · counts toward your plan`;
         document.getElementById('storage-fill').style.width = `${pct}%`;
         document.getElementById('storage-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
 
         const uploadUsed = Math.max(0, Math.trunc(Number(account.ingress?.used || 0)));
         const uploadValue = document.getElementById('usage-upload');
         uploadValue.textContent = formatBytes(uploadUsed);
-        uploadValue.title = `${uploadUsed.toLocaleString()} source bytes backed up this month`;
+        uploadValue.title = `${uploadUsed.toLocaleString()} original source bytes backed up this month`;
         document.getElementById('usage-upload-meta').textContent =
-            `This month · ${uploadUsed.toLocaleString()} source bytes · free`;
+            `This month · ${uploadUsed.toLocaleString()} original source bytes · free`;
 
         const restoreUsed = Math.max(0, Math.trunc(Number(account.egress?.used || 0)));
         const restoreAllowance = Math.max(0, Math.trunc(Number(account.egress?.allowance || 0)));
