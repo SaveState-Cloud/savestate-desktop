@@ -168,7 +168,7 @@
                             <div class="usage-section-header">
                                 <div>
                                     <h3 id="usage-heading">Usage</h3>
-                                    <p>Storage is plan-limited. Uploads are free. Restores have a monthly allowance.</p>
+                                    <p>Source data is the original size. Storage is compressed, deduplicated, and plan-limited.</p>
                                 </div>
                                 <div id="cleanup-state" class="cleanup-state hidden" role="status">
                                     <span class="cleanup-dot" aria-hidden="true"></span>
@@ -179,8 +179,18 @@
                             <div class="usage-list">
                                 <div class="usage-row">
                                     <div>
-                                        <strong>Storage</strong>
-                                        <span id="usage-storage-meta">Current encrypted repository size</span>
+                                        <strong>Source data protected</strong>
+                                        <span id="usage-source-meta">Original, uncompressed size across retained backups</span>
+                                    </div>
+                                    <div class="usage-measure">
+                                        <strong id="usage-source">—</strong>
+                                        <span id="usage-source-savings">Waiting for backup statistics</span>
+                                    </div>
+                                </div>
+                                <div class="usage-row">
+                                    <div>
+                                        <strong>Storage used</strong>
+                                        <span id="usage-storage-meta">Compressed and deduplicated data counted toward your plan</span>
                                     </div>
                                     <div class="usage-measure">
                                         <strong id="usage-storage">—</strong>
@@ -193,7 +203,7 @@
                                 <div class="usage-row">
                                     <div>
                                         <strong>Uploads</strong>
-                                        <span id="usage-upload-meta">This month, not charged</span>
+                                        <span id="usage-upload-meta">Original size of backups created this month, not charged</span>
                                     </div>
                                     <div class="usage-measure">
                                         <strong id="usage-upload">0 B</strong>
