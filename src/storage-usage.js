@@ -32,28 +32,16 @@
         return Number.isSafeInteger(number) && number >= 0 ? number : null;
     }
 
-    function sourceStatistics(usage) {
-        const sourceBytes = optionalWholeNumber(usage?.sourceBytes);
-        const storageBytes = normalizeBytes(usage?.bytes);
-        const reportedSavedBytes = optionalWholeNumber(usage?.spaceSavedBytes);
-        const spaceSavedBytes = reportedSavedBytes ?? (
-            sourceBytes === null ? null : Math.max(0, sourceBytes - storageBytes)
-        );
-        const reportedPercent = usage?.savingsPercent === null || usage?.savingsPercent === undefined
-            ? Number.NaN
-            : Number(usage.savingsPercent);
-        const savingsPercent = Number.isFinite(reportedPercent) && reportedPercent >= 0
-            ? Math.min(100, reportedPercent)
-            : sourceBytes && spaceSavedBytes !== null
-                ? (spaceSavedBytes / sourceBytes) * 100
-                : sourceBytes === 0 ? 0 : null;
-
+    function sourceStatistics(usage, backupState) {
+        // New API responses use `bytes`; `sourceBytes` is a same-value rollout
+        // alias. Prefer the alias while an older API may still report physical
+        // repository bytes in `bytes`.
+        const reportedSourceBytes = optionalWholeNumber(usage?.sourceBytes);
+        const sourceBytes = reportedSourceBytes ?? customerVisibleUsage(usage?.bytes, backupState);
         return {
             sourceBytes,
             snapshotCount: optionalWholeNumber(usage?.snapshotCount),
             fileCount: optionalWholeNumber(usage?.fileCount),
-            spaceSavedBytes,
-            savingsPercent,
         };
     }
 

@@ -168,7 +168,7 @@
                             <div class="usage-section-header">
                                 <div>
                                     <h3 id="usage-heading">Usage</h3>
-                                    <p>Source data is the original size. Storage is compressed, deduplicated, and plan-limited.</p>
+                                    <p>Your plan is measured using the original size of your retained backups.</p>
                                 </div>
                                 <div id="cleanup-state" class="cleanup-state hidden" role="status">
                                     <span class="cleanup-dot" aria-hidden="true"></span>
@@ -179,25 +179,15 @@
                             <div class="usage-list">
                                 <div class="usage-row">
                                     <div>
-                                        <strong>Source data protected</strong>
-                                        <span id="usage-source-meta">Original, uncompressed size across retained backups</span>
+                                        <strong>Backup data used</strong>
+                                        <span id="usage-backup-meta">Original, uncompressed size across retained backups</span>
                                     </div>
                                     <div class="usage-measure">
-                                        <strong id="usage-source">—</strong>
-                                        <span id="usage-source-savings">Waiting for backup statistics</span>
-                                    </div>
-                                </div>
-                                <div class="usage-row">
-                                    <div>
-                                        <strong>Storage used</strong>
-                                        <span id="usage-storage-meta">Compressed and deduplicated data counted toward your plan</span>
-                                    </div>
-                                    <div class="usage-measure">
-                                        <strong id="usage-storage">—</strong>
-                                        <span id="storage-pct">0%</span>
+                                        <strong id="usage-backup">—</strong>
+                                        <span id="backup-pct">0%</span>
                                     </div>
                                     <div class="progress-bar usage-storage-bar">
-                                        <div class="progress-bar-fill" id="storage-fill" style="width: 0%"></div>
+                                        <div class="progress-bar-fill" id="backup-fill" style="width: 0%"></div>
                                     </div>
                                 </div>
                                 <div class="usage-row">
@@ -440,6 +430,21 @@
                 <section id="page-settings" class="page">
                     <h2 class="page-title">Settings</h2>
 
+                    <!-- App Updates -->
+                    <div class="settings-section glass-card" id="settings-update-section">
+                        <div class="settings-update-row">
+                            <div class="settings-update-copy">
+                                <h3>App updates</h3>
+                                <p id="settings-update-status" class="text-muted" role="status" aria-live="polite">Checking for updates…</p>
+                                <span class="settings-version">Installed version <strong id="settings-current-version">Loading…</strong></span>
+                            </div>
+                            <div class="settings-update-actions">
+                                <button class="btn btn-primary btn-sm hidden" type="button" id="btn-settings-install-update">Update</button>
+                                <button class="btn btn-ghost btn-sm" type="button" id="btn-check-updates">Check again</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Encryption Info -->
                     <div class="settings-section glass-card">
                         <h3>🔐 Encryption</h3>
@@ -564,14 +569,14 @@
     </div>
 
     <!-- Update Banner -->
-    <div id="update-banner" class="update-banner hidden">
+    <div id="update-banner" class="update-banner hidden" role="region" aria-label="Application update">
         <div class="update-banner-content">
             <div class="update-banner-info">
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none" style="flex-shrink:0">
-                    <path d="M10 2L10 14M10 14L6 10M10 14L14 10" stroke="#82e0aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M4 17H16" stroke="#82e0aa" stroke-width="2" stroke-linecap="round"/>
+                <svg class="update-banner-icon" width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <path d="M10 2L10 14M10 14L6 10M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M4 17H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 </svg>
-                <span id="update-banner-text">A new version is ready to install</span>
+                <span id="update-banner-text" role="status" aria-live="polite">A new version is ready to install</span>
             </div>
             <div class="update-banner-actions">
                 <div id="update-progress-area" class="update-progress-area hidden">

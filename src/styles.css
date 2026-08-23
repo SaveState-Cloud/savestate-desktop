@@ -982,6 +982,34 @@ code {
   margin-top: 1.25rem;
 }
 
+.settings-update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+}
+
+.settings-update-copy {
+  min-width: 0;
+}
+
+.settings-update-copy h3,
+.settings-update-copy p {
+  margin-bottom: 0.45rem;
+}
+
+.settings-version {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.settings-update-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 0.65rem;
+}
+
 /* ─────────────────────────────────────────────────────────────
    BADGES
    ───────────────────────────────────────────────────────────── */
@@ -1326,12 +1354,11 @@ code {
   left: 0;
   right: 0;
   z-index: 9999;
-  background: linear-gradient(135deg, rgba(130, 224, 170, 0.12) 0%, rgba(15, 22, 36, 0.95) 100%);
-  backdrop-filter: blur(16px);
-  border-bottom: 1px solid rgba(130, 224, 170, 0.3);
+  background: oklch(0.19 0.018 252);
+  border-bottom: 1px solid oklch(0.72 0.12 153 / 0.42);
   padding: 0.75rem 1.5rem;
-  animation: slideDown 0.35s ease-out;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  animation: slideDown 0.2s cubic-bezier(0.165, 0.84, 0.44, 1);
+  box-shadow: 0 8px 24px oklch(0.08 0.012 252 / 0.38);
 }
 
 @keyframes slideDown {
@@ -1359,6 +1386,11 @@ code {
   font-size: 0.9rem;
   font-weight: 500;
   color: var(--text-primary);
+}
+
+.update-banner-icon {
+  flex-shrink: 0;
+  color: var(--accent);
 }
 
 .update-banner-actions {
@@ -1406,5 +1438,26 @@ code {
 
   .usage-row {
     gap: 0.75rem;
+  }
+
+  .settings-update-row,
+  .update-banner-content {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-update-actions,
+  .update-banner-actions {
+    width: 100%;
+  }
+
+  .update-banner-actions {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .update-banner {
+    animation: none;
   }
 }
