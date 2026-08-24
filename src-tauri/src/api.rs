@@ -273,8 +273,8 @@ pub struct RepoSession {
     pub expires_in: u64,
 }
 
-/// One-time grant returned after the backend has atomically reserved and, if
-/// needed, metered the restore bytes.
+/// One-time grant returned after the backend has atomically authorized a free
+/// restore and recorded byte-exact operational telemetry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreAuthorization {
@@ -295,6 +295,14 @@ pub struct RetentionResult {
     pub usage: u64,
     #[serde(default)]
     pub within_quota: bool,
+    #[serde(default)]
+    pub percent_used: f64,
+    #[serde(default)]
+    pub pressure_level: String,
+    #[serde(default)]
+    pub maintenance_recommended: bool,
+    #[serde(default)]
+    pub maintenance_urgent: bool,
 }
 
 impl SaveStateClient {
@@ -526,10 +534,10 @@ impl SaveStateClient {
             .context("Failed to parse repo session response")
     }
 
-    // ── Restore egress authorization (plan-specific allowance) ─────
+    // ── Free restore authorization ──────────────────────────────────
 
-    /// Ask the backend to authorize and meter a restore of `bytes` against the
-    /// monthly egress allowance. Returns the fair-use error message on a 403.
+    /// Ask the backend to authorize a restore. `bytes` remains telemetry only;
+    /// restores are never blocked by a transfer allowance or billed as overage.
     pub async fn restore_authorize(
         &self,
         snapshot_id: &str,
@@ -560,7 +568,7 @@ impl SaveStateClient {
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        // Surface the human-readable fair-use message when present.
+        // Surface a human-readable authorization error when present.
         if let Ok(api_err) = serde_json::from_str::<ApiError>(&text) {
             if let Some(msg) = api_err.message.or(api_err.error) {
                 return Err(anyhow!(msg));
