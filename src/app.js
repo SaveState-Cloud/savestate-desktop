@@ -23,6 +23,7 @@ const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const pages = {
     dashboard: document.getElementById('page-dashboard'),
     profiles:  document.getElementById('page-profiles'),
+    databases: document.getElementById('page-databases'),
     backup:    document.getElementById('page-backup'),
     backups:   document.getElementById('page-backups'),
     settings:  document.getElementById('page-settings'),
@@ -50,6 +51,12 @@ let repositorySessionGeneration = 0;
 let legacyProfileNoticeShown = false;
 let pendingVaultLoginResult = null;
 let discordWebhookConfigured = false;
+let databaseTools = [];
+let databaseProfiles = [];
+let databaseConnectionResult = null;
+let databaseConnectionFingerprint = null;
+let databaseSelectedDatabases = new Set();
+let databaseSelectedTables = new Set();
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -460,6 +467,40 @@ function setupEventListeners() {
         }
     });
 
+    // ── Database Backups ───────────────────────────────────────
+    document.getElementById('btn-create-database').addEventListener('click', () => {
+        void openDatabaseSetup();
+    });
+    document.getElementById('btn-close-database-setup').addEventListener('click', closeDatabaseSetup);
+    document.getElementById('btn-cancel-database').addEventListener('click', closeDatabaseSetup);
+    document.getElementById('btn-refresh-database-tools').addEventListener('click', () => {
+        void loadDatabaseTools({ force: true });
+    });
+    document.getElementById('database-tool-bundle').addEventListener('change', applySelectedDatabaseTool);
+    document.getElementById('btn-test-database').addEventListener('click', () => {
+        void testDatabaseConnection();
+    });
+    document.querySelectorAll('input[name="database-scope"]').forEach((input) => {
+        input.addEventListener('change', renderDatabaseScope);
+    });
+    document.getElementById('database-table-database').addEventListener('change', () => {
+        databaseSelectedTables = new Set();
+        document.getElementById('database-table-checklist').innerHTML = '<p class="text-muted">Load tables for the selected database.</p>';
+    });
+    document.getElementById('btn-load-database-tables').addEventListener('click', () => {
+        void loadDatabaseTables();
+    });
+    document.getElementById('database-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        void saveDatabaseProfile();
+    });
+    ['database-connection-url', 'database-password', 'database-dump-executable', 'database-client-executable']
+        .forEach((id) => {
+            document.getElementById(id).addEventListener('input', invalidateDatabaseConnectionTest);
+        });
+    document.getElementById('database-schedule-times').addEventListener('input', updateDatabaseSchedulePreview);
+    document.getElementById('database-schedule-interval').addEventListener('input', updateDatabaseSchedulePreview);
+
     // ── Settings ──────────────────────────────────────────────
     document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
     document.getElementById('btn-test-notification').addEventListener('click', testNotification);
@@ -681,6 +722,51 @@ function setupTauriListeners() {
         }
     });
 
+    listen('database-progress', (event) => {
+        const progress = event.payload;
+        const row = document.querySelector(`.database-row[data-database-profile-id="${cssEscape(progress.profileId)}"]`);
+        if (row) {
+            const wrap = row.querySelector('.database-row-progress');
+            const message = row.querySelector('.database-progress-message');
+            const percent = row.querySelector('.database-progress-percent');
+            const fill = row.querySelector('.database-progress-fill');
+            wrap?.classList.remove('hidden');
+            const pct = Math.round(Number(progress.progress || 0) * 100);
+            if (message) message.textContent = progress.message;
+            if (percent) percent.textContent = `${pct}%`;
+            if (fill) fill.style.width = `${pct}%`;
+        }
+        if (['done', 'cancelled', 'error'].includes(progress.stage)) {
+            if (progress.stage === 'done' && document.getElementById('page-databases').classList.contains('active')) {
+                setTimeout(() => loadDatabaseProfiles(), 900);
+            } else if (row) {
+                row.querySelector('.database-row-progress')?.classList.add('hidden');
+                const run = row.querySelector('[data-database-action="run"]');
+                if (run) {
+                    run.disabled = false;
+                    run.textContent = 'Run Now';
+                }
+            }
+        }
+    });
+
+    listen('database-restore-progress', (event) => {
+        const progress = event.payload;
+        const row = document.querySelector(`.database-row[data-database-profile-id="${cssEscape(progress.profileId)}"]`);
+        if (!row) return;
+        const pct = Math.round(Number(progress.progress || 0) * 100);
+        row.querySelector('.database-row-progress')?.classList.remove('hidden');
+        const message = row.querySelector('.database-progress-message');
+        const percent = row.querySelector('.database-progress-percent');
+        const fill = row.querySelector('.database-progress-fill');
+        if (message) message.textContent = progress.message;
+        if (percent) percent.textContent = `${pct}%`;
+        if (fill) fill.style.width = `${pct}%`;
+        if (['done', 'cancelled', 'error'].includes(progress.stage)) {
+            setTimeout(() => row.querySelector('.database-row-progress')?.classList.add('hidden'), 1200);
+        }
+    });
+
     listen('restore-progress', (event) => {
         const p = event.payload;
 
@@ -856,6 +942,7 @@ function navigateTo(pageId) {
     if (pageId === 'dashboard') loadDashboard();
     if (pageId === 'backups') loadBackups();
     if (pageId === 'profiles') loadProfiles();
+    if (pageId === 'databases') loadDatabaseProfiles();
     if (pageId === 'settings') loadSettings();
 }
 
@@ -889,6 +976,24 @@ function friendlyError(error) {
     }
     if (lower.includes('quotaexceeded') || lower.includes('storage limit exceeded')) {
         return 'Your encrypted repository reached its temporary safety ceiling. Run storage cleanup, remove an older backup, or choose a larger plan, then try again.';
+    }
+    if (lower.includes('database_authentication_failed')) {
+        return 'The database rejected that username or password. Check the credentials and test the connection again.';
+    }
+    if (lower.includes('database_unreachable')) {
+        return 'SaveState could not reach the database. Check that MySQL or MariaDB is running and that the host and port are correct.';
+    }
+    if (lower.includes('database_tool_not_found') || lower.includes('database_tool_invalid')) {
+        return 'The configured MySQL or MariaDB tools could not be verified. Scan this PC again or choose their executable locations.';
+    }
+    if (lower.includes('database_grants_unsupported')) {
+        return 'This dump tool cannot export users and grants. Choose a compatible MariaDB tool or turn that option off.';
+    }
+    if (lower.includes('database_export_failed')) {
+        return raw.split(':').slice(1).join(':').trim() || 'The database export failed before SaveState committed a backup.';
+    }
+    if (lower.includes('database_restore_failed')) {
+        return raw.split(':').slice(1).join(':').trim() || 'The database rejected part of the SQL restore. Review the destination before retrying.';
     }
 
     let message = raw;
@@ -1322,8 +1427,15 @@ async function loadBackups() {
             const restoreBtn = document.createElement('button');
             restoreBtn.className = 'btn btn-primary btn-sm btn-icon';
             restoreBtn.textContent = '↗';
-            restoreBtn.title = 'Restore backup';
-            restoreBtn.addEventListener('click', () => openRestoreModal(b.key, b.filename));
+            restoreBtn.title = b.backupKind === 'database' ? 'Restore from the Databases page' : 'Restore backup';
+            restoreBtn.addEventListener('click', () => {
+                if (b.backupKind === 'database') {
+                    navigateTo('databases');
+                    showToast('Open this database connection’s restore points to import the snapshot.', 'info');
+                    return;
+                }
+                openRestoreModal(b.key, b.filename);
+            });
 
             // Move button
             const moveBtn = document.createElement('button');
@@ -1682,6 +1794,644 @@ function formatBytes(bytes) {
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ────────────────────────────────────────────────────────────────
+// Database Backups
+// ────────────────────────────────────────────────────────────────
+
+function currentDatabaseFingerprint() {
+    const editId = document.getElementById('database-edit-id').value;
+    const password = document.getElementById('database-password').value;
+    return JSON.stringify({
+        editId,
+        connectionUrl: document.getElementById('database-connection-url').value.trim(),
+        password: editId && password === '' ? '[stored]' : password,
+        dumpExecutable: document.getElementById('database-dump-executable').value.trim(),
+        clientExecutable: document.getElementById('database-client-executable').value.trim(),
+    });
+}
+
+function invalidateDatabaseConnectionTest() {
+    databaseConnectionResult = null;
+    databaseConnectionFingerprint = null;
+    document.getElementById('database-selection-section').classList.add('hidden');
+    document.getElementById('database-schedule-section').classList.add('hidden');
+    document.getElementById('btn-save-database').disabled = true;
+    document.getElementById('database-save-help').textContent = 'Test the connection again after changing connection details.';
+    const status = document.getElementById('database-test-status');
+    status.dataset.state = '';
+    status.textContent = 'Test the connection to continue.';
+}
+
+async function loadDatabaseTools({ force = false, selectedDump = null } = {}) {
+    const select = document.getElementById('database-tool-bundle');
+    const previousDump = selectedDump || document.getElementById('database-dump-executable').value;
+    select.disabled = true;
+    select.innerHTML = '<option value="">Searching this PC…</option>';
+    try {
+        if (force || databaseTools.length === 0) {
+            databaseTools = await invoke('cmd_discover_database_tools');
+        }
+        select.innerHTML = '';
+        databaseTools.forEach((tool) => {
+            const option = document.createElement('option');
+            option.value = tool.id;
+            option.textContent = `${tool.label} · ${tool.version}`;
+            option.title = tool.version;
+            select.appendChild(option);
+        });
+        const matching = databaseTools.find((tool) => tool.dumpExecutable === previousDump);
+        if (previousDump && !matching) {
+            const custom = document.createElement('option');
+            custom.value = 'custom';
+            custom.textContent = 'Custom executable paths';
+            select.appendChild(custom);
+            select.value = 'custom';
+        } else if (matching) {
+            select.value = matching.id;
+        } else if (databaseTools.length > 0) {
+            select.value = databaseTools[0].id;
+            applySelectedDatabaseTool({ preserveTestState: true });
+        } else {
+            const custom = document.createElement('option');
+            custom.value = 'custom';
+            custom.textContent = 'No tools found, enter paths manually';
+            select.appendChild(custom);
+            document.querySelector('.database-tool-details').open = true;
+        }
+        updateDatabaseUsersOption();
+    } catch (error) {
+        select.innerHTML = '<option value="custom">Enter executable paths manually</option>';
+        document.querySelector('.database-tool-details').open = true;
+        showToast('Database tool scan failed: ' + friendlyError(error), 'error');
+    } finally {
+        select.disabled = false;
+    }
+}
+
+function selectedDatabaseTool() {
+    const selectedId = document.getElementById('database-tool-bundle').value;
+    return databaseTools.find((tool) => tool.id === selectedId) || null;
+}
+
+function applySelectedDatabaseTool({ preserveTestState = false } = {}) {
+    const tool = selectedDatabaseTool();
+    if (tool) {
+        document.getElementById('database-dump-executable').value = tool.dumpExecutable;
+        document.getElementById('database-client-executable').value = tool.clientExecutable;
+    } else {
+        document.querySelector('.database-tool-details').open = true;
+    }
+    updateDatabaseUsersOption();
+    if (!preserveTestState) invalidateDatabaseConnectionTest();
+}
+
+function updateDatabaseUsersOption() {
+    const checkbox = document.getElementById('database-include-users');
+    const help = document.getElementById('database-users-help');
+    const tool = selectedDatabaseTool();
+    const supported = tool ? Boolean(tool.supportsUserGrants) : true;
+    checkbox.disabled = !supported;
+    if (!supported) checkbox.checked = false;
+    help.textContent = supported
+        ? 'Exports portable users and grants when the dump tool supports it.'
+        : 'This tool does not support portable user and grant exports.';
+}
+
+async function openDatabaseSetup(profile = null) {
+    const form = document.getElementById('database-form');
+    form.reset();
+    databaseConnectionResult = null;
+    databaseConnectionFingerprint = null;
+    databaseSelectedDatabases = new Set(profile?.databases || []);
+    databaseSelectedTables = new Set(profile?.tables || []);
+    document.getElementById('database-edit-id').value = profile?.id || '';
+    document.getElementById('database-setup-title').textContent = profile ? 'Edit database backup' : 'Add database backup';
+    document.getElementById('database-name').value = profile?.name || '';
+    document.getElementById('database-connection-url').value = profile?.connectionUrl || 'mysql://root@127.0.0.1:3306';
+    document.getElementById('database-password').value = '';
+    document.getElementById('database-password-help').textContent = profile
+        ? 'Leave blank to keep the password already protected by Windows.'
+        : 'Leave blank only when the database account has no password.';
+    document.getElementById('database-dump-executable').value = profile?.dumpExecutable || '';
+    document.getElementById('database-client-executable').value = profile?.clientExecutable || '';
+    document.getElementById('database-include-new').checked = profile ? Boolean(profile.includeNewDatabases) : true;
+    document.getElementById('database-include-create').checked = profile ? Boolean(profile.includeCreateStatements) : true;
+    document.getElementById('database-include-users').checked = Boolean(profile?.includeUsersAndGrants);
+    document.querySelector(`input[name="database-scope"][value="${profile?.selectionMode || 'all'}"]`).checked = true;
+    document.getElementById('database-schedule-times').value = '';
+    document.getElementById('database-schedule-interval').value = 1;
+    if (profile?.schedule) {
+        try {
+            const schedule = JSON.parse(profile.schedule);
+            document.getElementById('database-schedule-times').value = (schedule.times || []).join(', ');
+            document.getElementById('database-schedule-interval').value = schedule.intervalDays || 1;
+        } catch {
+            // Database profiles are created only with the current JSON schedule contract.
+        }
+    }
+    document.getElementById('database-selection-section').classList.add('hidden');
+    document.getElementById('database-schedule-section').classList.add('hidden');
+    document.getElementById('btn-save-database').disabled = true;
+    document.getElementById('database-save-help').textContent = 'A successful connection test is required.';
+    const status = document.getElementById('database-test-status');
+    status.dataset.state = '';
+    status.textContent = 'Test the connection to continue.';
+    document.getElementById('database-setup').classList.remove('hidden');
+    await loadDatabaseTools({ selectedDump: profile?.dumpExecutable || null });
+    if (profile?.dumpExecutable && !selectedDatabaseTool()) {
+        document.getElementById('database-dump-executable').value = profile.dumpExecutable;
+        document.getElementById('database-client-executable').value = profile.clientExecutable;
+    }
+    renderDatabaseScope();
+    updateDatabaseSchedulePreview();
+    document.getElementById('database-setup').scrollIntoView({ behavior: 'auto', block: 'start' });
+}
+
+function closeDatabaseSetup() {
+    document.getElementById('database-setup').classList.add('hidden');
+    databaseConnectionResult = null;
+    databaseConnectionFingerprint = null;
+    databaseSelectedDatabases = new Set();
+    databaseSelectedTables = new Set();
+}
+
+function connectionPasswordPayload() {
+    const editId = document.getElementById('database-edit-id').value;
+    const value = document.getElementById('database-password').value;
+    return editId && value === '' ? null : value;
+}
+
+async function testDatabaseConnection() {
+    const button = document.getElementById('btn-test-database');
+    const status = document.getElementById('database-test-status');
+    const connectionUrl = document.getElementById('database-connection-url').value.trim();
+    const dumpExecutable = document.getElementById('database-dump-executable').value.trim();
+    const clientExecutable = document.getElementById('database-client-executable').value.trim();
+    if (!connectionUrl || !dumpExecutable || !clientExecutable) {
+        showToast('Enter a connection string and choose the database tools.', 'error');
+        return;
+    }
+    button.disabled = true;
+    button.textContent = 'Testing…';
+    status.dataset.state = '';
+    status.textContent = 'Connecting to the database…';
+    try {
+        databaseConnectionResult = await invoke('cmd_test_database_connection', {
+            connectionUrl,
+            password: connectionPasswordPayload(),
+            dumpExecutable,
+            clientExecutable,
+            profileId: document.getElementById('database-edit-id').value || null,
+        });
+        databaseConnectionFingerprint = currentDatabaseFingerprint();
+        status.dataset.state = 'success';
+        status.textContent = `Connected to ${databaseConnectionResult.serverVersion}. ${databaseConnectionResult.databases.length} user database${databaseConnectionResult.databases.length === 1 ? '' : 's'} found.`;
+        document.getElementById('database-selection-section').classList.remove('hidden');
+        document.getElementById('database-schedule-section').classList.remove('hidden');
+        document.getElementById('btn-save-database').disabled = false;
+        document.getElementById('database-save-help').textContent = 'The connection is verified. Save when the scope and schedule look right.';
+        renderDatabaseSelections();
+    } catch (error) {
+        databaseConnectionResult = null;
+        databaseConnectionFingerprint = null;
+        status.dataset.state = 'error';
+        status.textContent = friendlyError(error);
+        document.getElementById('database-selection-section').classList.add('hidden');
+        document.getElementById('database-schedule-section').classList.add('hidden');
+        document.getElementById('btn-save-database').disabled = true;
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Test Connection';
+    }
+}
+
+function renderDatabaseSelections() {
+    const databases = databaseConnectionResult?.databases || [];
+    const databaseChecklist = document.getElementById('database-checklist');
+    databaseChecklist.innerHTML = '';
+    if (databases.length === 0) {
+        databaseChecklist.innerHTML = '<p class="text-muted">No user databases were returned.</p>';
+    } else {
+        databases.forEach((database) => {
+            const label = document.createElement('label');
+            label.className = 'database-check-item';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = database;
+            checkbox.checked = databaseSelectedDatabases.has(database);
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) databaseSelectedDatabases.add(database);
+                else databaseSelectedDatabases.delete(database);
+            });
+            const name = document.createElement('span');
+            name.textContent = database;
+            name.title = database;
+            label.append(checkbox, name);
+            databaseChecklist.appendChild(label);
+        });
+    }
+
+    const tableDatabase = document.getElementById('database-table-database');
+    const previous = tableDatabase.value || [...databaseSelectedDatabases][0] || databases[0] || '';
+    tableDatabase.innerHTML = '';
+    databases.forEach((database) => {
+        const option = document.createElement('option');
+        option.value = database;
+        option.textContent = database;
+        tableDatabase.appendChild(option);
+    });
+    if (databases.includes(previous)) tableDatabase.value = previous;
+    renderDatabaseScope();
+}
+
+function selectedDatabaseScope() {
+    return document.querySelector('input[name="database-scope"]:checked')?.value || 'all';
+}
+
+function renderDatabaseScope() {
+    const scope = selectedDatabaseScope();
+    document.getElementById('database-all-options').classList.toggle('hidden', scope !== 'all');
+    document.getElementById('database-database-options').classList.toggle('hidden', scope !== 'databases');
+    document.getElementById('database-table-options').classList.toggle('hidden', scope !== 'tables');
+}
+
+async function loadDatabaseTables() {
+    if (!databaseConnectionResult || databaseConnectionFingerprint !== currentDatabaseFingerprint()) {
+        showToast('Test the connection again before loading tables.', 'error');
+        return;
+    }
+    const database = document.getElementById('database-table-database').value;
+    if (!database) {
+        showToast('Choose a database first.', 'error');
+        return;
+    }
+    const button = document.getElementById('btn-load-database-tables');
+    const container = document.getElementById('database-table-checklist');
+    button.disabled = true;
+    button.textContent = 'Loading…';
+    container.innerHTML = '<p class="text-muted">Loading tables…</p>';
+    try {
+        const tables = await invoke('cmd_list_database_tables', {
+            connectionUrl: document.getElementById('database-connection-url').value.trim(),
+            password: connectionPasswordPayload(),
+            clientExecutable: document.getElementById('database-client-executable').value.trim(),
+            profileId: document.getElementById('database-edit-id').value || null,
+            database,
+        });
+        container.innerHTML = '';
+        if (!tables.length) {
+            container.innerHTML = '<p class="text-muted">No tables or views found.</p>';
+            return;
+        }
+        tables.forEach((table) => {
+            const label = document.createElement('label');
+            label.className = 'database-check-item';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = table;
+            checkbox.checked = databaseSelectedTables.has(table);
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) databaseSelectedTables.add(table);
+                else databaseSelectedTables.delete(table);
+            });
+            const name = document.createElement('span');
+            name.textContent = table;
+            name.title = table;
+            label.append(checkbox, name);
+            container.appendChild(label);
+        });
+    } catch (error) {
+        container.innerHTML = `<p class="text-muted">${escapeHtml(friendlyError(error))}</p>`;
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Load tables';
+    }
+}
+
+function databaseScheduleValue() {
+    const raw = document.getElementById('database-schedule-times').value.trim();
+    if (!raw) return null;
+    const times = raw.split(',').map((value) => value.trim()).filter(Boolean);
+    const validTime = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    const invalid = times.find((value) => !validTime.test(value));
+    if (invalid) throw new Error(`Invalid time "${invalid}". Use HH:MM in 24-hour time.`);
+    const intervalDays = Math.max(1, Math.min(365, Math.trunc(Number(document.getElementById('database-schedule-interval').value || 1))));
+    return JSON.stringify({ times, intervalDays });
+}
+
+function updateDatabaseSchedulePreview() {
+    const help = document.getElementById('database-schedule-help');
+    const raw = document.getElementById('database-schedule-times').value.trim();
+    if (!raw) {
+        help.textContent = 'Leave blank for a manual-only database backup.';
+        return;
+    }
+    try {
+        const schedule = JSON.parse(databaseScheduleValue());
+        const utc = schedule.times.map((value) => {
+            const [hours, minutes] = value.split(':').map(Number);
+            const local = new Date();
+            local.setHours(hours, minutes, 0, 0);
+            return `${value} local (${String(local.getUTCHours()).padStart(2, '0')}:${String(local.getUTCMinutes()).padStart(2, '0')} UTC)`;
+        });
+        help.textContent = `${utc.join(', ')} · every ${schedule.intervalDays} day${schedule.intervalDays === 1 ? '' : 's'}`;
+    } catch (error) {
+        help.textContent = error.message;
+    }
+}
+
+async function saveDatabaseProfile() {
+    if (!databaseConnectionResult || databaseConnectionFingerprint !== currentDatabaseFingerprint()) {
+        showToast('Test the current connection before saving.', 'error');
+        invalidateDatabaseConnectionTest();
+        return;
+    }
+    const name = document.getElementById('database-name').value.trim();
+    if (!name) {
+        showToast('Enter a name for this database backup.', 'error');
+        return;
+    }
+    const selectionMode = selectedDatabaseScope();
+    let databases = [];
+    let tables = [];
+    if (selectionMode === 'databases') {
+        databases = [...databaseSelectedDatabases];
+        if (databases.length === 0) {
+            showToast('Select at least one database.', 'error');
+            return;
+        }
+    } else if (selectionMode === 'tables') {
+        const database = document.getElementById('database-table-database').value;
+        tables = [...databaseSelectedTables];
+        if (!database || tables.length === 0) {
+            showToast('Choose a database and at least one table.', 'error');
+            return;
+        }
+        databases = [database];
+    } else if (!document.getElementById('database-include-new').checked) {
+        databases = [...(databaseConnectionResult?.databases || [])];
+        if (databases.length === 0) {
+            showToast('No user databases are available to freeze in this backup scope.', 'error');
+            return;
+        }
+    }
+    let schedule;
+    try {
+        schedule = databaseScheduleValue();
+    } catch (error) {
+        showToast(error.message, 'error');
+        return;
+    }
+    const editId = document.getElementById('database-edit-id').value;
+    const payload = {
+        name,
+        connectionUrl: document.getElementById('database-connection-url').value.trim(),
+        password: connectionPasswordPayload(),
+        dumpExecutable: document.getElementById('database-dump-executable').value.trim(),
+        clientExecutable: document.getElementById('database-client-executable').value.trim(),
+        selectionMode,
+        databases,
+        tables,
+        includeNewDatabases: selectionMode === 'all' && document.getElementById('database-include-new').checked,
+        includeCreateStatements: document.getElementById('database-include-create').checked,
+        includeUsersAndGrants: document.getElementById('database-include-users').checked,
+        schedule,
+    };
+    const button = document.getElementById('btn-save-database');
+    button.disabled = true;
+    button.textContent = 'Saving…';
+    try {
+        if (editId) {
+            await invoke('cmd_update_database_profile', { id: editId, ...payload, enabled: true });
+            showToast('Database backup updated.', 'success');
+        } else {
+            await invoke('cmd_create_database_profile', { ...payload, password: payload.password ?? '' });
+            showToast('Database backup created.', 'success');
+        }
+        closeDatabaseSetup();
+        await loadDatabaseProfiles();
+    } catch (error) {
+        showToast(friendlyError(error), 'error');
+        button.disabled = false;
+    } finally {
+        button.textContent = 'Save Database Backup';
+    }
+}
+
+function databaseScheduleLabel(profile) {
+    if (!profile.schedule) return 'Manual only';
+    try {
+        const schedule = JSON.parse(profile.schedule);
+        const cadence = Number(schedule.intervalDays) === 1 ? 'Daily' : `Every ${schedule.intervalDays} days`;
+        return `${(schedule.times || []).join(', ')} local · ${cadence}`;
+    } catch {
+        return 'Scheduled';
+    }
+}
+
+function databaseScopeLabel(profile) {
+    if (profile.selectionMode === 'all') {
+        return profile.includeNewDatabases
+            ? 'Every user database · new databases included'
+            : `${profile.databases.length} verified database${profile.databases.length === 1 ? '' : 's'} · fixed scope`;
+    }
+    if (profile.selectionMode === 'tables') {
+        return `${profile.tables.length} table${profile.tables.length === 1 ? '' : 's'} in ${profile.databases[0] || 'one database'}`;
+    }
+    return `${profile.databases.length} database${profile.databases.length === 1 ? '' : 's'}`;
+}
+
+function databaseConnectionLabel(connectionUrl) {
+    try {
+        const url = new URL(connectionUrl);
+        return `${decodeURIComponent(url.username)}@${url.hostname}:${url.port || '3306'}`;
+    } catch {
+        return connectionUrl;
+    }
+}
+
+async function loadDatabaseProfiles() {
+    const container = document.getElementById('database-list');
+    try {
+        const [profiles, fileProfiles, profileLimitValue, backupState] = await Promise.all([
+            invoke('cmd_list_database_profiles'),
+            invoke('cmd_list_profiles'),
+            invoke('cmd_get_profile_limit'),
+            invoke('cmd_list_backups'),
+        ]);
+        databaseProfiles = profiles || [];
+        const profileLimit = Number(profileLimitValue ?? 2);
+        const scheduledDatabases = databaseProfiles.filter((profile) => profile.enabled && String(profile.schedule || '').trim()).length;
+        const scheduledFiles = (fileProfiles || []).filter((profile) => profile.enabled && String(profile.schedule || '').trim()).length;
+        document.getElementById('database-limit-summary').textContent = `${scheduledFiles + scheduledDatabases} of ${profileLimit} automated backup profiles in use across files and databases. Manual-only backups do not count.`;
+        container.innerHTML = '';
+        if (databaseProfiles.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-state';
+            empty.innerHTML = '<h3>No database backups yet</h3><p class="text-muted">Connect XAMPP, MariaDB or MySQL, verify access, then choose what SaveState should protect.</p>';
+            const add = document.createElement('button');
+            add.className = 'btn btn-primary';
+            add.textContent = 'Add Database';
+            add.addEventListener('click', () => void openDatabaseSetup());
+            empty.appendChild(add);
+            container.appendChild(empty);
+            return;
+        }
+
+        databaseProfiles.forEach((profile) => {
+            const row = document.createElement('article');
+            row.className = 'database-row';
+            row.dataset.databaseProfileId = profile.id;
+            const needsAttention = profile.scheduleState === 'needs_attention';
+            const effectiveNextRun = profile.scheduleState === 'retrying' && profile.retryAt ? profile.retryAt : profile.nextRun;
+            const restorePoints = (backupState?.backups || [])
+                .filter((backup) => backup.backupKind === 'database' && backup.databaseProfileId === profile.id)
+                .sort((left, right) => new Date(right.lastModified) - new Date(left.lastModified));
+            const statusLabel = needsAttention ? 'Needs attention' : (profile.enabled ? 'Active' : 'Paused');
+            const statusClass = needsAttention || !profile.enabled ? 'badge-neutral' : 'badge-success';
+            row.innerHTML = `
+                <div class="database-row-header">
+                    <div class="database-row-title">
+                        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+                        <h3 title="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}</h3>
+                    </div>
+                    <span class="badge ${statusClass}">${statusLabel}</span>
+                </div>
+                <div class="database-row-meta">
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Connection</span>
+                        <span class="meta-value" title="${escapeHtml(profile.connectionUrl)}">${escapeHtml(databaseConnectionLabel(profile.connectionUrl))}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Scope</span>
+                        <span class="meta-value">${escapeHtml(databaseScopeLabel(profile))}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Last run</span>
+                        <span class="meta-value">${profile.lastRun ? new Date(profile.lastRun).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Never'}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">${profile.scheduleState === 'retrying' ? 'Retry' : 'Next run'}</span>
+                        <span class="meta-value" title="${effectiveNextRun ? escapeHtml(formatLocalAndUtc(effectiveNextRun)) : escapeHtml(databaseScheduleLabel(profile))}">${effectiveNextRun ? escapeHtml(formatLocalAndUtc(effectiveNextRun)) : escapeHtml(databaseScheduleLabel(profile))}</span>
+                    </div>
+                </div>
+                ${profile.lastErrorCode ? `<p class="field-help">Last issue: ${escapeHtml(profile.lastErrorCode.replaceAll('_', ' '))}</p>` : ''}
+                <details class="database-restore-points">
+                    <summary>${restorePoints.length} restore point${restorePoints.length === 1 ? '' : 's'}</summary>
+                    <div class="database-restore-list"></div>
+                </details>
+                <div class="database-row-progress hidden">
+                    <div class="database-row-progress-info">
+                        <span class="database-progress-message">Starting…</span>
+                        <span class="database-progress-percent">0%</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-bar-fill database-progress-fill" style="width:0%"></div></div>
+                </div>
+                <div class="database-row-actions"></div>
+            `;
+            const restoreList = row.querySelector('.database-restore-list');
+            if (restorePoints.length === 0) {
+                restoreList.innerHTML = '<p class="text-muted">Run the first backup to create a restore point.</p>';
+            } else {
+                restorePoints.forEach((backup) => {
+                    const item = document.createElement('div');
+                    item.className = 'database-restore-item';
+                    const copy = document.createElement('div');
+                    const date = document.createElement('strong');
+                    date.textContent = new Date(backup.lastModified).toLocaleString();
+                    const size = document.createElement('span');
+                    size.textContent = `${backup.sizeFormatted} source SQL`;
+                    copy.append(date, size);
+                    const restore = document.createElement('button');
+                    restore.className = 'btn btn-ghost btn-sm';
+                    restore.textContent = 'Restore';
+                    restore.addEventListener('click', async () => {
+                        const confirmed = await confirmDialog(
+                            `Import this restore point into ${databaseConnectionLabel(profile.connectionUrl)}? Existing objects may be replaced. A stopped or failed SQL import can leave partial database changes, so keep a current safety backup.`,
+                            { title: 'Restore database', kind: 'warning' },
+                        );
+                        if (!confirmed) return;
+                        restore.disabled = true;
+                        restore.textContent = 'Restoring…';
+                        const stop = document.createElement('button');
+                        stop.className = 'btn btn-danger btn-sm';
+                        stop.textContent = 'Stop';
+                        stop.addEventListener('click', async () => {
+                            stop.disabled = true;
+                            stop.textContent = 'Stopping…';
+                            try {
+                                await invoke('cmd_cancel_restore', { key: backup.key });
+                            } catch (error) {
+                                showToast('Could not stop restore: ' + friendlyError(error), 'error');
+                                stop.disabled = false;
+                                stop.textContent = 'Stop';
+                            }
+                        });
+                        item.appendChild(stop);
+                        row.querySelector('.database-row-progress').classList.remove('hidden');
+                        try {
+                            await invoke('cmd_restore_database_backup', {
+                                profileId: profile.id,
+                                snapshotId: backup.key,
+                            });
+                        } catch (error) {
+                            void handleRepositoryError(error);
+                        } finally {
+                            stop.remove();
+                            restore.disabled = false;
+                            restore.textContent = 'Restore';
+                            row.querySelector('.database-row-progress').classList.add('hidden');
+                        }
+                    });
+                    item.append(copy, restore);
+                    restoreList.appendChild(item);
+                });
+            }
+            const actions = row.querySelector('.database-row-actions');
+            const run = document.createElement('button');
+            run.className = 'btn btn-primary btn-sm';
+            run.dataset.databaseAction = 'run';
+            run.textContent = 'Run Now';
+            run.addEventListener('click', () => {
+                run.disabled = true;
+                run.textContent = 'Running…';
+                row.querySelector('.database-row-progress').classList.remove('hidden');
+                invoke('cmd_run_database_backup', { profileId: profile.id }).catch((error) => {
+                    row.querySelector('.database-row-progress').classList.add('hidden');
+                    run.disabled = false;
+                    run.textContent = 'Run Now';
+                    failBackupUi(error);
+                });
+            });
+            const edit = document.createElement('button');
+            edit.className = 'btn btn-ghost btn-sm';
+            edit.textContent = 'Edit';
+            edit.addEventListener('click', () => void openDatabaseSetup(profile));
+            const remove = document.createElement('button');
+            remove.className = 'btn btn-danger btn-sm';
+            remove.textContent = 'Delete';
+            remove.addEventListener('click', async () => {
+                const confirmed = await confirmDialog(
+                    `Delete database backup "${profile.name}"? Its saved database password will also be removed. Existing encrypted snapshots stay in My Backups, but you must recreate a compatible database connection before you can restore them.`,
+                    { title: 'Delete database backup', kind: 'warning' },
+                );
+                if (!confirmed) return;
+                try {
+                    await invoke('cmd_delete_database_profile', { id: profile.id });
+                    showToast('Database backup removed.', 'success');
+                    loadDatabaseProfiles();
+                } catch (error) {
+                    showToast(friendlyError(error), 'error');
+                }
+            });
+            actions.append(run, edit, remove);
+            container.appendChild(row);
+        });
+    } catch (error) {
+        container.innerHTML = `<div class="empty-state"><p class="text-muted">Could not load database backups: ${escapeHtml(friendlyError(error))}</p></div>`;
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -2111,6 +2861,11 @@ function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+function cssEscape(value) {
+    if (window.CSS?.escape) return window.CSS.escape(String(value));
+    return String(value).replace(/[^a-zA-Z0-9_-]/g, (character) => `\\${character}`);
 }
 
 // Make navigateTo globally available for inline onclick handlers

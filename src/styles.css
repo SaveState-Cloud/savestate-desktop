@@ -730,6 +730,455 @@ code {
 }
 
 /* ─────────────────────────────────────────────────────────────
+   DATABASE BACKUPS
+   ───────────────────────────────────────────────────────────── */
+
+.page-intro {
+  max-width: 62ch;
+  margin-top: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.database-limit-summary {
+  margin: -0.35rem 0 1.25rem;
+  font-size: 0.82rem;
+}
+
+.database-setup {
+  margin-bottom: 1.5rem;
+  padding: 0;
+  overflow: hidden;
+}
+
+.database-setup-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.database-setup-header h3 {
+  margin-top: 0.25rem;
+  font-size: 1.2rem;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.database-form-section {
+  display: grid;
+  grid-template-columns: minmax(145px, 0.34fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  padding: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.database-section-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.database-section-copy strong {
+  font-size: 0.9rem;
+}
+
+.database-section-copy span {
+  color: var(--text-muted);
+  font-size: 0.77rem;
+  line-height: 1.45;
+}
+
+.database-fields,
+.database-tool-picker {
+  min-width: 0;
+}
+
+.database-fields > .form-group:last-child,
+.database-field-grid .form-group,
+.database-tool-picker.form-group {
+  margin-bottom: 0;
+}
+
+.database-field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(150px, 0.8fr);
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.database-tool-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.database-tool-picker {
+  flex: 1;
+}
+
+.database-tool-details {
+  margin-top: 0.85rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.database-tool-details summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.database-tool-details[open] summary {
+  margin-bottom: 1rem;
+}
+
+.database-tool-details .database-field-grid {
+  margin-bottom: 0;
+}
+
+.database-test-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
+.database-test-status {
+  flex: 1;
+  min-width: 0;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.database-test-status[data-state="success"] {
+  border-color: var(--border-focus);
+  color: var(--accent);
+  background: var(--accent-ghost);
+}
+
+.database-test-status[data-state="error"] {
+  border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  color: oklch(75% 0.12 27);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+
+.database-scope-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1.1rem;
+  padding: 0;
+  border: 0;
+}
+
+.database-scope-options legend,
+.field-label {
+  width: 100%;
+  margin-bottom: 0.65rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.database-scope-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-primary);
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+
+.database-scope-options input,
+.check-row input,
+.database-check-item input {
+  accent-color: var(--accent);
+}
+
+.database-selection-panel {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-secondary);
+}
+
+.database-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
+  gap: 0.5rem;
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.database-check-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  border-radius: 7px;
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.database-check-item:hover {
+  background: var(--accent-ghost);
+}
+
+.database-check-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.check-row + .check-row {
+  margin-top: 0.8rem;
+}
+
+.check-row input {
+  margin-top: 0.15rem;
+}
+
+.check-row span {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.check-row small {
+  color: var(--text-muted);
+  font-size: 0.73rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.database-content-options {
+  margin-top: 1.25rem;
+}
+
+.input-with-suffix {
+  display: flex;
+  align-items: stretch;
+}
+
+.input-with-suffix input {
+  border-radius: 8px 0 0 8px;
+}
+
+.input-with-suffix span {
+  display: flex;
+  align-items: center;
+  padding: 0 0.8rem;
+  border: 1px solid var(--border);
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  font-size: 0.8rem;
+}
+
+.database-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.15rem 1.5rem;
+}
+
+.database-form-actions > span {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.database-form-actions > div {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.database-list {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg-glass);
+}
+
+.database-list > .empty-state {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.database-list > .empty-state .btn {
+  margin-top: 1rem;
+}
+
+.database-row {
+  padding: 1.2rem 1.35rem;
+}
+
+.database-row + .database-row {
+  border-top: 1px solid var(--border);
+}
+
+.database-row-header,
+.database-row-actions,
+.database-row-progress-info {
+  display: flex;
+  align-items: center;
+}
+
+.database-row-header {
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.database-row-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 0.65rem;
+}
+
+.database-row-title svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.database-row-title h3 {
+  overflow: hidden;
+  font-size: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.database-row-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) repeat(3, minmax(115px, 0.8fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.database-row-progress {
+  margin: 0.9rem 0;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--border);
+}
+
+.database-restore-points {
+  margin: 0.8rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.database-restore-points summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.database-restore-list {
+  margin-top: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.database-restore-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.7rem 0.8rem;
+  background: var(--bg-secondary);
+}
+
+.database-restore-item + .database-restore-item {
+  border-top: 1px solid var(--border);
+}
+
+.database-restore-item > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.database-restore-item strong {
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  font-weight: 550;
+}
+
+.database-restore-item span {
+  font-size: 0.72rem;
+}
+
+.database-row-progress-info {
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.77rem;
+}
+
+.database-row-actions {
+  gap: 0.5rem;
+  padding-top: 0.95rem;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 920px) {
+  .database-form-section {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  .database-row-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .database-field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .database-tool-row,
+  .database-test-row,
+  .database-form-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .database-form-actions > div {
+    justify-content: flex-end;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
    DATA TABLES
    ───────────────────────────────────────────────────────────── */
 

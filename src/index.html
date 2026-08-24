@@ -114,6 +114,12 @@
                         </a>
                     </li>
                     <li>
+                        <a href="#" data-view="databases" class="nav-link">
+                            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+                            <span>Databases</span>
+                        </a>
+                    </li>
+                    <li>
                         <a href="#" data-view="backup" class="nav-link">
                             <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                             <span>Quick Backup</span>
@@ -243,6 +249,171 @@
                     <div id="profiles-list" class="profiles-grid">
                         <div class="empty-state glass-card">
                             <p class="text-muted">No backup profiles yet. Create one to get started.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ── DATABASES ────────────────────── -->
+                <section id="page-databases" class="page">
+                    <div class="page-header">
+                        <div>
+                            <h2 class="page-title">Database Backups</h2>
+                            <p class="page-intro">Stream MySQL and MariaDB exports directly into encrypted SaveState snapshots.</p>
+                        </div>
+                        <button class="btn btn-primary btn-sm" id="btn-create-database">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            Add Database
+                        </button>
+                    </div>
+                    <p class="text-muted database-limit-summary" id="database-limit-summary">Scheduled-profile allowance is loading…</p>
+
+                    <div id="database-setup" class="database-setup glass-card hidden">
+                        <div class="database-setup-header">
+                            <div>
+                                <span class="eyebrow">Database connection</span>
+                                <h3 id="database-setup-title">Add database backup</h3>
+                            </div>
+                            <button type="button" class="btn btn-ghost btn-sm" id="btn-close-database-setup" aria-label="Close database setup">Close</button>
+                        </div>
+
+                        <form id="database-form" autocomplete="off">
+                            <input type="hidden" id="database-edit-id" />
+                            <div class="database-form-section">
+                                <div class="database-section-copy">
+                                    <strong>1. Connect</strong>
+                                    <span>Credentials stay in Windows Credential Manager.</span>
+                                </div>
+                                <div class="database-fields">
+                                    <div class="form-group">
+                                        <label for="database-name">Backup name</label>
+                                        <input type="text" id="database-name" placeholder="Production database" maxlength="80" required />
+                                    </div>
+                                    <div class="database-field-grid">
+                                        <div class="form-group">
+                                            <label for="database-connection-url">Connection string</label>
+                                            <input type="text" id="database-connection-url" value="mysql://root@127.0.0.1:3306" spellcheck="false" required />
+                                            <p class="field-help">Use <code>mysql://username@host:port</code>. Do not put the password in this field.</p>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="database-password">Password</label>
+                                            <input type="password" id="database-password" autocomplete="new-password" />
+                                            <p class="field-help" id="database-password-help">Leave blank only when the database account has no password.</p>
+                                        </div>
+                                    </div>
+                                    <div class="database-tool-row">
+                                        <div class="form-group database-tool-picker">
+                                            <label for="database-tool-bundle">Database tools</label>
+                                            <select id="database-tool-bundle" class="select-input">
+                                                <option value="">Searching this PC…</option>
+                                            </select>
+                                        </div>
+                                        <button type="button" class="btn btn-ghost btn-sm" id="btn-refresh-database-tools">Scan again</button>
+                                    </div>
+                                    <details class="database-tool-details">
+                                        <summary>Executable locations</summary>
+                                        <div class="database-field-grid">
+                                            <div class="form-group">
+                                                <label for="database-dump-executable">Dump tool</label>
+                                                <input type="text" id="database-dump-executable" spellcheck="false" required />
+                                            </div>
+                                            <div class="form-group">
+                                                <label for="database-client-executable">Connection tool</label>
+                                                <input type="text" id="database-client-executable" spellcheck="false" required />
+                                            </div>
+                                        </div>
+                                    </details>
+                                    <div class="database-test-row">
+                                        <button type="button" class="btn btn-primary" id="btn-test-database">Test Connection</button>
+                                        <div id="database-test-status" class="database-test-status" role="status">Test the connection to continue.</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="database-selection-section" class="database-form-section hidden">
+                                <div class="database-section-copy">
+                                    <strong>2. Choose data</strong>
+                                    <span>Tables, views, triggers, routines and events are included.</span>
+                                </div>
+                                <div class="database-fields">
+                                    <fieldset class="database-scope-options">
+                                        <legend>Backup scope</legend>
+                                        <label><input type="radio" name="database-scope" value="all" checked /> Every database</label>
+                                        <label><input type="radio" name="database-scope" value="databases" /> Selected databases</label>
+                                        <label><input type="radio" name="database-scope" value="tables" /> Individual tables</label>
+                                    </fieldset>
+
+                                    <div id="database-all-options" class="database-selection-panel">
+                                        <label class="check-row">
+                                            <input type="checkbox" id="database-include-new" checked />
+                                            <span><strong>Automatically include new databases</strong><small>System databases remain excluded.</small></span>
+                                        </label>
+                                    </div>
+                                    <div id="database-database-options" class="database-selection-panel hidden">
+                                        <p class="field-label">Databases</p>
+                                        <div id="database-checklist" class="database-checklist"></div>
+                                    </div>
+                                    <div id="database-table-options" class="database-selection-panel hidden">
+                                        <div class="database-tool-row">
+                                            <div class="form-group database-tool-picker">
+                                                <label for="database-table-database">Database</label>
+                                                <select id="database-table-database" class="select-input"></select>
+                                            </div>
+                                            <button type="button" class="btn btn-ghost btn-sm" id="btn-load-database-tables">Load tables</button>
+                                        </div>
+                                        <div id="database-table-checklist" class="database-checklist database-table-checklist">
+                                            <p class="text-muted">Choose a database, then load its tables.</p>
+                                        </div>
+                                    </div>
+
+                                    <div class="database-content-options">
+                                        <label class="check-row">
+                                            <input type="checkbox" id="database-include-create" checked />
+                                            <span><strong>Include database creation statements</strong><small>Makes full-server restores easier.</small></span>
+                                        </label>
+                                        <label class="check-row" id="database-users-option">
+                                            <input type="checkbox" id="database-include-users" />
+                                            <span><strong>Include users and grants</strong><small id="database-users-help">Available when the selected dump tool supports portable account exports.</small></span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="database-schedule-section" class="database-form-section hidden">
+                                <div class="database-section-copy">
+                                    <strong>3. Schedule</strong>
+                                    <span>Leave times blank for manual backups only.</span>
+                                </div>
+                                <div class="database-fields">
+                                    <div class="database-field-grid">
+                                        <div class="form-group">
+                                            <label for="database-schedule-times">Backup times</label>
+                                            <input type="text" id="database-schedule-times" placeholder="02:00, 14:00" />
+                                            <p class="field-help" id="database-schedule-help">This machine's local time.</p>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="database-schedule-interval">Repeat every</label>
+                                            <div class="input-with-suffix">
+                                                <input type="number" id="database-schedule-interval" value="1" min="1" max="365" />
+                                                <span>days</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="database-form-actions">
+                                <span id="database-save-help">A successful connection test is required.</span>
+                                <div>
+                                    <button type="button" class="btn btn-ghost" id="btn-cancel-database">Cancel</button>
+                                    <button type="submit" class="btn btn-primary" id="btn-save-database" disabled>Save Database Backup</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+
+                    <div id="database-list" class="database-list">
+                        <div class="empty-state glass-card">
+                            <p class="text-muted">Loading database backups…</p>
                         </div>
                     </div>
                 </section>

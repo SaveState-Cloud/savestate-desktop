@@ -187,6 +187,7 @@ pub struct GenericSuccess {
 #[serde(rename_all = "camelCase")]
 pub struct EngineScheduleSnapshot {
     pub profile_id: String,
+    pub profile_kind: String,
     pub times: Vec<String>,
     pub interval_days: u32,
     pub next_run_at: Option<String>,

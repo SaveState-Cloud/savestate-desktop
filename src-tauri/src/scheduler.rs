@@ -21,6 +21,24 @@ pub fn classify_schedule_failure(error: &str) -> FailureClassification {
             retryable: false,
         };
     }
+    if value.contains("database_authentication_failed") {
+        return FailureClassification {
+            code: "database_authentication_failed",
+            retryable: false,
+        };
+    }
+    if value.contains("database_tool_not_found") {
+        return FailureClassification {
+            code: "database_tool_missing",
+            retryable: false,
+        };
+    }
+    if value.contains("database_grants_unsupported") {
+        return FailureClassification {
+            code: "database_grants_unsupported",
+            retryable: false,
+        };
+    }
     if value.contains("repository_key_mismatch")
         || value.contains("message authentication failed")
         || value.contains("unable to decrypt content")
@@ -138,6 +156,13 @@ mod tests {
             "source_missing"
         );
         assert!(!classify_schedule_failure("REPOSITORY_KEY_MISMATCH: cannot decrypt").retryable);
+        assert!(
+            !classify_schedule_failure("DATABASE_AUTHENTICATION_FAILED: access denied").retryable
+        );
+        assert_eq!(
+            classify_schedule_failure("DATABASE_TOOL_NOT_FOUND: missing mysqldump").code,
+            "database_tool_missing"
+        );
         assert!(classify_schedule_failure("request timed out").retryable);
     }
 
