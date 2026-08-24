@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod backup;
 mod backup_operations;
+mod databases;
 mod db;
 mod incremental;
 mod kopia;
@@ -234,6 +235,16 @@ fn main() {
             profiles::cmd_count_unowned_profiles,
             profiles::cmd_claim_unowned_profiles,
             profiles::cmd_run_profile_backup,
+            // Database backups
+            databases::cmd_discover_database_tools,
+            databases::cmd_test_database_connection,
+            databases::cmd_list_database_tables,
+            databases::cmd_create_database_profile,
+            databases::cmd_update_database_profile,
+            databases::cmd_list_database_profiles,
+            databases::cmd_delete_database_profile,
+            databases::cmd_run_database_backup,
+            databases::cmd_restore_database_backup,
             // Notifications & Settings
             notifications::cmd_save_settings,
             notifications::cmd_get_settings,
@@ -345,15 +356,20 @@ async fn run_scheduler_tick(app_handle: &tauri::AppHandle) {
     };
 
     // Load all profiles
-    let profiles = {
+    let (profiles, database_profiles) = {
         let guard = match state.0.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        match db::list_profiles_for_account(&guard.db, &owner_account) {
-            Ok(p) => p,
-            Err(_) => return,
-        }
+        let Ok(profiles) = db::list_profiles_for_account(&guard.db, &owner_account) else {
+            return;
+        };
+        let Ok(database_profiles) =
+            db::list_database_profiles_for_account(&guard.db, &owner_account)
+        else {
+            return;
+        };
+        (profiles, database_profiles)
     };
 
     profiles::report_schedule_snapshot_from_profiles(&state, &profiles);
@@ -506,6 +522,132 @@ async fn run_scheduler_tick(app_handle: &tauri::AppHandle) {
 
         // Report the new future run, retry deadline, or needs-attention state
         // immediately instead of waiting for the next minute tick.
+        profiles::report_schedule_snapshot(&state);
+    }
+
+    for profile in database_profiles {
+        if !databases::database_profile_is_due(&profile, now) {
+            continue;
+        }
+
+        let previous_retry_count = if profile.schedule_state == "needs_attention" {
+            if let Ok(guard) = state.0.lock() {
+                let _ = db::begin_database_profile_attempt(&guard.db, &profile.id, &owner_account);
+            }
+            0
+        } else {
+            profile.retry_count
+        };
+
+        let result = databases::run_database_backup_inner(
+            app_handle.clone(),
+            &state,
+            &profile.id,
+            "database_scheduled",
+        )
+        .await;
+        let api = match state.0.lock() {
+            Ok(guard) => guard.api.clone(),
+            Err(_) => continue,
+        };
+
+        match result {
+            Ok(backup_id) => {
+                let recovered = matches!(
+                    profile.schedule_state.as_str(),
+                    "retrying" | "needs_attention"
+                ) || previous_retry_count > 0;
+                notifications::send_backup_notification(
+                    &api,
+                    "backup_success",
+                    &profile.name,
+                    &if recovered {
+                        format!(
+                            "Scheduled database backup recovered after an automatic retry. ID: {}",
+                            backup_id
+                        )
+                    } else {
+                        format!("Scheduled database backup completed. ID: {}", backup_id)
+                    },
+                )
+                .await;
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if error.contains("BACKUP_CANCELLED") {
+                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                    if let Ok(guard) = state.0.lock() {
+                        let _ = db::advance_database_profile_after_cancellation(
+                            &guard.db,
+                            &profile.id,
+                            &owner_account,
+                            next_regular.as_deref(),
+                        );
+                    }
+                    profiles::report_schedule_snapshot(&state);
+                    continue;
+                }
+                let classification = scheduler::classify_schedule_failure(&error);
+                let bounded_error: String = error.chars().take(1_000).collect();
+                let next_retry_number = previous_retry_count + 1;
+                let retry_delay = classification
+                    .retryable
+                    .then(|| scheduler::retry_delay(&profile.id, next_retry_number))
+                    .flatten();
+
+                if let Some(delay) = retry_delay {
+                    let retry_at = (chrono::Utc::now() + delay).to_rfc3339();
+                    if let Ok(guard) = state.0.lock() {
+                        let _ = db::schedule_database_profile_retry(
+                            &guard.db,
+                            &profile.id,
+                            &owner_account,
+                            next_retry_number,
+                            &retry_at,
+                            classification.code,
+                            &bounded_error,
+                        );
+                    }
+                    if previous_retry_count == 0 {
+                        notifications::send_backup_notification(
+                            &api,
+                            "backup_failure",
+                            &profile.name,
+                            &format!(
+                                "Scheduled database backup failed ({}). Automatic retry {} of {} is queued.",
+                                classification.code,
+                                next_retry_number,
+                                scheduler::MAX_SCHEDULE_RETRIES,
+                            ),
+                        )
+                        .await;
+                    }
+                } else {
+                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                    if let Ok(guard) = state.0.lock() {
+                        let _ = db::mark_database_profile_needs_attention(
+                            &guard.db,
+                            &profile.id,
+                            &owner_account,
+                            next_regular.as_deref(),
+                            previous_retry_count,
+                            classification.code,
+                            &bounded_error,
+                        );
+                    }
+                    notifications::send_backup_notification(
+                        &api,
+                        "backup_failure",
+                        &profile.name,
+                        &format!(
+                            "Scheduled database backup needs attention ({}). Open SaveState Vault to test the connection.",
+                            classification.code,
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
         profiles::report_schedule_snapshot(&state);
     }
 }

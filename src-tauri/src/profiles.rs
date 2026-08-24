@@ -1,6 +1,6 @@
 use crate::api::EngineScheduleSnapshot;
 use crate::backup;
-use crate::db::{self, BackupProfile};
+use crate::db::{self, BackupProfile, DatabaseProfile};
 use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, TimeZone, Timelike, Utc};
@@ -27,14 +27,16 @@ fn is_automated_profile(profile: &BackupProfile) -> bool {
 
 fn ensure_automated_profile_capacity(
     profiles: &[BackupProfile],
+    other_automated_profiles: usize,
     profile_limit: usize,
     excluded_profile_id: Option<&str>,
 ) -> std::result::Result<(), String> {
-    let automated = profiles
-        .iter()
-        .filter(|profile| excluded_profile_id != Some(profile.id.as_str()))
-        .filter(|profile| is_automated_profile(profile))
-        .count();
+    let automated = other_automated_profiles
+        + profiles
+            .iter()
+            .filter(|profile| excluded_profile_id != Some(profile.id.as_str()))
+            .filter(|profile| is_automated_profile(profile))
+            .count();
     if automated >= profile_limit {
         return Err(format!(
             "AUTOMATED_PROFILE_LIMIT_REACHED: Your plan allows up to {profile_limit} enabled scheduled backup profiles. Keep this profile manual-only, pause another schedule, or upgrade your plan."
@@ -156,7 +158,12 @@ pub async fn cmd_create_profile(
                 profile.owner_account.as_deref().unwrap_or_default(),
             )
             .map_err(|e| e.to_string())?;
-            ensure_automated_profile_capacity(&profiles, profile_limit, None)?;
+            let database_profiles = db::count_scheduled_database_profiles_for_account(
+                &guard.db,
+                profile.owner_account.as_deref().unwrap_or_default(),
+            )
+            .map_err(|e| e.to_string())?;
+            ensure_automated_profile_capacity(&profiles, database_profiles, profile_limit, None)?;
         }
         db::create_profile(&guard.db, &profile).map_err(|e| e.to_string())?;
     }
@@ -214,8 +221,12 @@ pub async fn cmd_update_profile(
         if requested_is_automated && !is_automated_profile(&existing) {
             let profiles = db::list_profiles_for_account(&guard.db, &owner_account)
                 .map_err(|e| e.to_string())?;
+            let database_profiles =
+                db::count_scheduled_database_profiles_for_account(&guard.db, &owner_account)
+                    .map_err(|e| e.to_string())?;
             ensure_automated_profile_capacity(
                 &profiles,
+                database_profiles,
                 profile_limit.unwrap_or(2),
                 Some(id.as_str()),
             )?;
@@ -412,8 +423,36 @@ fn engine_schedule(profile: &BackupProfile) -> Option<EngineScheduleSnapshot> {
 
     Some(EngineScheduleSnapshot {
         profile_id: profile.id.clone(),
+        profile_kind: "files".to_string(),
         times,
         interval_days,
+        next_run_at: profile.next_run.clone(),
+        retry_at: profile.retry_at.clone(),
+        retry_count: profile.retry_count,
+        state: profile.schedule_state.clone(),
+        last_error_code: profile.last_error_code.clone(),
+        enabled: profile.enabled,
+    })
+}
+
+fn database_engine_schedule(profile: &DatabaseProfile) -> Option<EngineScheduleSnapshot> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScheduleConfig {
+        times: Vec<String>,
+        interval_days: u32,
+    }
+
+    let schedule = profile.schedule.as_deref()?.trim();
+    if schedule.is_empty() {
+        return None;
+    }
+    let config: ScheduleConfig = serde_json::from_str(schedule).ok()?;
+    Some(EngineScheduleSnapshot {
+        profile_id: profile.id.clone(),
+        profile_kind: "database".to_string(),
+        times: config.times,
+        interval_days: config.interval_days,
         next_run_at: profile.next_run.clone(),
         retry_at: profile.retry_at.clone(),
         retry_count: profile.retry_count,
@@ -438,18 +477,28 @@ pub fn report_schedule_snapshot(state: &AppStateWrapper) {
 }
 
 pub fn report_schedule_snapshot_from_profiles(state: &AppStateWrapper, profiles: &[BackupProfile]) {
-    let (api, owner_account) = {
+    let (api, owner_account, database_profiles) = {
         let Ok(guard) = state.0.lock() else { return };
         let Some(owner_account) = guard.account_scope() else {
             return;
         };
-        (guard.api.clone(), owner_account)
+        let Ok(database_profiles) =
+            db::list_database_profiles_for_account(&guard.db, &owner_account)
+        else {
+            return;
+        };
+        (guard.api.clone(), owner_account, database_profiles)
     };
-    let schedules: Vec<EngineScheduleSnapshot> = profiles
+    let mut schedules: Vec<EngineScheduleSnapshot> = profiles
         .iter()
         .filter(|profile| profile.owner_account.as_deref() == Some(owner_account.as_str()))
         .filter_map(engine_schedule)
         .collect();
+    schedules.extend(
+        database_profiles
+            .iter()
+            .filter_map(database_engine_schedule),
+    );
     // Include the local account scope so switching between accounts with the
     // same schedule shape still reports to the newly authenticated account.
     let Ok(fingerprint) = serde_json::to_string(&(owner_account, &schedules)) else {
@@ -1255,14 +1304,14 @@ mod schedule_time_tests {
         scheduled_two.enabled = true;
 
         let profiles = vec![scheduled_one, manual, paused];
-        assert!(ensure_automated_profile_capacity(&profiles, 2, None).is_ok());
+        assert!(ensure_automated_profile_capacity(&profiles, 0, 2, None).is_ok());
         let profiles = vec![
             profiles[0].clone(),
             profiles[1].clone(),
             profiles[2].clone(),
             scheduled_two,
         ];
-        assert!(ensure_automated_profile_capacity(&profiles, 2, None).is_err());
+        assert!(ensure_automated_profile_capacity(&profiles, 0, 2, None).is_err());
     }
 
     #[test]
@@ -1270,7 +1319,7 @@ mod schedule_time_tests {
         let first = migration_profile("first", "2026-08-19T12:15:00Z");
         let second = migration_profile("second", "2026-08-19T12:15:00Z");
         let profiles = vec![first, second];
-        assert!(ensure_automated_profile_capacity(&profiles, 2, Some("second")).is_ok());
+        assert!(ensure_automated_profile_capacity(&profiles, 0, 2, Some("second")).is_ok());
     }
 
     #[test]

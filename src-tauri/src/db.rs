@@ -38,6 +38,33 @@ CREATE TABLE IF NOT EXISTS backup_profiles (
     created_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS database_profiles (
+    id              TEXT PRIMARY KEY,
+    owner_account   TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    connection_url  TEXT NOT NULL,
+    dump_executable TEXT NOT NULL,
+    client_executable TEXT NOT NULL,
+    selection_mode  TEXT NOT NULL,
+    databases_json  TEXT NOT NULL DEFAULT '[]',
+    tables_json     TEXT NOT NULL DEFAULT '[]',
+    include_new_databases INTEGER NOT NULL DEFAULT 0,
+    include_create_statements INTEGER NOT NULL DEFAULT 1,
+    include_users_and_grants INTEGER NOT NULL DEFAULT 0,
+    schedule        TEXT,
+    retention       INTEGER NOT NULL DEFAULT 0,
+    folder          TEXT NOT NULL DEFAULT '/',
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    last_run        TEXT,
+    next_run        TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    retry_at        TEXT,
+    last_error      TEXT,
+    last_error_code TEXT,
+    schedule_state  TEXT NOT NULL DEFAULT 'scheduled',
+    created_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS file_snapshots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     profile_id  TEXT NOT NULL,
@@ -118,6 +145,43 @@ pub struct BackupProfile {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseProfile {
+    pub id: String,
+    #[serde(skip_serializing)]
+    pub owner_account: String,
+    pub name: String,
+    pub connection_url: String,
+    pub dump_executable: String,
+    pub client_executable: String,
+    pub selection_mode: String,
+    pub databases: Vec<String>,
+    pub tables: Vec<String>,
+    pub include_new_databases: bool,
+    pub include_create_statements: bool,
+    pub include_users_and_grants: bool,
+    pub schedule: Option<String>,
+    pub retention: i64,
+    pub folder: String,
+    pub enabled: bool,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub retry_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_code: Option<String>,
+    #[serde(default = "default_schedule_state")]
+    pub schedule_state: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub has_credentials: bool,
+}
+
 fn default_schedule_state() -> String {
     "scheduled".to_string()
 }
@@ -163,8 +227,27 @@ pub fn init_db(data_dir: &Path) -> Result<Connection> {
         let _ = conn.execute(migration, []);
     }
     normalize_disabled_profile_state(&conn)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_database_profiles_owner_account
+         ON database_profiles(owner_account)",
+        [],
+    )
+    .context("Failed to index database profile ownership")?;
+    normalize_disabled_database_profile_state(&conn)?;
 
     Ok(conn)
+}
+
+fn normalize_disabled_database_profile_state(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE database_profiles
+         SET next_run = NULL, retry_count = 0, retry_at = NULL,
+             last_error = NULL, last_error_code = NULL, schedule_state = 'disabled'
+         WHERE enabled = 0",
+        [],
+    )
+    .context("Failed to normalize disabled database profile schedule state")?;
+    Ok(())
 }
 
 fn migrate_profile_ownership(conn: &Connection) -> Result<()> {
@@ -675,6 +758,339 @@ pub fn begin_profile_attempt(conn: &Connection, id: &str, owner_account: &str) -
     Ok(())
 }
 
+pub fn count_scheduled_file_profiles_for_account(
+    conn: &Connection,
+    owner_account: &str,
+) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM backup_profiles
+         WHERE owner_account = ?1 AND enabled = 1
+           AND schedule IS NOT NULL AND TRIM(schedule) <> ''",
+        params![owner_account],
+        |row| row.get(0),
+    )?;
+    usize::try_from(count).context("Scheduled file profile count was negative")
+}
+
+pub fn count_scheduled_database_profiles_for_account(
+    conn: &Connection,
+    owner_account: &str,
+) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM database_profiles
+         WHERE owner_account = ?1 AND enabled = 1
+           AND schedule IS NOT NULL AND TRIM(schedule) <> ''",
+        params![owner_account],
+        |row| row.get(0),
+    )?;
+    usize::try_from(count).context("Scheduled database profile count was negative")
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Database profile CRUD
+// ────────────────────────────────────────────────────────────────────
+
+pub fn create_database_profile(conn: &Connection, profile: &DatabaseProfile) -> Result<()> {
+    let databases = serde_json::to_string(&profile.databases)?;
+    let tables = serde_json::to_string(&profile.tables)?;
+    conn.execute(
+        "INSERT INTO database_profiles
+           (id, owner_account, name, connection_url, dump_executable, client_executable,
+            selection_mode, databases_json, tables_json, include_new_databases,
+            include_create_statements, include_users_and_grants, schedule, retention, folder,
+            enabled, last_run, next_run, retry_count, retry_at, last_error, last_error_code,
+            schedule_state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        params![
+            profile.id,
+            profile.owner_account,
+            profile.name,
+            profile.connection_url,
+            profile.dump_executable,
+            profile.client_executable,
+            profile.selection_mode,
+            databases,
+            tables,
+            profile.include_new_databases as i32,
+            profile.include_create_statements as i32,
+            profile.include_users_and_grants as i32,
+            profile.schedule,
+            profile.retention,
+            profile.folder,
+            profile.enabled as i32,
+            profile.last_run,
+            profile.next_run,
+            profile.retry_count,
+            profile.retry_at,
+            profile.last_error,
+            profile.last_error_code,
+            profile.schedule_state,
+            profile.created_at,
+        ],
+    )
+    .context("Failed to create database profile")?;
+    Ok(())
+}
+
+pub fn update_database_profile(conn: &Connection, profile: &DatabaseProfile) -> Result<()> {
+    let databases = serde_json::to_string(&profile.databases)?;
+    let tables = serde_json::to_string(&profile.tables)?;
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET name = ?1, connection_url = ?2, dump_executable = ?3, client_executable = ?4,
+             selection_mode = ?5, databases_json = ?6, tables_json = ?7,
+             include_new_databases = ?8, include_create_statements = ?9,
+             include_users_and_grants = ?10, schedule = ?11, retention = ?12, folder = ?13,
+             enabled = ?14, last_run = ?15, next_run = ?16, retry_count = ?17,
+             retry_at = ?18, last_error = ?19, last_error_code = ?20, schedule_state = ?21
+         WHERE id = ?22 AND owner_account = ?23",
+        params![
+            profile.name,
+            profile.connection_url,
+            profile.dump_executable,
+            profile.client_executable,
+            profile.selection_mode,
+            databases,
+            tables,
+            profile.include_new_databases as i32,
+            profile.include_create_statements as i32,
+            profile.include_users_and_grants as i32,
+            profile.schedule,
+            profile.retention,
+            profile.folder,
+            profile.enabled as i32,
+            profile.last_run,
+            profile.next_run,
+            profile.retry_count,
+            profile.retry_at,
+            profile.last_error,
+            profile.last_error_code,
+            profile.schedule_state,
+            profile.id,
+            profile.owner_account,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+fn database_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseProfile> {
+    let databases_json: String = row.get(7)?;
+    let tables_json: String = row.get(8)?;
+    Ok(DatabaseProfile {
+        id: row.get(0)?,
+        owner_account: row.get(1)?,
+        name: row.get(2)?,
+        connection_url: row.get(3)?,
+        dump_executable: row.get(4)?,
+        client_executable: row.get(5)?,
+        selection_mode: row.get(6)?,
+        databases: serde_json::from_str(&databases_json).unwrap_or_default(),
+        tables: serde_json::from_str(&tables_json).unwrap_or_default(),
+        include_new_databases: row.get::<_, i32>(9)? != 0,
+        include_create_statements: row.get::<_, i32>(10)? != 0,
+        include_users_and_grants: row.get::<_, i32>(11)? != 0,
+        schedule: row.get(12)?,
+        retention: row.get(13)?,
+        folder: row.get(14)?,
+        enabled: row.get::<_, i32>(15)? != 0,
+        last_run: row.get(16)?,
+        next_run: row.get(17)?,
+        retry_count: row.get(18)?,
+        retry_at: row.get(19)?,
+        last_error: row.get(20)?,
+        last_error_code: row.get(21)?,
+        schedule_state: row.get(22)?,
+        created_at: row.get(23)?,
+        has_credentials: true,
+    })
+}
+
+const DATABASE_PROFILE_COLUMNS: &str =
+    "id, owner_account, name, connection_url, dump_executable, client_executable,
+     selection_mode, databases_json, tables_json, include_new_databases,
+     include_create_statements, include_users_and_grants, schedule, retention, folder,
+     enabled, last_run, next_run, retry_count, retry_at, last_error, last_error_code,
+     schedule_state, created_at";
+
+pub fn list_database_profiles_for_account(
+    conn: &Connection,
+    owner_account: &str,
+) -> Result<Vec<DatabaseProfile>> {
+    let sql = format!(
+        "SELECT {DATABASE_PROFILE_COLUMNS} FROM database_profiles
+         WHERE owner_account = ?1 ORDER BY created_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![owner_account], database_profile_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("Failed to read database profiles")
+}
+
+pub fn get_database_profile_for_account(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+) -> Result<DatabaseProfile> {
+    let sql = format!(
+        "SELECT {DATABASE_PROFILE_COLUMNS} FROM database_profiles
+         WHERE id = ?1 AND owner_account = ?2"
+    );
+    conn.query_row(&sql, params![id, owner_account], database_profile_from_row)
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                anyhow!("Database profile is not available for the signed-in account")
+            }
+            other => other.into(),
+        })
+}
+
+pub fn delete_database_profile_for_account(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "DELETE FROM database_profiles WHERE id = ?1 AND owner_account = ?2",
+        params![id, owner_account],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+pub fn update_database_profile_run_times(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+    last_run: &str,
+    next_run: Option<&str>,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET last_run = ?1, next_run = ?2, retry_count = 0, retry_at = NULL,
+             last_error = NULL, last_error_code = NULL, schedule_state = 'scheduled'
+         WHERE id = ?3 AND owner_account = ?4",
+        params![last_run, next_run, id, owner_account],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+pub fn advance_database_profile_after_cancellation(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+    next_run: Option<&str>,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET next_run = ?1, retry_count = 0, retry_at = NULL,
+             last_error = NULL, last_error_code = NULL, schedule_state = 'scheduled'
+         WHERE id = ?2 AND owner_account = ?3",
+        params![next_run, id, owner_account],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+pub fn schedule_database_profile_retry(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+    retry_count: u32,
+    retry_at: &str,
+    error_code: &str,
+    error_message: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET retry_count = ?1, retry_at = ?2, last_error_code = ?3,
+             last_error = ?4, schedule_state = 'retrying'
+         WHERE id = ?5 AND owner_account = ?6",
+        params![
+            retry_count,
+            retry_at,
+            error_code,
+            error_message,
+            id,
+            owner_account
+        ],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+pub fn mark_database_profile_needs_attention(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+    next_run: Option<&str>,
+    retry_count: u32,
+    error_code: &str,
+    error_message: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET next_run = ?1, retry_count = ?2, retry_at = NULL,
+             last_error_code = ?3, last_error = ?4, schedule_state = 'needs_attention'
+         WHERE id = ?5 AND owner_account = ?6",
+        params![
+            next_run,
+            retry_count,
+            error_code,
+            error_message,
+            id,
+            owner_account
+        ],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
+pub fn begin_database_profile_attempt(
+    conn: &Connection,
+    id: &str,
+    owner_account: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE database_profiles
+         SET retry_count = 0, retry_at = NULL, schedule_state = 'scheduled'
+         WHERE id = ?1 AND owner_account = ?2",
+        params![id, owner_account],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!(
+            "Database profile is not available for the signed-in account"
+        ));
+    }
+    Ok(())
+}
+
 // ────────────────────────────────────────────────────────────────────
 // File snapshot functions
 // ────────────────────────────────────────────────────────────────────
@@ -767,6 +1183,61 @@ mod tests {
             schedule_state: "scheduled".to_string(),
             created_at: "2026-08-19T12:00:00Z".to_string(),
         }
+    }
+
+    fn test_database_profile(id: &str, owner: &str) -> DatabaseProfile {
+        DatabaseProfile {
+            id: id.to_string(),
+            owner_account: owner.to_string(),
+            name: "XAMPP database".to_string(),
+            connection_url: "mysql://root@127.0.0.1:3306".to_string(),
+            dump_executable: r"C:\xampp\mysql\bin\mysqldump.exe".to_string(),
+            client_executable: r"C:\xampp\mysql\bin\mysql.exe".to_string(),
+            selection_mode: "databases".to_string(),
+            databases: vec!["shop".to_string(), "analytics".to_string()],
+            tables: Vec::new(),
+            include_new_databases: false,
+            include_create_statements: true,
+            include_users_and_grants: false,
+            schedule: Some(r#"{"times":["02:00"],"intervalDays":1}"#.to_string()),
+            retention: 7,
+            folder: "/".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: Some("2026-08-25T00:00:00Z".to_string()),
+            retry_count: 0,
+            retry_at: None,
+            last_error: None,
+            last_error_code: None,
+            schedule_state: "scheduled".to_string(),
+            created_at: "2026-08-24T09:00:00Z".to_string(),
+            has_credentials: false,
+        }
+    }
+
+    #[test]
+    fn database_profiles_are_account_scoped_and_count_toward_schedules() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let first = test_database_profile("database-1", "owner@example.com");
+        let second = test_database_profile("database-2", "other@example.com");
+        create_database_profile(&conn, &first).unwrap();
+        create_database_profile(&conn, &second).unwrap();
+
+        let owner_profiles =
+            list_database_profiles_for_account(&conn, "owner@example.com").unwrap();
+        assert_eq!(owner_profiles.len(), 1);
+        assert_eq!(owner_profiles[0].databases, vec!["shop", "analytics"]);
+        assert!(
+            get_database_profile_for_account(&conn, "database-2", "owner@example.com").is_err()
+        );
+        assert_eq!(
+            count_scheduled_database_profiles_for_account(&conn, "owner@example.com").unwrap(),
+            1
+        );
+        assert!(
+            delete_database_profile_for_account(&conn, "database-2", "owner@example.com").is_err()
+        );
     }
 
     #[test]

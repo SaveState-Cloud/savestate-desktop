@@ -20,6 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -298,10 +299,79 @@ pub struct KopiaSnapshot {
     pub file_count: u64,
     #[serde(default = "root_folder")]
     pub folder: String,
+    #[serde(default = "file_backup_kind")]
+    pub backup_kind: String,
+    #[serde(default)]
+    pub database_profile_id: Option<String>,
+    #[serde(default)]
+    pub database_profile_name: Option<String>,
+    #[serde(default)]
+    pub root_object_id: Option<String>,
 }
 
 fn root_folder() -> String {
     "/".to_string()
+}
+
+fn file_backup_kind() -> String {
+    "files".to_string()
+}
+
+pub struct StreamSourceCommand {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
+}
+
+pub struct StreamRestoreCommand {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseProgress {
+    profile_id: String,
+    stage: String,
+    progress: f64,
+    message: String,
+}
+
+fn emit_database_progress(
+    app: &tauri::AppHandle,
+    profile_id: &str,
+    stage: &str,
+    progress: f64,
+    message: &str,
+) {
+    let _ = app.emit(
+        "database-progress",
+        DatabaseProgress {
+            profile_id: profile_id.to_string(),
+            stage: stage.to_string(),
+            progress,
+            message: message.to_string(),
+        },
+    );
+}
+
+fn emit_database_restore_progress(
+    app: &tauri::AppHandle,
+    profile_id: &str,
+    stage: &str,
+    progress: f64,
+    message: &str,
+) {
+    let _ = app.emit(
+        "database-restore-progress",
+        DatabaseProgress {
+            profile_id: profile_id.to_string(),
+            stage: stage.to_string(),
+            progress,
+            message: message.to_string(),
+        },
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1086,6 +1156,367 @@ where
     Ok(())
 }
 
+struct StreamPipelineOutput {
+    source_status: std::process::ExitStatus,
+    source_stderr: Vec<u8>,
+    kopia_output: Output,
+    source_bytes: u64,
+}
+
+fn run_stream_pipeline(
+    app: &tauri::AppHandle,
+    source: StreamSourceCommand,
+    kopia_args: &[String],
+    password: &str,
+    session: &RepoSession,
+    control: &Arc<BackupControl>,
+) -> Result<StreamPipelineOutput> {
+    let mut source_command = Command::new(&source.program);
+    source_command
+        .args(&source.args)
+        .envs(source.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        source_command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut source_child = source_command.spawn().with_context(|| {
+        format!(
+            "Failed to start database export tool at {}",
+            source.program.display()
+        )
+    })?;
+
+    let mut kopia_command = build_kopia_command(app, kopia_args, Some(password), Some(session));
+    kopia_command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut kopia_child = match kopia_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = source_child.kill();
+            let _ = source_child.wait();
+            return Err(error).context("Failed to start the encrypted database snapshot");
+        }
+    };
+
+    let mut source_stdout = source_child
+        .stdout
+        .take()
+        .context("Failed to capture database export output")?;
+    let mut source_stderr = source_child
+        .stderr
+        .take()
+        .context("Failed to capture database export errors")?;
+    let mut kopia_stdin = kopia_child
+        .stdin
+        .take()
+        .context("Failed to open the encrypted snapshot stream")?;
+    let mut kopia_stdout = kopia_child
+        .stdout
+        .take()
+        .context("Failed to capture Kopia output")?;
+    let mut kopia_stderr = kopia_child
+        .stderr
+        .take()
+        .context("Failed to capture Kopia errors")?;
+
+    let transferred = Arc::new(AtomicU64::new(0));
+    let transferred_writer = Arc::clone(&transferred);
+    let stream_thread = std::thread::spawn(move || -> std::io::Result<()> {
+        let copied = std::io::copy(&mut source_stdout, &mut kopia_stdin)?;
+        transferred_writer.store(copied, Ordering::Release);
+        Ok(())
+    });
+    let source_error_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = source_stderr.read_to_end(&mut output);
+        output
+    });
+    let kopia_output_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = kopia_stdout.read_to_end(&mut output);
+        output
+    });
+    let kopia_error_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = kopia_stderr.read_to_end(&mut output);
+        output
+    });
+
+    let mut source_status = None;
+    let mut kopia_status = None;
+    loop {
+        if control.is_cancel_requested() {
+            let source_kill = source_child.kill();
+            let kopia_kill = kopia_child.kill();
+            let _ = source_child.wait();
+            let _ = kopia_child.wait();
+            let _ = stream_thread.join();
+            let _ = source_error_thread.join();
+            let _ = kopia_output_thread.join();
+            let _ = kopia_error_thread.join();
+            if let Err(error) = source_kill.and(kopia_kill) {
+                let message = format!("Failed to stop database backup processes: {error}");
+                control.record_cancellation_error(message.clone());
+                return Err(anyhow!("BACKUP_CANCEL_FAILED: {message}"));
+            }
+            return Err(backup_operations::cancelled_error());
+        }
+
+        if source_status.is_none() {
+            source_status = source_child
+                .try_wait()
+                .context("Failed to poll database export")?;
+        }
+        if kopia_status.is_none() {
+            kopia_status = kopia_child
+                .try_wait()
+                .context("Failed to poll encrypted database snapshot")?;
+        }
+
+        if source_status.is_some_and(|status| !status.success()) && kopia_status.is_none() {
+            let _ = kopia_child.kill();
+        }
+        if kopia_status.is_some_and(|status| !status.success()) && source_status.is_none() {
+            let _ = source_child.kill();
+        }
+        if source_status.is_some() && kopia_status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let stream_result = stream_thread
+        .join()
+        .map_err(|_| anyhow!("Database stream worker stopped unexpectedly"))?;
+    let source_stderr = source_error_thread
+        .join()
+        .map_err(|_| anyhow!("Failed to collect database export errors"))?;
+    let kopia_stdout = kopia_output_thread
+        .join()
+        .map_err(|_| anyhow!("Failed to collect Kopia output"))?;
+    let kopia_stderr = kopia_error_thread
+        .join()
+        .map_err(|_| anyhow!("Failed to collect Kopia errors"))?;
+
+    if let Err(error) = stream_result {
+        if source_status.is_some_and(|status| status.success())
+            && kopia_status.is_some_and(|status| status.success())
+        {
+            return Err(error).context("Database export stream was interrupted");
+        }
+    }
+
+    Ok(StreamPipelineOutput {
+        source_status: source_status.context("Database export process did not exit")?,
+        source_stderr,
+        kopia_output: Output {
+            status: kopia_status.context("Kopia process did not exit")?,
+            stdout: kopia_stdout,
+            stderr: kopia_stderr,
+        },
+        source_bytes: transferred.load(Ordering::Acquire),
+    })
+}
+
+/// Stream a command's stdout directly into a Kopia snapshot. Database
+/// credentials remain in the child environment and plaintext SQL is never
+/// materialized as a local file.
+pub async fn backup_stream_with_operation(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+    source: StreamSourceCommand,
+    stdin_filename: String,
+    profile_id: &str,
+    profile_name: &str,
+    trigger: &'static str,
+    folder: &str,
+) -> Result<String> {
+    let _operation_guard = begin_operation().await;
+    let folder = normalize_snapshot_folder(folder)?;
+    let op_id = uuid::Uuid::new_v4().to_string();
+    let mut engine_job = EngineJobReporter::start(
+        operation.context.api.clone(),
+        op_id.clone(),
+        "backup",
+        trigger,
+    );
+    let mut terminal_progress = TerminalProgressGuard::backup(app, &op_id);
+    emit_progress(
+        app,
+        &op_id,
+        "connecting",
+        0.08,
+        "Connecting to database repository…",
+    );
+    emit_database_progress(
+        app,
+        profile_id,
+        "connecting",
+        0.08,
+        "Connecting to repository…",
+    );
+
+    let result: Result<(KopiaSnapshot, u64)> = async {
+        operation.ensure_not_cancelled()?;
+        engine_job.progress("repository_connect");
+        let (session, password) = ensure_repo_with_context(
+            app,
+            &operation.context,
+            "backup",
+            None,
+            Some(&operation.control),
+        )
+        .await?;
+
+        emit_progress(
+            app,
+            &op_id,
+            "exporting",
+            0.22,
+            "Exporting database securely…",
+        );
+        emit_database_progress(app, profile_id, "exporting", 0.22, "Exporting database…");
+        engine_job.progress("database_export");
+        let app_c = app.clone();
+        let session_c = session.clone();
+        let control = Arc::clone(&operation.control);
+        let kopia_args = vec![
+            "snapshot".to_string(),
+            "create".to_string(),
+            format!("--stdin-file={stdin_filename}"),
+            "--tags=backup-kind:database".to_string(),
+            format!("--tags=database-profile:{profile_id}"),
+            format!("--description=SaveState database backup: {profile_name}"),
+            "--json".to_string(),
+            "--no-progress".to_string(),
+            "-".to_string(),
+        ];
+        let pipeline = tokio::task::spawn_blocking(move || {
+            run_stream_pipeline(&app_c, source, &kopia_args, &password, &session_c, &control)
+        })
+        .await
+        .context("Database snapshot task stopped unexpectedly")??;
+
+        let mut snapshot = if pipeline.kopia_output.status.success() {
+            serde_json::from_str::<serde_json::Value>(
+                String::from_utf8_lossy(&pipeline.kopia_output.stdout).trim(),
+            )
+            .ok()
+            .as_ref()
+            .map(parse_snapshot)
+        } else {
+            None
+        };
+
+        // Kopia can close the pipe first (for example on a quota or repository
+        // error), which then makes the dump process fail with a broken pipe.
+        // Preserve the actual storage failure instead of misreporting it as a
+        // database export problem.
+        ensure_success(&pipeline.kopia_output, "database snapshot create")?;
+        if !pipeline.source_status.success() {
+            if let Some(created) = snapshot.as_ref().filter(|created| !created.id.is_empty()) {
+                rollback_uncommitted_snapshot(app, operation, &session, &created.id, false).await?;
+            }
+            let detail = String::from_utf8_lossy(&pipeline.source_stderr);
+            let detail = detail
+                .lines()
+                .last()
+                .unwrap_or("Database export failed")
+                .trim();
+            return Err(anyhow!("DATABASE_EXPORT_FAILED: {detail}"));
+        }
+        let snapshot = snapshot
+            .as_mut()
+            .filter(|created| !created.id.is_empty())
+            .ok_or_else(|| anyhow!("Kopia returned incomplete database snapshot metadata"))?;
+        snapshot.folder = folder;
+        snapshot.backup_kind = "database".to_string();
+        snapshot.database_profile_id = Some(profile_id.to_string());
+        snapshot.database_profile_name = Some(profile_name.to_string());
+        snapshot.size = pipeline.source_bytes;
+        snapshot.file_count = 1;
+
+        if let Err(cancelled) = operation.ensure_not_cancelled() {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, false).await?;
+            return Err(cancelled);
+        }
+
+        emit_progress(
+            app,
+            &op_id,
+            "finalizing",
+            0.82,
+            "Verifying encrypted snapshot…",
+        );
+        emit_database_progress(
+            app,
+            profile_id,
+            "finalizing",
+            0.82,
+            "Verifying encrypted snapshot…",
+        );
+        engine_job.progress("manifest_sync");
+        if let Err(error) = upsert_manifest_snapshot(&operation.context.api, snapshot.clone()).await
+        {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
+            return Err(error.context(
+                "Database snapshot was rolled back because metadata could not be synchronized",
+            ));
+        }
+        if let Err(cancelled) = operation.control.mark_committed().await {
+            rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
+            return Err(cancelled);
+        }
+        Ok((snapshot.clone(), pipeline.source_bytes))
+    }
+    .await;
+
+    match result {
+        Ok((snapshot, source_bytes)) => {
+            emit_progress(app, &op_id, "done", 1.0, "Database backup complete");
+            emit_database_progress(app, profile_id, "done", 1.0, "Database backup complete");
+            terminal_progress.finish();
+            engine_job.finish("succeeded", "completed", Some(source_bytes), Some(1), None);
+            if operation
+                .api()
+                .enforce_retention()
+                .await
+                .map(|result| result.maintenance_recommended)
+                .unwrap_or(false)
+            {
+                schedule_storage_cleanup(app.clone());
+            }
+            Ok(snapshot.id)
+        }
+        Err(error) if backup_operations::is_cancelled(&error) => {
+            emit_progress(app, &op_id, "cancelled", 0.0, "Database backup stopped");
+            emit_database_progress(app, profile_id, "cancelled", 0.0, "Database backup stopped");
+            terminal_progress.finish();
+            engine_job.finish("cancelled", "cancelled", None, None, Some("user_logout"));
+            Err(error)
+        }
+        Err(error) => {
+            emit_database_progress(
+                app,
+                profile_id,
+                "error",
+                0.0,
+                "Database backup failed. Check the error message and try again.",
+            );
+            engine_job.fail("database_backup_failed", None, None);
+            Err(error)
+        }
+    }
+}
+
 /// Create a deduplicated, compressed snapshot of `source_path`.
 pub async fn backup_path(
     app: &tauri::AppHandle,
@@ -1264,6 +1695,21 @@ fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
         .and_then(|s| s.get("files"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let tags = item.get("tags").and_then(|value| value.as_object());
+    let backup_kind = tags
+        .and_then(|tags| tags.get("tag:backup-kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("files")
+        .to_string();
+    let database_profile_id = tags
+        .and_then(|tags| tags.get("tag:database-profile"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
+    let root_object_id = item
+        .get("rootEntry")
+        .and_then(|root| root.get("obj"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
 
     KopiaSnapshot {
         id,
@@ -1272,6 +1718,10 @@ fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
         size,
         file_count,
         folder: root_folder(),
+        backup_kind,
+        database_profile_id,
+        database_profile_name: None,
+        root_object_id,
     }
 }
 
@@ -1325,6 +1775,364 @@ async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> R
         serde_json::from_value(current).context("Invalid Kopia snapshot manifest")?;
     snapshots.retain(|item| item.id != snapshot_id);
     upload_manifest_with_retry(api, &snapshots).await
+}
+
+fn database_content_object(
+    app: &tauri::AppHandle,
+    session: &RepoSession,
+    password: &str,
+    root_object_id: &str,
+) -> Result<String> {
+    let args = vec![
+        "content".to_string(),
+        "show".to_string(),
+        root_object_id.to_string(),
+        "--json".to_string(),
+    ];
+    let output = run_kopia(app, &args, Some(password), Some(session))?;
+    ensure_success(&output, "database snapshot lookup")?;
+    let directory: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Database snapshot directory metadata is invalid")?;
+    database_content_object_from_value(&directory)
+}
+
+fn database_content_object_from_value(directory: &serde_json::Value) -> Result<String> {
+    directory
+        .get("entries")
+        .and_then(|entries| entries.as_array())
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("type").and_then(|value| value.as_str()) == Some("f")
+                    && entry
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|name| name.ends_with("database.sql"))
+            })
+        })
+        .and_then(|entry| entry.get("obj"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("Database SQL stream is missing from this snapshot"))
+}
+
+fn run_database_restore_pipeline(
+    app: &tauri::AppHandle,
+    session: &RepoSession,
+    password: &str,
+    content_object_id: &str,
+    target: StreamRestoreCommand,
+    snapshot_id: &str,
+) -> Result<u64> {
+    let content_args = vec![
+        "content".to_string(),
+        "show".to_string(),
+        content_object_id.to_string(),
+    ];
+    let mut kopia_command = build_kopia_command(app, &content_args, Some(password), Some(session));
+    kopia_command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut kopia_child = kopia_command
+        .spawn()
+        .context("Could not start the encrypted database restore stream")?;
+
+    let mut target_command = Command::new(&target.program);
+    target_command
+        .args(&target.args)
+        .envs(target.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        target_command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut target_child = match target_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = kopia_child.kill();
+            let _ = kopia_child.wait();
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not start database restore tool at {}",
+                    target.program.display()
+                )
+            });
+        }
+    };
+
+    let mut kopia_stdout = kopia_child
+        .stdout
+        .take()
+        .context("Could not read decrypted database snapshot")?;
+    let mut kopia_stderr = kopia_child
+        .stderr
+        .take()
+        .context("Could not capture database snapshot errors")?;
+    let mut target_stdin = target_child
+        .stdin
+        .take()
+        .context("Could not open database restore input")?;
+    let mut target_stdout = target_child
+        .stdout
+        .take()
+        .context("Could not capture database restore output")?;
+    let mut target_stderr = target_child
+        .stderr
+        .take()
+        .context("Could not capture database restore errors")?;
+
+    let transferred = Arc::new(AtomicU64::new(0));
+    let transferred_writer = Arc::clone(&transferred);
+    let stream_thread = std::thread::spawn(move || -> std::io::Result<()> {
+        let copied = std::io::copy(&mut kopia_stdout, &mut target_stdin)?;
+        transferred_writer.store(copied, Ordering::Release);
+        Ok(())
+    });
+    let kopia_error_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = kopia_stderr.read_to_end(&mut output);
+        output
+    });
+    let target_output_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = target_stdout.read_to_end(&mut output);
+        output
+    });
+    let target_error_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = target_stderr.read_to_end(&mut output);
+        output
+    });
+
+    let mut kopia_status = None;
+    let mut target_status = None;
+    loop {
+        if restore_is_cancelled(snapshot_id) {
+            let _ = kopia_child.kill();
+            let _ = target_child.kill();
+            let _ = kopia_child.wait();
+            let _ = target_child.wait();
+            let _ = stream_thread.join();
+            let _ = kopia_error_thread.join();
+            let _ = target_output_thread.join();
+            let _ = target_error_thread.join();
+            return Err(anyhow!("Restore cancelled"));
+        }
+        if kopia_status.is_none() {
+            kopia_status = kopia_child
+                .try_wait()
+                .context("Failed to poll database snapshot stream")?;
+        }
+        if target_status.is_none() {
+            target_status = target_child
+                .try_wait()
+                .context("Failed to poll database restore")?;
+        }
+        if kopia_status.is_some_and(|status| !status.success()) && target_status.is_none() {
+            let _ = target_child.kill();
+        }
+        if target_status.is_some_and(|status| !status.success()) && kopia_status.is_none() {
+            let _ = kopia_child.kill();
+        }
+        if kopia_status.is_some() && target_status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let stream_result = stream_thread
+        .join()
+        .map_err(|_| anyhow!("Database restore stream worker stopped unexpectedly"))?;
+    let kopia_stderr = kopia_error_thread
+        .join()
+        .map_err(|_| anyhow!("Could not collect database snapshot errors"))?;
+    let _target_stdout = target_output_thread
+        .join()
+        .map_err(|_| anyhow!("Could not collect database restore output"))?;
+    let target_stderr = target_error_thread
+        .join()
+        .map_err(|_| anyhow!("Could not collect database restore errors"))?;
+    let kopia_status = kopia_status.context("Database snapshot stream did not exit")?;
+    let target_status = target_status.context("Database restore process did not exit")?;
+    let target_detail = String::from_utf8_lossy(&target_stderr);
+    let target_detail = target_detail.trim();
+    if !target_status.success() && !target_detail.is_empty() {
+        let detail = target_detail
+            .lines()
+            .last()
+            .unwrap_or("The database rejected the SQL restore")
+            .trim();
+        return Err(anyhow!("DATABASE_RESTORE_FAILED: {detail}"));
+    }
+    if !kopia_status.success() {
+        return Err(classify_kopia_error(
+            "database snapshot stream",
+            &String::from_utf8_lossy(&kopia_stderr),
+        ));
+    }
+    if !target_status.success() {
+        return Err(anyhow!(
+            "DATABASE_RESTORE_FAILED: The database restore tool exited before accepting the SQL stream"
+        ));
+    }
+    stream_result.context("The database restore stream was interrupted")?;
+    Ok(transferred.load(Ordering::Acquire))
+}
+
+/// Decrypt and stream one database snapshot directly into a database client.
+/// No plaintext SQL file is created during restore.
+pub async fn restore_database_snapshot_to_command(
+    app: &tauri::AppHandle,
+    state: &AppStateWrapper,
+    snapshot_id: &str,
+    profile_id: &str,
+    target: StreamRestoreCommand,
+) -> Result<()> {
+    let _operation_guard = begin_operation().await;
+    let op_id = uuid::Uuid::new_v4().to_string();
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+        AccountContext::capture(&guard)?
+    };
+    let api = context.api.clone();
+    let mut engine_job =
+        EngineJobReporter::start(api.clone(), op_id.clone(), "restore", "database_manual");
+    let mut terminal_progress = TerminalProgressGuard::restore(app, &op_id);
+    clear_restore_cancellation(snapshot_id);
+    emit_restore_progress(
+        app,
+        &op_id,
+        "preparing",
+        0.08,
+        "Preparing database restore…",
+    );
+    emit_database_restore_progress(app, profile_id, "preparing", 0.08, "Preparing restore…");
+
+    engine_job.progress("manifest_lookup");
+    let manifest = api.get_kopia_manifest().await?;
+    let snapshots: Vec<KopiaSnapshot> =
+        serde_json::from_value(manifest).context("Invalid Kopia snapshot manifest")?;
+    let snapshot = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.id == snapshot_id)
+        .ok_or_else(|| anyhow!("Database snapshot not found"))?;
+    if snapshot.backup_kind != "database"
+        || snapshot.database_profile_id.as_deref() != Some(profile_id)
+    {
+        return Err(anyhow!(
+            "This restore point does not belong to the selected database profile"
+        ));
+    }
+    let root_object_id = snapshot
+        .root_object_id
+        .clone()
+        .ok_or_else(|| anyhow!("This database restore point is missing stream metadata"))?;
+
+    engine_job.progress("authorization");
+    let authorization = api.restore_authorize(snapshot_id, snapshot.size).await?;
+    if !authorization.authorized {
+        return Err(anyhow!("Database restore was not authorized"));
+    }
+    ensure_restore_not_cancelled(snapshot_id)?;
+
+    emit_restore_progress(
+        app,
+        &op_id,
+        "restoring",
+        0.3,
+        "Downloading and decrypting database…",
+    );
+    emit_database_restore_progress(
+        app,
+        profile_id,
+        "restoring",
+        0.3,
+        "Downloading and importing…",
+    );
+    engine_job.progress("repository_connect");
+    let (session, password) = ensure_repo_with_context(
+        app,
+        &context,
+        "restore",
+        authorization.grant_id.as_deref(),
+        None,
+    )
+    .await?;
+    ensure_restore_not_cancelled(snapshot_id)?;
+
+    let app_c = app.clone();
+    let session_c = session.clone();
+    let snapshot_id_owned = snapshot_id.to_string();
+    engine_job.progress("database_import");
+    let transferred = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let content_object =
+            database_content_object(&app_c, &session_c, &password, &root_object_id)?;
+        run_database_restore_pipeline(
+            &app_c,
+            &session_c,
+            &password,
+            &content_object,
+            target,
+            &snapshot_id_owned,
+        )
+    })
+    .await
+    .context("Database restore task stopped unexpectedly")?;
+
+    match transferred {
+        Ok(bytes) => {
+            clear_restore_cancellation(snapshot_id);
+            emit_restore_progress(app, &op_id, "done", 1.0, "Database restore complete");
+            emit_database_restore_progress(
+                app,
+                profile_id,
+                "done",
+                1.0,
+                "Database restore complete",
+            );
+            terminal_progress.finish();
+            engine_job.finish("succeeded", "completed", Some(bytes), Some(1), None);
+            Ok(())
+        }
+        Err(error) => {
+            let was_cancelled = restore_is_cancelled(snapshot_id)
+                || error.to_string().to_ascii_lowercase().contains("cancelled");
+            clear_restore_cancellation(snapshot_id);
+            emit_restore_progress(
+                app,
+                &op_id,
+                if was_cancelled { "cancelled" } else { "error" },
+                0.0,
+                if was_cancelled {
+                    "Database restore cancelled"
+                } else {
+                    "Database restore failed"
+                },
+            );
+            emit_database_restore_progress(
+                app,
+                profile_id,
+                if was_cancelled { "cancelled" } else { "error" },
+                0.0,
+                if was_cancelled {
+                    "Database restore stopped"
+                } else {
+                    "Database restore failed"
+                },
+            );
+            terminal_progress.finish();
+            if was_cancelled {
+                engine_job.finish("cancelled", "cancelled", Some(snapshot.size), Some(1), None);
+            } else {
+                engine_job.fail("database_restore_failed", Some(snapshot.size), Some(1));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Restore a snapshot to `target_path`. Requests a short-lived authorization
@@ -1959,8 +2767,9 @@ pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper
 mod tests {
     use super::{
         backup_reliability_policy_args, begin_operation, cancel_restore, classify_kopia_error,
-        clear_restore_cancellation, ensure_restore_not_cancelled, execute_rollback_steps,
-        parse_snapshot, repository_is_missing, try_begin_update,
+        clear_restore_cancellation, database_content_object_from_value,
+        ensure_restore_not_cancelled, execute_rollback_steps, parse_snapshot,
+        repository_is_missing, try_begin_update,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1994,6 +2803,42 @@ mod tests {
         assert_eq!(snapshot.id, "abc123");
         assert_eq!(snapshot.size, 1024);
         assert_eq!(snapshot.file_count, 3);
+    }
+
+    #[test]
+    fn database_snapshot_metadata_and_stream_object_are_preserved() {
+        let value = serde_json::json!({
+            "id": "database-snapshot",
+            "source": { "path": "-" },
+            "startTime": "2026-08-24T09:00:00Z",
+            "tags": {
+                "tag:backup-kind": "database",
+                "tag:database-profile": "profile-db"
+            },
+            "rootEntry": {
+                "obj": "root-object",
+                "summ": { "size": 2048, "files": 1 }
+            }
+        });
+        let snapshot = parse_snapshot(&value);
+        assert_eq!(snapshot.backup_kind, "database");
+        assert_eq!(snapshot.database_profile_id.as_deref(), Some("profile-db"));
+        assert_eq!(snapshot.root_object_id.as_deref(), Some("root-object"));
+
+        let directory = serde_json::json!({
+            "entries": [
+                { "name": "metadata.json", "type": "f", "obj": "metadata-object" },
+                {
+                    "name": "savestate-database/profile-db/database.sql",
+                    "type": "f",
+                    "obj": "sql-object"
+                }
+            ]
+        });
+        assert_eq!(
+            database_content_object_from_value(&directory).unwrap(),
+            "sql-object"
+        );
     }
 
     #[test]

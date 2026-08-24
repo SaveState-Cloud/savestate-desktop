@@ -563,10 +563,19 @@ pub async fn cmd_list_backups(
     let backups: Vec<serde_json::Value> = snapshots
         .into_iter()
         .map(|snap| {
-            let filename = std::path::Path::new(&snap.source_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| snap.id.clone());
+            let filename = if snap.backup_kind == "database" {
+                format!(
+                    "{} (Database)",
+                    snap.database_profile_name
+                        .as_deref()
+                        .unwrap_or("Database backup")
+                )
+            } else {
+                std::path::Path::new(&snap.source_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| snap.id.clone())
+            };
 
             serde_json::json!({
                 "key": snap.id,
@@ -575,6 +584,8 @@ pub async fn cmd_list_backups(
                 "size": snap.size,
                 "sizeFormatted": format_bytes(snap.size),
                 "lastModified": snap.start_time,
+                "backupKind": snap.backup_kind,
+                "databaseProfileId": snap.database_profile_id,
             })
         })
         .collect();
