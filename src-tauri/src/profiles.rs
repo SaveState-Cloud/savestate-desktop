@@ -544,12 +544,13 @@ pub async fn run_profile_backup_inner(
     profile_id: &str,
     trigger: &'static str,
 ) -> Result<String> {
+    let operation = crate::backup_operations::begin(state, "Backup profile")?;
+    crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
     // Keep the full scheduled/profile workflow under one operation lease so
     // an update cannot slip into the gap between snapshot creation, retention,
-    // and recording the next run time.
+    // and recording the next run time. Pressure maintenance above must run
+    // before this shared lease because maintenance requires exclusive access.
     let _operation_guard = crate::kopia::begin_operation().await;
-
-    let operation = crate::backup_operations::begin(state, "Backup profile")?;
     let result: Result<String> = async {
         let profile = {
             let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;

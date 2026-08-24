@@ -51,7 +51,13 @@ static LAST_RETENTION: OnceLock<Mutex<Option<CachedRetention>>> = OnceLock::new(
 static OPERATION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
 static CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
 static SESSION_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
-static LAST_CLEANUP: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+struct LastCleanup {
+    account_scope: String,
+    completed_at: Instant,
+}
+
+static LAST_CLEANUP: OnceLock<Mutex<Option<LastCleanup>>> = OnceLock::new();
 
 fn backup_session_cache() -> &'static Mutex<Option<CachedBackupSession>> {
     BACKUP_SESSION.get_or_init(|| Mutex::new(None))
@@ -77,8 +83,29 @@ fn operation_gate() -> &'static RwLock<()> {
     OPERATION_GATE.get_or_init(|| RwLock::new(()))
 }
 
-fn last_cleanup() -> &'static Mutex<Option<Instant>> {
+fn last_cleanup() -> &'static Mutex<Option<LastCleanup>> {
     LAST_CLEANUP.get_or_init(|| Mutex::new(None))
+}
+
+fn cleanup_within_cooldown(account_scope: &str) -> bool {
+    last_cleanup()
+        .lock()
+        .map(|last| {
+            last.as_ref().is_some_and(|cleanup| {
+                cleanup.account_scope == account_scope
+                    && cleanup.completed_at.elapsed() < Duration::from_secs(30 * 60)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn mark_cleanup_complete(account_scope: &str) {
+    if let Ok(mut last) = last_cleanup().lock() {
+        *last = Some(LastCleanup {
+            account_scope: account_scope.to_string(),
+            completed_at: Instant::now(),
+        });
+    }
 }
 
 /// Hold a shared lease for any backup-engine operation that must finish before
@@ -870,6 +897,7 @@ pub async fn backup_paths_with_trigger(
         format!("{} selected files", paths.len())
     };
     let operation = backup_operations::begin(state, display_name)?;
+    prepare_repository_for_backup(app, &operation).await?;
     let result = backup_paths_with_operation(app, &operation, paths, trigger, folder).await;
     operation.finish_tracking().await;
     result
@@ -960,6 +988,15 @@ pub async fn backup_paths_with_operation(
                 Some(snapshot.file_count),
                 None,
             );
+            if operation
+                .api()
+                .enforce_retention()
+                .await
+                .map(|result| result.maintenance_recommended)
+                .unwrap_or(false)
+            {
+                schedule_storage_cleanup(app.clone());
+            }
             Ok(snapshot.id)
         }
         Err(error) if backup_operations::is_cancelled(&error) => {
@@ -1290,8 +1327,8 @@ async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> R
     upload_manifest_with_retry(api, &snapshots).await
 }
 
-/// Restore a snapshot to `target_path`. Enforces the plan's egress allowance by
-/// asking the backend to authorize the snapshot's size BEFORE pulling data.
+/// Restore a snapshot to `target_path`. Requests a short-lived authorization
+/// grant before issuing repository read credentials; restore traffic is free.
 pub async fn restore_snapshot(
     app: &tauri::AppHandle,
     state: &AppStateWrapper,
@@ -1310,7 +1347,7 @@ pub async fn restore_snapshot(
     clear_restore_cancellation(snapshot_id);
     emit_restore_progress(app, &op_id, "preparing", 0.1, "Preparing restore…");
 
-    // Determine the snapshot size so the backend can meter egress.
+    // Determine the snapshot size for replay-safe operational transfer telemetry.
     engine_job.progress("manifest_lookup");
     let manifest = api.get_kopia_manifest().await?;
     let snapshots: Vec<KopiaSnapshot> =
@@ -1325,7 +1362,8 @@ pub async fn restore_snapshot(
         ));
     }
 
-    // Phase 3: hard egress check. Returns the fair-use message on a 403.
+    // Request the short-lived restore grant. A 403 now means authorization or
+    // service access failed, never that a paid transfer allowance was exceeded.
     engine_job.progress("authorization");
     let authorization = api.restore_authorize(snapshot_id, snap.size).await?;
     if !authorization.authorized {
@@ -1556,12 +1594,11 @@ fn maintenance_owner_from_config(session: &RepoSession) -> Result<String> {
 /// Run repository maintenance (reclaims space from pruned snapshots).
 /// Maintenance takes the engine gate exclusively so Kopia never performs a
 /// backup, restore, deletion, or application update at the same time.
-pub async fn run_maintenance(app: &tauri::AppHandle, state: &AppStateWrapper) -> Result<()> {
+async fn run_maintenance_with_context(
+    app: &tauri::AppHandle,
+    context: &AccountContext,
+) -> Result<()> {
     let _operation_guard = operation_gate().write().await;
-    let context = {
-        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
-        AccountContext::capture(&guard)?
-    };
     let mut engine_job = EngineJobReporter::start(
         context.api.clone(),
         uuid::Uuid::new_v4().to_string(),
@@ -1614,6 +1651,111 @@ pub async fn run_maintenance(app: &tauri::AppHandle, state: &AppStateWrapper) ->
     Ok(())
 }
 
+pub async fn run_maintenance(app: &tauri::AppHandle, state: &AppStateWrapper) -> Result<()> {
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+        AccountContext::capture(&guard)?
+    };
+    run_maintenance_with_context(app, &context).await
+}
+
+/// Reclaim obsolete packs before a near-capacity backup. The commercial plan
+/// is measured from physical repository usage, but the gateway retains a small
+/// private safety buffer so a failed maintenance attempt does not destroy an
+/// otherwise valid backup. The gateway remains the final hard safety ceiling.
+pub async fn prepare_repository_for_backup(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+) -> Result<()> {
+    operation.ensure_not_cancelled()?;
+    let pressure = match operation.api().enforce_retention().await {
+        Ok(pressure) => pressure,
+        Err(error) => {
+            eprintln!(
+                "Could not check repository pressure before backup: {}",
+                error
+            );
+            return Ok(());
+        }
+    };
+    if !pressure.maintenance_recommended
+        || (cleanup_within_cooldown(operation.account_scope()) && !pressure.maintenance_urgent)
+    {
+        return Ok(());
+    }
+    if CLEANUP_RUNNING.swap(true, Ordering::AcqRel) {
+        if pressure.maintenance_urgent {
+            // A dashboard/deletion cleanup may have been queued just before
+            // this backup. Wait for it instead of letting the backup race the
+            // 750 ms scheduling delay and spend reclamation headroom first.
+            for _ in 0..1_800 {
+                operation.ensure_not_cancelled()?;
+                if !CLEANUP_RUNNING.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if CLEANUP_RUNNING.load(Ordering::Acquire) {
+                return Err(anyhow!(
+                    "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Storage cleanup is still running. Retry this backup when cleanup finishes."
+                ));
+            }
+            if operation
+                .api()
+                .enforce_retention()
+                .await
+                .map(|current| current.maintenance_urgent)
+                .unwrap_or(false)
+            {
+                return Err(anyhow!(
+                    "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Your optimized backup storage is full after cleanup. Remove a retained backup or choose a larger plan."
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    emit_storage_cleanup(
+        app,
+        "running",
+        if pressure.maintenance_urgent {
+            "Storage is full. Reclaiming expired backup data before retrying…"
+        } else {
+            "Optimizing repository storage before backup…"
+        },
+    );
+    let result = run_maintenance_with_context(app, &operation.context).await;
+    CLEANUP_RUNNING.store(false, Ordering::Release);
+    match result {
+        Ok(()) => {
+            mark_cleanup_complete(operation.account_scope());
+            emit_storage_cleanup(app, "complete", "Repository optimization completed");
+        }
+        Err(error) => {
+            emit_storage_cleanup(
+                app,
+                "failed",
+                &format!("Repository optimization could not finish: {}", error),
+            );
+            eprintln!("Pre-backup repository maintenance failed: {}", error);
+        }
+    }
+    operation.ensure_not_cancelled()?;
+    if pressure.maintenance_urgent
+        && operation
+            .api()
+            .enforce_retention()
+            .await
+            .map(|current| current.maintenance_urgent)
+            .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Your optimized backup storage is full after cleanup. Remove a retained backup or choose a larger plan."
+        ));
+    }
+    Ok(())
+}
+
 /// Queue full maintenance after deletion without keeping the delete button
 /// blocked. Calls are coalesced and rate-limited because safe Kopia cleanup can
 /// require multiple maintenance cycles before remote objects are reclaimable.
@@ -1622,14 +1764,25 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
         return "running";
     }
 
-    let within_cooldown = last_cleanup()
-        .lock()
-        .map(|last| {
-            last.map(|instant| instant.elapsed() < Duration::from_secs(30 * 60))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    if within_cooldown {
+    let context = {
+        let state = app.state::<AppStateWrapper>();
+        let guard = match state.0.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                CLEANUP_RUNNING.store(false, Ordering::Release);
+                return "unavailable";
+            }
+        };
+        match AccountContext::capture(&guard) {
+            Ok(context) => context,
+            Err(_) => {
+                CLEANUP_RUNNING.store(false, Ordering::Release);
+                return "unavailable";
+            }
+        }
+    };
+
+    if cleanup_within_cooldown(&context.account_scope) {
         CLEANUP_RUNNING.store(false, Ordering::Release);
         return "cooldown";
     }
@@ -1643,13 +1796,10 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
         tokio::time::sleep(Duration::from_millis(750)).await;
         emit_storage_cleanup(&app, "running", "Reclaiming deleted storage…");
 
-        let result = {
-            let state = app.state::<AppStateWrapper>();
-            run_maintenance(&app, state.inner()).await
-        };
+        let result = run_maintenance_with_context(&app, &context).await;
 
-        if let Ok(mut last) = last_cleanup().lock() {
-            *last = Some(Instant::now());
+        if result.is_ok() {
+            mark_cleanup_complete(&context.account_scope);
         }
         CLEANUP_RUNNING.store(false, Ordering::Release);
 

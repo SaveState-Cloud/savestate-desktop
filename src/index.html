@@ -168,7 +168,7 @@
                             <div class="usage-section-header">
                                 <div>
                                     <h3 id="usage-heading">Usage</h3>
-                                    <p>Your plan is measured using the original size of your retained backups.</p>
+                                    <p>Your plan is measured from the encrypted repository footprint after compression and deduplication.</p>
                                 </div>
                                 <div id="cleanup-state" class="cleanup-state hidden" role="status">
                                     <span class="cleanup-dot" aria-hidden="true"></span>
@@ -179,8 +179,8 @@
                             <div class="usage-list">
                                 <div class="usage-row">
                                     <div>
-                                        <strong>Backup data used</strong>
-                                        <span id="usage-backup-meta">Original, uncompressed size across retained backups</span>
+                                        <strong>Storage used</strong>
+                                        <span id="usage-backup-meta">Compressed and deduplicated encrypted repository footprint</span>
                                     </div>
                                     <div class="usage-measure">
                                         <strong id="usage-backup">—</strong>
@@ -188,6 +188,15 @@
                                     </div>
                                     <div class="progress-bar usage-storage-bar">
                                         <div class="progress-bar-fill" id="backup-fill" style="width: 0%"></div>
+                                    </div>
+                                </div>
+                                <div class="usage-row">
+                                    <div>
+                                        <strong>Backup data protected</strong>
+                                        <span id="usage-source-meta">Original data represented by retained restore points</span>
+                                    </div>
+                                    <div class="usage-measure">
+                                        <strong id="usage-source">—</strong>
                                     </div>
                                 </div>
                                 <div class="usage-row">
@@ -202,7 +211,7 @@
                                 <div class="usage-row">
                                     <div>
                                         <strong>Restores</strong>
-                                        <span id="usage-restore-meta">Included monthly restore traffic</span>
+                                        <span id="usage-restore-meta">Unlimited encrypted restore traffic · free</span>
                                     </div>
                                     <div class="usage-measure">
                                         <strong id="usage-restore">0 B</strong>

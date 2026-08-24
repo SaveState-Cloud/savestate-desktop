@@ -882,7 +882,13 @@ function friendlyError(error) {
         return 'This folder is not empty. Move its backups and remove nested folders first.';
     }
     if (lower.includes('source_quota_exceeded') || lower.includes('backup data allowance exceeded')) {
-        return 'This backup would exceed your plan’s original-data allowance. Remove an older backup or choose a larger plan, then try again.';
+        return 'Your encrypted repository is full. SaveState will reclaim expired data before retrying; remove an older backup or choose a larger plan if it remains full.';
+    }
+    if (lower.includes('optimized_storage_quota_exceeded')) {
+        return raw.split(':').slice(1).join(':').trim() || 'Your optimized backup storage is full after cleanup. Remove an older backup or choose a larger plan, then try again.';
+    }
+    if (lower.includes('quotaexceeded') || lower.includes('storage limit exceeded')) {
+        return 'Your encrypted repository reached its temporary safety ceiling. Run storage cleanup, remove an older backup, or choose a larger plan, then try again.';
     }
 
     let message = raw;
@@ -992,25 +998,42 @@ async function loadDashboard() {
         document.getElementById('stat-email').title = account.email || '';
         document.getElementById('stat-plan').textContent = account.plan || 'No plan';
 
-        const usage = Math.max(0, Math.trunc(Number(account.usage?.bytes || 0)));
+        const usage = storageUsageUi.customerVisibleUsage(account.usage?.bytes, backupState);
         const sourceStatistics = storageUsageUi.sourceStatistics(account.usage, backupState);
         const sourceUsage = sourceStatistics.sourceBytes;
+        const savings = storageUsageUi.savingsStatistics(account.usage, sourceUsage, usage);
         const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
-        const limitBytes = limitGB * 1024 * 1024 * 1024;
-        const pct = limitBytes > 0 ? Math.min(100, (sourceUsage / limitBytes) * 100) : 0;
+        const reportedLimitBytes = Number(account.usage?.limitBytes);
+        const limitBytes = Number.isSafeInteger(reportedLimitBytes) && reportedLimitBytes >= 0
+            ? reportedLimitBytes
+            : limitGB * 1024 * 1024 * 1024;
+        const pct = limitBytes > 0 ? Math.min(100, (usage / limitBytes) * 100) : 0;
         const backupValue = document.getElementById('usage-backup');
         backupValue.textContent = limitBytes > 0
-            ? `${formatBytes(sourceUsage)} of ${formatBytes(limitBytes)}`
-            : formatBytes(sourceUsage);
-        backupValue.title = `${sourceUsage.toLocaleString()} original bytes${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+            ? `${formatBytes(usage)} of ${formatBytes(limitBytes)}`
+            : formatBytes(usage);
+        backupValue.title = `${usage.toLocaleString()} encrypted repository bytes${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+        document.getElementById('usage-backup-meta').textContent =
+            `${usage.toLocaleString()} physical bytes after compression and deduplication`;
         const retained = sourceStatistics.snapshotCount === null
             ? 'retained backups'
             : `${sourceStatistics.snapshotCount.toLocaleString()} retained ${sourceStatistics.snapshotCount === 1 ? 'backup' : 'backups'}`;
         const files = sourceStatistics.fileCount === null
             ? ''
             : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
-        document.getElementById('usage-backup-meta').textContent =
-            `${sourceUsage.toLocaleString()} original bytes · ${retained}${files}`;
+        const sourceValue = document.getElementById('usage-source');
+        const sourceMeta = document.getElementById('usage-source-meta');
+        if (sourceUsage === null) {
+            sourceValue.textContent = 'Calculating…';
+            sourceMeta.textContent = `${retained}${files}`;
+        } else {
+            sourceValue.textContent = formatBytes(sourceUsage);
+            sourceValue.title = `${sourceUsage.toLocaleString()} original bytes across restore points`;
+            const savingsText = savings.savedBytes === null
+                ? ''
+                : ` · ${formatBytes(savings.savedBytes)} saved${savings.savingsPercent === null ? '' : ` (${savings.savingsPercent.toFixed(2)}%)`}`;
+            sourceMeta.textContent = `${retained}${files}${savingsText}`;
+        }
         document.getElementById('backup-fill').style.width = `${pct}%`;
         document.getElementById('backup-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
 
@@ -1022,23 +1045,13 @@ async function loadDashboard() {
             `This month · ${uploadUsed.toLocaleString()} original source bytes · free`;
 
         const restoreUsed = Math.max(0, Math.trunc(Number(account.egress?.used || 0)));
-        const restoreAllowance = Math.max(0, Math.trunc(Number(account.egress?.allowance || 0)));
         const restoreValue = document.getElementById('usage-restore');
-        restoreValue.textContent = restoreAllowance > 0
-            ? `${formatBytes(restoreUsed)} of ${formatBytes(restoreAllowance)}`
-            : formatBytes(restoreUsed);
-        restoreValue.title = `${restoreUsed.toLocaleString()} of ${restoreAllowance.toLocaleString()} bytes`;
+        restoreValue.textContent = `${formatBytes(restoreUsed)} this month`;
+        restoreValue.title = `${restoreUsed.toLocaleString()} encrypted bytes restored this month`;
+        document.getElementById('usage-restore-meta').textContent =
+            `${restoreUsed.toLocaleString()} bytes this month · unlimited · free`;
 
-        const restoreMeta = document.getElementById('usage-restore-meta');
-        if (account.egress?.paidOverageEnabled) {
-            const dkkRate = Number(account.egress.overageDkkPerGB);
-            const displayedRate = Number.isFinite(dkkRate) ? dkkRate.toFixed(4) : '—';
-            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · overage DKK ${displayedRate}/GB`;
-        } else {
-            restoreMeta.textContent = `${restoreUsed.toLocaleString()} bytes this month · paid overage off`;
-        }
-
-        const inferredCleanup = storageUsageUi.shouldScheduleCleanup(usage, backupState);
+        const inferredCleanup = storageUsageUi.shouldScheduleCleanup(account.usage, backupState);
         // A maintenance hint is not a customer-facing storage state. Only show
         // the badge while a native cleanup job is actually queued or running.
         setStorageCleanupState(storageCleanupPending);
