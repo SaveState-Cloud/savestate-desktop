@@ -1036,11 +1036,13 @@ mod tests {
             owner_account: "account".into(),
             name: "Database".into(),
             connection_url: "mysql://root@127.0.0.1:3306".into(),
-            dump_executable: if cfg!(windows) {
-                r"C:\xampp\mysql\bin\mysqldump.exe".into()
-            } else {
-                "/usr/bin/mysqldump".into()
-            },
+            // The command builder validates that the executable still exists. Use the
+            // current test binary so this unit test does not depend on XAMPP being
+            // installed on the CI runner.
+            dump_executable: std::env::current_exe()
+                .expect("test executable path")
+                .to_string_lossy()
+                .into_owned(),
             client_executable: String::new(),
             selection_mode: mode.into(),
             databases: vec!["app".into()],
