@@ -134,8 +134,17 @@ fn connection_args(target: &ConnectionTarget) -> Vec<OsString> {
         format!("--port={}", target.port).into(),
         format!("--user={}", target.username).into(),
         "--protocol=tcp".into(),
-        "--connect-timeout=5".into(),
     ]
+}
+
+fn client_connection_args(target: &ConnectionTarget) -> Vec<OsString> {
+    let mut args = connection_args(target);
+    // `mysql` and `mariadb` accept this option, but XAMPP's MariaDB
+    // `mysqldump` rejects it as an unknown variable. Keep client-only
+    // connection controls out of dump commands so detected tool bundles work
+    // without an adapter executable.
+    args.push("--connect-timeout=5".into());
+    args
 }
 
 fn test_connection(
@@ -144,7 +153,7 @@ fn test_connection(
     client_executable: &Path,
 ) -> Result<DatabaseConnectionResult> {
     let target = parse_connection_url(connection_url)?;
-    let mut args = connection_args(&target);
+    let mut args = client_connection_args(&target);
     args.extend([
         "--batch".into(),
         "--skip-column-names".into(),
@@ -472,7 +481,7 @@ fn build_restore_command(
             client_path.display()
         ));
     }
-    let mut args = connection_args(&target);
+    let mut args = client_connection_args(&target);
     args.push("--binary-mode=1".into());
     if profile.selection_mode == "tables" {
         let database = profile
@@ -559,7 +568,7 @@ pub async fn cmd_list_database_tables(
     };
     tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
         let target = parse_connection_url(&connection_url)?;
-        let mut args = connection_args(&target);
+        let mut args = client_connection_args(&target);
         args.extend([
             format!("--database={database}").into(),
             "--batch".into(),
@@ -1026,7 +1035,8 @@ pub fn database_profile_is_due(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dump_command, credential_username, parse_connection_url, validate_selection,
+        build_dump_command, client_connection_args, credential_username, parse_connection_url,
+        validate_selection,
     };
     use crate::db::DatabaseProfile;
 
@@ -1119,6 +1129,10 @@ mod tests {
         assert!(command.args.iter().any(|arg| arg == "--routines"));
         assert!(command.args.iter().any(|arg| arg == "--events"));
         assert!(command.args.iter().any(|arg| arg == "--triggers"));
+        assert!(command
+            .args
+            .iter()
+            .all(|arg| !arg.to_string_lossy().starts_with("--connect-timeout=")));
 
         let fixed = build_dump_command(
             &profile("all"),
@@ -1139,5 +1153,12 @@ mod tests {
         )
         .unwrap();
         assert!(dynamic.args.iter().any(|arg| arg == "new_database"));
+    }
+
+    #[test]
+    fn connection_timeout_is_kept_on_mysql_client_commands() {
+        let target = parse_connection_url("mysql://root@127.0.0.1:3306").unwrap();
+        let args = client_connection_args(&target);
+        assert!(args.iter().any(|arg| arg == "--connect-timeout=5"));
     }
 }
