@@ -20,6 +20,58 @@ The hosted API, operator Engine, storage infrastructure, billing systems,
 website, and future business, reseller, and affiliate panels are separate
 services and are not included here.
 
+## Released capabilities
+
+The current Windows client provides:
+
+- reusable folder backup profiles with one or more local run times, custom day
+  intervals, vault-folder placement, and latest-N or unlimited retention;
+- one-off Quick Backup for selected files or a folder;
+- bounded automatic retries for transient scheduled-backup failures, while
+  credential, key, tool, and quota failures wait for customer action;
+- native MySQL and MariaDB backup profiles that discover compatible vendor and
+  XAMPP tools, require a successful connection test, and support all-database,
+  selected-database, or selected-table scopes;
+- streamed native database dumps into Kopia and streamed restores into the
+  native database client, without an intermediate plaintext SQL dump file;
+- database-password storage in Windows Credential Manager;
+- content-defined deduplication, zstd compression, encrypted Kopia snapshots,
+  and latest-N snapshot retention;
+- optimized storage accounting based on the encrypted physical repository
+  footprint, with separate source-data and optimization-savings statistics;
+- whole-snapshot and selective-file restore to an original or alternate
+  destination;
+- Windows VSS in `when-available` mode, with normal traversal fallback and
+  snapshot failure on file or directory read errors;
+- backup, restore, database, retry, maintenance, and quota status in the app
+  and privacy-limited operational telemetry for the customer dashboard;
+- configurable webhook notifications and a real delivery test, without a
+  separate Discord bot;
+- a one-time offline vault recovery key distinct from account recovery codes;
+  and
+- Tauri-signed update artifacts that install only when backup-engine work is
+  idle.
+
+Public feature explanations and current commercial facts live at
+[savestate.dk/features](https://savestate.dk/features). The compact factual
+product sheet is available at
+[savestate.dk/ai-facts.txt](https://savestate.dk/ai-facts.txt).
+
+### Product boundaries
+
+- The released app supports Windows 10 and 11 on x64. Linux distribution is
+  not currently released.
+- SaveState protects selected files, folders, application recovery data, and
+  native MySQL or MariaDB logical dumps. It is not a bare-metal system-image
+  product.
+- VSS provides a stable file-system view; it does not by itself guarantee
+  logical consistency for every stateful application.
+- Native database integration currently covers MySQL and MariaDB. Other
+  applications should use their vendor-supported dump or snapshot workflow.
+- A successful job confirms capture and storage. Customers should still test a
+  representative restore and validate the recovered application.
+- Compression and deduplication savings depend on the workload.
+
 ## Security model
 
 - Backup data is encrypted on the device before it is uploaded.
