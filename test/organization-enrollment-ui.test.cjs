@@ -16,6 +16,7 @@ test('Settings requires review and explicit confirmation before connecting', () 
   for (const id of [
     'organization-installation-section',
     'organization-setup-token',
+    'btn-paste-organization-token',
     'btn-review-organization-enrollment',
     'organization-enrollment-preview',
     'organization-preview-name',
@@ -30,6 +31,7 @@ test('Settings requires review and explicit confirmation before connecting', () 
   assert.match(html, /review the organization and server before anything changes/i);
   assert.match(html, /never receives your password, recovery keys, or decrypted backups/i);
   assert.match(app, /cmd_inspect_organization_installation/);
+  assert.match(app, /navigator\.clipboard\.readText\(\)/);
   assert.match(app, /if \(!organizationEnrollmentPreview\)/);
   assert.match(app, /cmd_redeem_organization_installation/);
 });
@@ -47,6 +49,8 @@ test('successful redemption switches the service session and warms the repositor
 test('the device credential is stored in Windows Credential Manager and never exposed to the UI', () => {
   assert.match(enrollment, /keyring::v1::Entry::new\("SaveState Vault", "organization-installation"\)/);
   assert.match(enrollment, /set_secret\(&data\)/);
+  assert.match(enrollment, /delete_credential\(\)/);
+  assert.match(enrollment, /invalid_device_credential/);
   assert.doesNotMatch(enrollment, /std::fs::write/);
   assert.doesNotMatch(html, /device[_ -]?credential/i);
   assert.doesNotMatch(app, /deviceCredential/);

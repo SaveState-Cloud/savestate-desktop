@@ -60,6 +60,18 @@ fn load_installation() -> Option<StoredOrganizationInstallation> {
     serde_json::from_slice(&data).ok()
 }
 
+fn remove_installation() -> Result<()> {
+    credential_entry()?
+        .delete_credential()
+        .context("Failed to remove the disabled organization device credential")
+}
+
+fn device_credential_was_revoked(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("invalid_device_credential"))
+}
+
 fn installation_for_account(account_email: &str) -> Option<StoredOrganizationInstallation> {
     let stored = load_installation()?;
     stored
@@ -154,6 +166,14 @@ pub(crate) fn queue_organization_installation_backup_heartbeat(
                     return;
                 }
                 Err(error) => {
+                    if device_credential_was_revoked(&error) {
+                        if let Err(remove_error) = remove_installation() {
+                            eprintln!(
+                                "Failed to remove revoked organization credential: {remove_error}"
+                            );
+                        }
+                        return;
+                    }
                     eprintln!("Organization installation health report failed: {error}");
                 }
             }
@@ -178,8 +198,16 @@ pub(crate) async fn send_organization_installation_heartbeat(
         return Ok(());
     };
     let pending_backup = stored.pending_backup.clone();
-    api.organization_installation_heartbeat(&stored.device_credential, pending_backup.clone())
-        .await?;
+    if let Err(error) = api
+        .organization_installation_heartbeat(&stored.device_credential, pending_backup.clone())
+        .await
+    {
+        if device_credential_was_revoked(&error) {
+            remove_installation()?;
+            return Ok(());
+        }
+        return Err(error);
+    }
     if let Some(backup) = pending_backup {
         clear_delivered_backup(&account_email, &backup.event_id);
     }
@@ -373,5 +401,15 @@ mod tests {
             decoded.pending_backup.unwrap().event_id,
             "11111111-1111-4111-8111-111111111111"
         );
+    }
+
+    #[test]
+    fn only_the_stable_invalid_credential_response_triggers_local_removal() {
+        assert!(device_credential_was_revoked(&anyhow!(String::from(
+            "Organization installation heartbeat failed (401 Unauthorized): {\"error\":\"invalid_device_credential\"}"
+        ))));
+        assert!(!device_credential_was_revoked(&anyhow!(
+            "Organization installation heartbeat failed (503 Service Unavailable)"
+        )));
     }
 }

@@ -540,6 +540,9 @@ function setupEventListeners() {
     document.getElementById('btn-remove-webhook').addEventListener('click', removeWebhook);
     document.getElementById('btn-toggle-webhook-visibility').addEventListener('click', toggleWebhookVisibility);
     document.getElementById('btn-open-organization-enrollment').addEventListener('click', openOrganizationEnrollment);
+    document.getElementById('btn-paste-organization-token').addEventListener('click', () => {
+        void pasteOrganizationSetupToken();
+    });
     document.getElementById('organization-enrollment-form').addEventListener('submit', (event) => {
         event.preventDefault();
         void reviewOrganizationEnrollment();
@@ -2955,6 +2958,17 @@ function resetOrganizationEnrollmentPreview() {
     organizationEnrollmentPreview = null;
     document.getElementById('organization-enrollment-preview').classList.add('hidden');
     setOrganizationEnrollmentMessage('');
+}
+
+async function pasteOrganizationSetupToken() {
+    const input = document.getElementById('organization-setup-token');
+    try {
+        input.value = (await navigator.clipboard.readText()).trim();
+        resetOrganizationEnrollmentPreview();
+        input.focus();
+    } catch {
+        setOrganizationEnrollmentMessage('SaveState could not read the clipboard. Paste the token into the field manually.');
+    }
 }
 
 function closeOrganizationEnrollment() {
