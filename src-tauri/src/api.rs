@@ -1293,6 +1293,69 @@ impl SaveStateClient {
             .context("Failed to parse create folder response")
     }
 
+    /// Create or rename the logical folder owned by one backup profile.
+    pub async fn ensure_profile_folder(
+        &self,
+        profile_id: &str,
+        profile_name: &str,
+    ) -> Result<String> {
+        let url = format!("{}/backup/profile-folders", self.base_url);
+        let auth = self.auth_header()?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({
+                "profileId": profile_id,
+                "profileName": profile_name,
+            }))
+            .send()
+            .await
+            .context("Failed to organize the profile folder")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Profile folder setup failed: {} — {}",
+                status,
+                text
+            ));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse profile folder response")?;
+        value
+            .get("folder")
+            .and_then(serde_json::Value::as_str)
+            .filter(|folder| !folder.is_empty())
+            .map(ToString::to_string)
+            .context("Profile folder response did not include a folder")
+    }
+
+    /// Stop treating a folder as profile-managed while preserving its backups.
+    pub async fn detach_profile_folder(&self, profile_id: &str) -> Result<()> {
+        let url = format!("{}/backup/profile-folders/{}", self.base_url, profile_id);
+        let auth = self.auth_header()?;
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .context("Failed to detach the profile folder")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Profile folder detach failed: {} — {}",
+                status,
+                text
+            ));
+        }
+        Ok(())
+    }
+
     /// Move a backup to a different folder.
     pub async fn move_backup(
         &self,

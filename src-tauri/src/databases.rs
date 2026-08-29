@@ -363,7 +363,7 @@ fn load_password(owner_account: &str, profile_id: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Stored database credentials use an unsupported format"))
 }
 
-fn delete_password(owner_account: &str, profile_id: &str) {
+pub(crate) fn delete_profile_password(owner_account: &str, profile_id: &str) {
     if let Ok(entry) = credential_entry(owner_account, profile_id) {
         let _ = entry.delete_credential();
     }
@@ -670,7 +670,7 @@ pub async fn cmd_create_database_profile(
     } else {
         None
     };
-    let profile = DatabaseProfile {
+    let mut profile = DatabaseProfile {
         id: uuid::Uuid::new_v4().to_string(),
         owner_account: owner_account.clone(),
         name,
@@ -714,6 +714,13 @@ pub async fn cmd_create_database_profile(
         }
     }
     save_password(&owner_account, &profile.id, &password).map_err(|error| error.to_string())?;
+    profile.folder = match api.ensure_profile_folder(&profile.id, &profile.name).await {
+        Ok(folder) => folder,
+        Err(error) => {
+            delete_profile_password(&owner_account, &profile.id);
+            return Err(error.to_string());
+        }
+    };
     let create_result = state
         .0
         .lock()
@@ -722,7 +729,8 @@ pub async fn cmd_create_database_profile(
             db::create_database_profile(&guard.db, &profile).map_err(|error| error.to_string())
         });
     if let Err(error) = create_result {
-        delete_password(&owner_account, &profile.id);
+        delete_profile_password(&owner_account, &profile.id);
+        let _ = api.detach_profile_folder(&profile.id).await;
         return Err(error);
     }
     crate::profiles::report_schedule_snapshot(&state);
@@ -827,6 +835,14 @@ pub async fn cmd_update_database_profile(
         }
     }
 
+    let api = {
+        let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
+        guard.api.clone()
+    };
+    let managed_folder = api
+        .ensure_profile_folder(&id, &name)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut profile = existing;
     profile.name = name;
     profile.connection_url = connection_url;
@@ -839,6 +855,7 @@ pub async fn cmd_update_database_profile(
     profile.include_create_statements = include_create_statements;
     profile.include_users_and_grants = include_users_and_grants;
     profile.schedule = schedule.clone();
+    profile.folder = managed_folder;
     profile.enabled = enabled;
     profile.next_run = if enabled {
         crate::profiles::compute_next_run(schedule.as_deref())
@@ -867,23 +884,59 @@ pub async fn cmd_list_database_profiles(
     state: tauri::State<'_, AppStateWrapper>,
 ) -> std::result::Result<Vec<DatabaseProfile>, String> {
     let owner_account = current_owner(&state)?;
-    let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
-    db::list_database_profiles_for_account(&guard.db, &owner_account)
-        .map_err(|error| error.to_string())
+    let (mut profiles, api) = {
+        let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
+        (
+            db::list_database_profiles_for_account(&guard.db, &owner_account)
+                .map_err(|error| error.to_string())?,
+            guard.api.clone(),
+        )
+    };
+    for profile in &mut profiles {
+        if let Ok(folder) = api.ensure_profile_folder(&profile.id, &profile.name).await {
+            if folder != profile.folder {
+                profile.folder = folder;
+                let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
+                db::update_database_profile(&guard.db, profile)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(profiles)
 }
 
 #[tauri::command]
 pub async fn cmd_delete_database_profile(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppStateWrapper>,
     id: String,
+    delete_backups: Option<bool>,
 ) -> std::result::Result<(), String> {
     let owner_account = current_owner(&state)?;
+    let (profile, api) = {
+        let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
+        let profile = db::get_database_profile_for_account(&guard.db, &id, &owner_account)
+            .map_err(|error| error.to_string())?;
+        (profile, guard.api.clone())
+    };
+    if delete_backups.unwrap_or(false) {
+        crate::backup::delete_snapshots_in_folder(&app, state.inner(), &profile.folder)
+            .await
+            .map_err(|error| error.to_string())?;
+        api.delete_folder(&profile.folder)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        api.detach_profile_folder(&profile.id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     {
         let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
         db::delete_database_profile_for_account(&guard.db, &id, &owner_account)
             .map_err(|error| error.to_string())?;
     }
-    delete_password(&owner_account, &id);
+    delete_profile_password(&owner_account, &id);
     crate::profiles::report_schedule_snapshot(&state);
     Ok(())
 }
@@ -973,11 +1026,20 @@ pub async fn run_database_backup_inner(
     let operation = crate::backup_operations::begin(state, "Database backup")?;
     crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
     let result: Result<String> = async {
-        let profile = {
+        let mut profile = {
             let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
             db::get_database_profile_for_account(&guard.db, profile_id, operation.account_scope())?
         };
         operation.set_name(profile.name.clone());
+        let managed_folder = operation
+            .api()
+            .ensure_profile_folder(&profile.id, &profile.name)
+            .await?;
+        if managed_folder != profile.folder {
+            profile.folder = managed_folder;
+            let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+            db::update_database_profile(&guard.db, &profile)?;
+        }
         let password = load_password(operation.account_scope(), profile_id)?;
         let connection = test_connection(
             &profile.connection_url,

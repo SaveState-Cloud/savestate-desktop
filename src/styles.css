@@ -1515,6 +1515,30 @@ code {
   margin-top: 1.5rem;
 }
 
+.profile-folder-preview {
+  min-height: 42px;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.profile-delete-modal {
+  max-width: 500px;
+}
+
+.profile-delete-choice {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border: 1px solid rgba(231, 76, 60, 0.35);
+  border-radius: 9px;
+  background: rgba(231, 76, 60, 0.07);
+}
+
 /* ─────────────────────────────────────────────────────────────
    UTILITIES & ANIMATIONS
    ───────────────────────────────────────────────────────────── */
@@ -1722,6 +1746,13 @@ code {
   color: var(--text-muted);
 }
 
+.folder-card-managed {
+  margin-top: 0.5rem;
+  color: var(--accent);
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
 .folder-card-delete {
   position: absolute;
   top: 0.5rem;
@@ -1766,6 +1797,33 @@ code {
 .btn-icon {
   padding: 0.35rem 0.5rem;
   min-width: 32px;
+}
+
+.backup-name-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.backup-version-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.backup-version-badge.is-newest {
+  border-color: rgba(130, 224, 170, 0.35);
+  background: var(--accent-ghost);
+  color: var(--accent);
 }
 
 /* Quick Backup Folder Selector */
