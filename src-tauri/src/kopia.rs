@@ -307,6 +307,14 @@ pub struct KopiaSnapshot {
     pub database_profile_name: Option<String>,
     #[serde(default)]
     pub root_object_id: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub profile_name: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub version_number: Option<u64>,
 }
 
 fn root_folder() -> String {
@@ -731,13 +739,20 @@ fn backup_reliability_policy_args(
     new_repository: bool,
     enable_volume_shadow_copy: bool,
 ) -> Option<Vec<String>> {
-    if !new_repository && !enable_volume_shadow_copy {
-        return None;
-    }
     let mut args = vec![
         "policy".to_string(),
         "set".to_string(),
         "--global".to_string(),
+        // Older clients used one global keep-latest value for every profile.
+        // Keep Kopia's native expiration effectively unlimited and let the
+        // client prune only versions that still live in each managed folder.
+        // This is the largest value accepted by Kopia's signed counter.
+        "--keep-latest=2147483647".to_string(),
+        "--keep-hourly=0".to_string(),
+        "--keep-daily=0".to_string(),
+        "--keep-weekly=0".to_string(),
+        "--keep-monthly=0".to_string(),
+        "--keep-annual=0".to_string(),
     ];
     if new_repository {
         args.push("--compression=zstd".to_string());
@@ -968,7 +983,7 @@ pub async fn backup_paths_with_trigger(
     };
     let operation = backup_operations::begin(state, display_name)?;
     prepare_repository_for_backup(app, &operation).await?;
-    let result = backup_paths_with_operation(app, &operation, paths, trigger, folder).await;
+    let result = backup_paths_with_operation(app, &operation, paths, trigger, folder, None).await;
     operation.finish_tracking().await;
     result
 }
@@ -979,6 +994,7 @@ pub async fn backup_paths_with_operation(
     paths: Vec<String>,
     trigger: &'static str,
     folder: &str,
+    profile: Option<(&str, &str)>,
 ) -> Result<String> {
     let _operation_guard = begin_operation().await;
 
@@ -986,6 +1002,7 @@ pub async fn backup_paths_with_operation(
         return Err(anyhow!("No backup paths provided"));
     }
     let folder = normalize_snapshot_folder(folder)?;
+    let profile = profile.map(|(id, name)| (id.to_string(), name.to_string()));
 
     let op_id = uuid::Uuid::new_v4().to_string();
     let mut engine_job = EngineJobReporter::start(
@@ -1010,9 +1027,16 @@ pub async fn backup_paths_with_operation(
         let app_c = app.clone();
         let session_c = session.clone();
         let control = Arc::clone(&operation.control);
+        let profile_c = profile.clone();
+        let trigger_c = trigger.to_string();
         let mut snapshot = tokio::task::spawn_blocking(move || -> Result<KopiaSnapshot> {
             let mut args = vec!["snapshot".to_string(), "create".to_string()];
             args.extend(paths);
+            args.push("--tags=backup-kind:files".to_string());
+            args.push(format!("--tags=savestate-trigger:{trigger_c}"));
+            if let Some((profile_id, _)) = profile_c.as_ref() {
+                args.push(format!("--tags=savestate-profile:{profile_id}"));
+            }
             args.push("--json".to_string());
             args.push("--no-progress".to_string());
             let out = run_kopia_for_backup(
@@ -1029,6 +1053,11 @@ pub async fn backup_paths_with_operation(
             Ok(snapshot)
         }).await.context("kopia snapshot task panicked")??;
         snapshot.folder = folder;
+        snapshot.trigger = Some(trigger.to_string());
+        if let Some((profile_id, profile_name)) = profile.as_ref() {
+            snapshot.profile_id = Some(profile_id.clone());
+            snapshot.profile_name = Some(profile_name.clone());
+        }
 
         if let Err(cancelled) = operation.ensure_not_cancelled() {
             rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, false).await?;
@@ -1394,6 +1423,8 @@ pub async fn backup_stream_with_operation(
             format!("--stdin-file={stdin_filename}"),
             "--tags=backup-kind:database".to_string(),
             format!("--tags=database-profile:{profile_id}"),
+            format!("--tags=savestate-profile:{profile_id}"),
+            format!("--tags=savestate-trigger:{trigger}"),
             format!("--description=SaveState database backup: {profile_name}"),
             "--json".to_string(),
             "--no-progress".to_string(),
@@ -1441,6 +1472,9 @@ pub async fn backup_stream_with_operation(
         snapshot.backup_kind = "database".to_string();
         snapshot.database_profile_id = Some(profile_id.to_string());
         snapshot.database_profile_name = Some(profile_name.to_string());
+        snapshot.profile_id = Some(profile_id.to_string());
+        snapshot.profile_name = Some(profile_name.to_string());
+        snapshot.trigger = Some(trigger.to_string());
         snapshot.size = pipeline.source_bytes;
         snapshot.file_count = 1;
 
@@ -1636,6 +1670,63 @@ pub async fn list_snapshots(
     serde_json::from_value(manifest).context("Invalid kopia snapshot manifest")
 }
 
+/// Delete only excess versions that still live in the managed profile folder.
+/// A version deliberately moved elsewhere is a user-pinned restore point and
+/// is excluded from both automatic retention and profile-folder deletion.
+pub async fn prune_profile_snapshots(
+    app: &tauri::AppHandle,
+    state: &AppStateWrapper,
+    profile_id: &str,
+    profile_folder: &str,
+    keep_latest: usize,
+) -> Result<Vec<String>> {
+    if keep_latest == 0 {
+        return Ok(Vec::new());
+    }
+    let expired = expired_profile_snapshot_ids(
+        list_snapshots(app, state).await?,
+        profile_id,
+        profile_folder,
+        keep_latest,
+    );
+    for snapshot_id in &expired {
+        delete_snapshot(app, state, snapshot_id).await?;
+    }
+    if !expired.is_empty() {
+        schedule_storage_cleanup(app.clone());
+    }
+    Ok(expired)
+}
+
+fn expired_profile_snapshot_ids(
+    snapshots: Vec<KopiaSnapshot>,
+    profile_id: &str,
+    profile_folder: &str,
+    keep_latest: usize,
+) -> Vec<String> {
+    if keep_latest == 0 {
+        return Vec::new();
+    }
+    let mut snapshots: Vec<KopiaSnapshot> = snapshots
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot.profile_id.as_deref() == Some(profile_id)
+                && crate::backup::folder_contains(profile_folder, &snapshot.folder)
+        })
+        .collect();
+    snapshots.sort_by(|left, right| {
+        right
+            .version_number
+            .cmp(&left.version_number)
+            .then_with(|| right.start_time.cmp(&left.start_time))
+    });
+    snapshots
+        .into_iter()
+        .skip(keep_latest)
+        .map(|snapshot| snapshot.id)
+        .collect()
+}
+
 async fn list_snapshots_from_repository(
     app: &tauri::AppHandle,
     context: &AccountContext,
@@ -1705,6 +1796,15 @@ fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
         .and_then(|tags| tags.get("tag:database-profile"))
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
+    let profile_id = tags
+        .and_then(|tags| tags.get("tag:savestate-profile"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| database_profile_id.clone());
+    let trigger = tags
+        .and_then(|tags| tags.get("tag:savestate-trigger"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
     let root_object_id = item
         .get("rootEntry")
         .and_then(|root| root.get("obj"))
@@ -1722,6 +1822,10 @@ fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
         database_profile_id,
         database_profile_name: None,
         root_object_id,
+        profile_id,
+        profile_name: None,
+        trigger,
+        version_number: None,
     }
 }
 
@@ -2768,8 +2872,8 @@ mod tests {
     use super::{
         backup_reliability_policy_args, begin_operation, cancel_restore, classify_kopia_error,
         clear_restore_cancellation, database_content_object_from_value,
-        ensure_restore_not_cancelled, execute_rollback_steps, parse_snapshot,
-        repository_is_missing, try_begin_update,
+        ensure_restore_not_cancelled, execute_rollback_steps, expired_profile_snapshot_ids,
+        parse_snapshot, repository_is_missing, try_begin_update,
     };
     use std::sync::{Arc, Mutex};
 
@@ -2803,6 +2907,38 @@ mod tests {
         assert_eq!(snapshot.id, "abc123");
         assert_eq!(snapshot.size, 1024);
         assert_eq!(snapshot.file_count, 3);
+    }
+
+    #[test]
+    fn profile_retention_never_prunes_versions_moved_out_of_the_managed_folder() {
+        let snapshot = |id: &str, profile_id: &str, folder: &str, version_number: u64| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "sourcePath": "C:\\Screenshots",
+                "startTime": format!("2026-08-{version_number:02}T10:00:00Z"),
+                "size": 100,
+                "fileCount": 1,
+                "folder": folder,
+                "profileId": profile_id,
+                "profileName": "Screenshots",
+                "trigger": "manual",
+                "versionNumber": version_number
+            }))
+            .unwrap()
+        };
+        let expired = expired_profile_snapshot_ids(
+            vec![
+                snapshot("newest", "profile-a", "/Screenshots", 4),
+                snapshot("middle", "profile-a", "/Screenshots", 3),
+                snapshot("saved-elsewhere", "profile-a", "/Tested working DB", 2),
+                snapshot("oldest", "profile-a", "/Screenshots", 1),
+                snapshot("other-profile", "profile-b", "/Screenshots", 99),
+            ],
+            "profile-a",
+            "/Screenshots",
+            2,
+        );
+        assert_eq!(expired, vec!["oldest"]);
     }
 
     #[test]
@@ -2853,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_windows_repository_gets_only_kopias_native_vss_upgrade() {
+    fn existing_windows_repository_disables_legacy_retention_and_keeps_vss() {
         let args = backup_reliability_policy_args(false, true).unwrap();
         assert_eq!(
             args,
@@ -2861,6 +2997,12 @@ mod tests {
                 "policy",
                 "set",
                 "--global",
+                "--keep-latest=2147483647",
+                "--keep-hourly=0",
+                "--keep-daily=0",
+                "--keep-weekly=0",
+                "--keep-monthly=0",
+                "--keep-annual=0",
                 "--enable-volume-shadow-copy=when-available",
             ]
         );
@@ -2875,6 +3017,12 @@ mod tests {
                 "policy",
                 "set",
                 "--global",
+                "--keep-latest=2147483647",
+                "--keep-hourly=0",
+                "--keep-daily=0",
+                "--keep-weekly=0",
+                "--keep-monthly=0",
+                "--keep-annual=0",
                 "--compression=zstd",
                 "--enable-volume-shadow-copy=when-available",
             ]
@@ -2882,8 +3030,21 @@ mod tests {
     }
 
     #[test]
-    fn existing_non_windows_repository_needs_no_policy_migration() {
-        assert!(backup_reliability_policy_args(false, false).is_none());
+    fn existing_non_windows_repository_disables_legacy_global_retention() {
+        assert_eq!(
+            backup_reliability_policy_args(false, false).unwrap(),
+            vec![
+                "policy",
+                "set",
+                "--global",
+                "--keep-latest=2147483647",
+                "--keep-hourly=0",
+                "--keep-daily=0",
+                "--keep-weekly=0",
+                "--keep-monthly=0",
+                "--keep-annual=0",
+            ]
+        );
     }
 
     #[test]
@@ -2891,7 +3052,18 @@ mod tests {
         let args = backup_reliability_policy_args(true, false).unwrap();
         assert_eq!(
             args,
-            vec!["policy", "set", "--global", "--compression=zstd"]
+            vec![
+                "policy",
+                "set",
+                "--global",
+                "--keep-latest=2147483647",
+                "--keep-hourly=0",
+                "--keep-daily=0",
+                "--keep-weekly=0",
+                "--keep-monthly=0",
+                "--keep-annual=0",
+                "--compression=zstd",
+            ]
         );
     }
 

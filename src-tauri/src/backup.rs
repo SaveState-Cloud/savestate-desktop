@@ -675,6 +675,42 @@ pub async fn cmd_get_backup_history(
 // Folder operations
 // ────────────────────────────────────────────────────────────────────
 
+pub(crate) fn folder_contains(folder: &str, candidate: &str) -> bool {
+    candidate == folder
+        || candidate
+            .strip_prefix(folder)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+pub(crate) async fn delete_snapshots_in_folder(
+    app: &tauri::AppHandle,
+    state: &AppStateWrapper,
+    folder: &str,
+) -> anyhow::Result<Vec<String>> {
+    if folder.trim().is_empty() || folder == "/" {
+        return Err(anyhow::anyhow!("The root backup folder cannot be deleted"));
+    }
+    let snapshots = crate::kopia::list_snapshots(app, state).await?;
+    let snapshot_ids: Vec<String> = snapshots
+        .into_iter()
+        .filter(|snapshot| folder_contains(folder, &snapshot.folder))
+        .map(|snapshot| snapshot.id)
+        .collect();
+    for snapshot_id in &snapshot_ids {
+        crate::kopia::delete_snapshot(app, state, snapshot_id).await?;
+        if let Ok(guard) = state.0.lock() {
+            let _ = guard.db.execute(
+                "DELETE FROM backup_history WHERE remote_key = ?1",
+                rusqlite::params![snapshot_id],
+            );
+        }
+    }
+    if !snapshot_ids.is_empty() {
+        crate::kopia::schedule_storage_cleanup(app.clone());
+    }
+    Ok(snapshot_ids)
+}
+
 #[tauri::command]
 pub async fn cmd_create_folder(
     state: tauri::State<'_, AppStateWrapper>,
@@ -707,14 +743,63 @@ pub async fn cmd_move_backup(
 
 #[tauri::command]
 pub async fn cmd_delete_folder(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppStateWrapper>,
     name: String,
-) -> std::result::Result<(), String> {
-    let api = {
+) -> std::result::Result<serde_json::Value, String> {
+    let (api, owner_account, file_profiles, database_profiles) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
-        guard.api.clone()
+        let owner_account = guard
+            .account_scope()
+            .ok_or_else(|| "Sign in before deleting a backup folder".to_string())?;
+        let file_profiles = db::list_profiles_for_account(&guard.db, &owner_account)
+            .map_err(|error| error.to_string())?;
+        let database_profiles = db::list_database_profiles_for_account(&guard.db, &owner_account)
+            .map_err(|error| error.to_string())?;
+        (
+            guard.api.clone(),
+            owner_account,
+            file_profiles,
+            database_profiles,
+        )
     };
-    api.delete_folder(&name).await.map_err(|e| e.to_string())
+    let deleted_snapshots = delete_snapshots_in_folder(&app, state.inner(), &name)
+        .await
+        .map_err(|error| error.to_string())?;
+    api.delete_folder(&name)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let removed_file_profiles: Vec<String> = file_profiles
+        .into_iter()
+        .filter(|profile| folder_contains(&name, &profile.folder))
+        .map(|profile| profile.id)
+        .collect();
+    let removed_database_profiles: Vec<String> = database_profiles
+        .into_iter()
+        .filter(|profile| folder_contains(&name, &profile.folder))
+        .map(|profile| profile.id)
+        .collect();
+    {
+        let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+        for profile_id in &removed_file_profiles {
+            db::delete_profile_for_account(&guard.db, profile_id, &owner_account)
+                .map_err(|error| error.to_string())?;
+        }
+        for profile_id in &removed_database_profiles {
+            db::delete_database_profile_for_account(&guard.db, profile_id, &owner_account)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for profile_id in &removed_database_profiles {
+        crate::databases::delete_profile_password(&owner_account, profile_id);
+    }
+    crate::profiles::report_schedule_snapshot(&state);
+    Ok(serde_json::json!({
+        "deletedSnapshots": deleted_snapshots.len(),
+        "deletedProfiles": removed_file_profiles.len() + removed_database_profiles.len(),
+        "folder": name,
+    }))
 }
 
 #[cfg(test)]
@@ -750,4 +835,16 @@ pub async fn cmd_list_folders(
         guard.api.clone()
     };
     api.list_folders().await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::folder_contains;
+
+    #[test]
+    fn folder_matching_does_not_include_similar_siblings() {
+        assert!(folder_contains("/Servers", "/Servers"));
+        assert!(folder_contains("/Servers", "/Servers/Database"));
+        assert!(!folder_contains("/Servers", "/Servers-old"));
+    }
 }

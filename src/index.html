@@ -724,16 +724,34 @@
                     <input type="number" id="profile-retention" value="0" min="0" />
                 </div>
                 <div class="form-group">
-                    <label for="profile-folder">Save backups to folder</label>
-                    <select class="select-input" id="profile-folder">
-                        <option value="/">/ (Root)</option>
-                    </select>
+                    <label for="profile-folder-preview">Backup folder</label>
+                    <div class="profile-folder-preview" id="profile-folder-preview" aria-live="polite">/Backup Profile</div>
+                    <p class="text-muted text-sm">Created automatically from the profile name. Move any version out of this folder to preserve it independently.</p>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn btn-ghost" id="btn-cancel-profile">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save Profile</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Profile deletion confirmation -->
+    <div id="profile-delete-modal" class="modal-overlay hidden">
+        <div class="modal glass-card profile-delete-modal" role="dialog" aria-modal="true" aria-labelledby="profile-delete-title">
+            <h3 id="profile-delete-title">Delete backup profile?</h3>
+            <p class="text-muted" id="profile-delete-copy"></p>
+            <label class="check-row profile-delete-choice">
+                <input type="checkbox" id="profile-delete-backups" />
+                <span>
+                    Delete all backups within this profile
+                    <small>Only versions still inside this profile folder are deleted. Backups moved elsewhere are preserved.</small>
+                </span>
+            </label>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-ghost" id="btn-cancel-profile-delete">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btn-confirm-profile-delete">Delete Profile</button>
+            </div>
         </div>
     </div>
 

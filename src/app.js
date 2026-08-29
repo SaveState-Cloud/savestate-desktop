@@ -57,6 +57,7 @@ let databaseConnectionResult = null;
 let databaseConnectionFingerprint = null;
 let databaseSelectedDatabases = new Set();
 let databaseSelectedTables = new Set();
+let pendingProfileDeletion = null;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -422,6 +423,8 @@ function setupEventListeners() {
         if (folder) document.getElementById('profile-source').value = folder;
     });
 
+    document.getElementById('profile-name').addEventListener('input', updateProfileFolderPreview);
+
     document.getElementById('profile-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const editId = document.getElementById('profile-edit-id').value;
@@ -448,22 +451,51 @@ function setupEventListeners() {
             schedule = JSON.stringify({ times, intervalDays });
         }
 
-        const folder = document.getElementById('profile-folder')?.value || '/';
-
         try {
             if (editId) {
                 await invoke('cmd_update_profile', {
-                    id: editId, name, sourcePath, schedule, retention, enabled: true, folder,
+                    id: editId, name, sourcePath, schedule, retention, enabled: true, folder: '/',
                 });
                 showToast('Profile updated', 'success');
             } else {
-                await invoke('cmd_create_profile', { name, sourcePath, schedule, retention, folder });
+                await invoke('cmd_create_profile', { name, sourcePath, schedule, retention, folder: '/' });
                 showToast('Profile created', 'success');
             }
             document.getElementById('profile-modal').classList.add('hidden');
             loadProfiles();
         } catch (err) {
             showToast(String(err), 'error');
+        }
+    });
+
+    document.getElementById('btn-cancel-profile-delete').addEventListener('click', closeProfileDeleteModal);
+    document.getElementById('btn-confirm-profile-delete').addEventListener('click', async () => {
+        if (!pendingProfileDeletion) return;
+        const target = pendingProfileDeletion;
+        const deleteBackups = document.getElementById('profile-delete-backups').checked;
+        const button = document.getElementById('btn-confirm-profile-delete');
+        button.disabled = true;
+        button.textContent = deleteBackups ? 'Deleting backups…' : 'Deleting profile…';
+        try {
+            if (target.kind === 'database') {
+                await invoke('cmd_delete_database_profile', { id: target.id, deleteBackups });
+            } else {
+                await invoke('cmd_delete_profile', { id: target.id, deleteBackups });
+            }
+            closeProfileDeleteModal();
+            showToast(deleteBackups
+                ? 'Profile folder and its remaining backups were deleted.'
+                : 'Profile deleted. Its backup folder was preserved.', 'success');
+            if (target.kind === 'database') {
+                void loadDatabaseProfiles();
+            } else {
+                void loadProfiles();
+            }
+        } catch (error) {
+            showToast(friendlyError(error), 'error');
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Delete Profile';
         }
     });
 
@@ -1265,6 +1297,13 @@ function resetBackupMode() {
 // ────────────────────────────────────────────────────────────────
 // Backups Lis
 // ────────────────────────────────────────────────────────────────
+function folderContainsPath(parent, candidate) {
+    const normalizedParent = parent || '/';
+    const normalizedCandidate = candidate || '/';
+    return normalizedCandidate === normalizedParent
+        || (normalizedParent !== '/' && normalizedCandidate.startsWith(`${normalizedParent}/`));
+}
+
 async function loadBackups() {
     const tbody = document.getElementById('backups-tbody');
     const folderGrid = document.getElementById('folder-grid');
@@ -1309,7 +1348,16 @@ async function loadBackups() {
                             const bFolder = b.folder || '/';
                             return bFolder === childPath || bFolder.startsWith(childPath + '/');
                         }).length;
-                        subfolders.push({ name: childName, path: childPath, itemCount });
+                        const managedFolder = folders.find((entry) => typeof entry !== 'string'
+                            && entry.path === childPath && entry.managed);
+                        subfolders.push({
+                            name: childName,
+                            path: childPath,
+                            itemCount,
+                            managed: Boolean(managedFolder),
+                            profileId: managedFolder?.profileId || null,
+                            profileName: managedFolder?.profileName || null,
+                        });
                     }
                 }
             }
@@ -1333,7 +1381,7 @@ async function loadBackups() {
                             const f2 = b2.folder || '/';
                             return f2 === childPath || f2.startsWith(childPath + '/');
                         }).length;
-                        subfolders.push({ name: childName, path: childPath, itemCount });
+                        subfolders.push({ name: childName, path: childPath, itemCount, managed: false });
                     }
                 }
             }
@@ -1347,34 +1395,46 @@ async function loadBackups() {
         subfolders.forEach(sf => {
             const card = document.createElement('div');
             card.className = 'folder-card';
-            card.innerHTML = `
+            const openButton = document.createElement('button');
+            openButton.type = 'button';
+            openButton.className = 'folder-card-open';
+            openButton.setAttribute('aria-label', `Open folder ${sf.name}`);
+            openButton.innerHTML = `
                 <span class="folder-card-icon">📁</span>
                 <div class="folder-card-name" title="${escapeHtml(sf.name)}">${escapeHtml(sf.name)}</div>
                 <div class="folder-card-count">${sf.itemCount} item${sf.itemCount !== 1 ? 's' : ''}</div>
+                ${sf.managed ? `<div class="folder-card-managed">${escapeHtml(sf.profileName || 'Backup profile')}</div>` : ''}
             `;
-            card.addEventListener('click', (e) => {
-                if (e.target.closest('.folder-card-delete')) return;
-                navigateToFolder(sf.path);
-            });
+            openButton.addEventListener('click', () => navigateToFolder(sf.path));
+            card.appendChild(openButton);
 
             // Delete folder button
             const delBtn = document.createElement('button');
             delBtn.className = 'folder-card-delete';
             delBtn.textContent = '✕';
             delBtn.title = 'Delete folder';
+            delBtn.setAttribute('aria-label', `Delete folder ${sf.name}`);
             delBtn.addEventListener('click', async (e) => {
                 e.stopPropagation();
+                const containedBackups = allBackups.filter((backup) => folderContainsPath(sf.path, backup.folder || '/'));
+                const containedProfiles = folders.filter((entry) => typeof entry !== 'string'
+                    && entry.managed && folderContainsPath(sf.path, entry.path));
+                const profileWarning = containedProfiles.length > 0
+                    ? ` This also removes ${containedProfiles.length} backup profile${containedProfiles.length === 1 ? '' : 's'} whose managed folder is inside it.`
+                    : '';
                 const confirmed = await confirmDialog(
-                    `Delete the empty folder "${sf.name}"? Backups are never deleted with a folder.`,
-                    { title: 'Delete empty folder', kind: 'warning' },
+                    `Permanently delete "${sf.name}" and all ${containedBackups.length} backup${containedBackups.length === 1 ? '' : 's'} inside it?${profileWarning} This cannot be undone.`,
+                    { title: 'Delete folder and contents', kind: 'warning' },
                 );
                 if (!confirmed) return;
                 try {
-                    await invoke('cmd_delete_folder', { name: sf.path });
-                    showToast(`Folder "${sf.name}" deleted`, 'success');
+                    delBtn.disabled = true;
+                    const result = await invoke('cmd_delete_folder', { name: sf.path });
+                    showToast(`Deleted "${sf.name}", ${Number(result?.deletedSnapshots || 0)} backup${Number(result?.deletedSnapshots || 0) === 1 ? '' : 's'} and ${Number(result?.deletedProfiles || 0)} profile${Number(result?.deletedProfiles || 0) === 1 ? '' : 's'}.`, 'success');
                     loadBackups();
                 } catch (err) {
                     showToast('Failed to delete folder: ' + String(err), 'error');
+                    delBtn.disabled = false;
                 }
             });
             card.appendChild(delBtn);
@@ -1385,7 +1445,7 @@ async function loadBackups() {
         const currentBackups = allBackups.filter(b => {
             const bFolder = b.folder || '/';
             return bFolder === currentFolder;
-        });
+        }).sort((left, right) => new Date(right.lastModified) - new Date(left.lastModified));
 
         // Render backup table
         tbody.innerHTML = '';
@@ -1414,7 +1474,29 @@ async function loadBackups() {
         currentBackups.forEach(b => {
             const tr = document.createElement('tr');
             const tdName = document.createElement('td');
-            tdName.textContent = b.filename;
+            tdName.className = 'backup-name-cell';
+            const filename = document.createElement('span');
+            filename.textContent = b.filename;
+            tdName.appendChild(filename);
+            if (Number.isFinite(Number(b.versionNumber)) && Number(b.versionNumber) > 0) {
+                const profileVersions = allBackups
+                    .filter((backup) => backup.profileId === b.profileId && Number(backup.versionNumber) > 0)
+                    .map((backup) => Number(backup.versionNumber));
+                const version = Number(b.versionNumber);
+                const oldestVersion = Math.min(...profileVersions);
+                const newestVersion = Math.max(...profileVersions);
+                const versionBadge = document.createElement('span');
+                versionBadge.className = 'backup-version-badge';
+                if (version === newestVersion) {
+                    versionBadge.classList.add('is-newest');
+                    versionBadge.textContent = `Newest · v${version}`;
+                } else if (version === oldestVersion) {
+                    versionBadge.textContent = `Oldest · v${version}`;
+                } else {
+                    versionBadge.textContent = `Version ${version}`;
+                }
+                tdName.appendChild(versionBadge);
+            }
             const tdSize = document.createElement('td');
             tdSize.textContent = b.sizeFormatted;
             const tdDate = document.createElement('td');
@@ -1428,6 +1510,7 @@ async function loadBackups() {
             restoreBtn.className = 'btn btn-primary btn-sm btn-icon';
             restoreBtn.textContent = '↗';
             restoreBtn.title = b.backupKind === 'database' ? 'Restore from the Databases page' : 'Restore backup';
+            restoreBtn.setAttribute('aria-label', restoreBtn.title);
             restoreBtn.addEventListener('click', () => {
                 if (b.backupKind === 'database') {
                     navigateTo('databases');
@@ -1442,13 +1525,15 @@ async function loadBackups() {
             moveBtn.className = 'btn btn-ghost btn-sm btn-icon';
             moveBtn.textContent = '→';
             moveBtn.title = 'Move to folder';
-            moveBtn.addEventListener('click', () => openMoveModal(b.key, b.filename));
+            moveBtn.setAttribute('aria-label', `Move ${b.filename} to another folder`);
+            moveBtn.addEventListener('click', () => openMoveModal(b));
 
             // Delete button
             const deleteBtn = document.createElement('button');
             deleteBtn.className = 'btn btn-danger btn-sm btn-icon';
             deleteBtn.textContent = '🗑';
             deleteBtn.title = 'Delete backup';
+            deleteBtn.setAttribute('aria-label', `Delete backup ${b.filename}`);
             deleteBtn.addEventListener('click', async () => {
                 const confirmed = await confirmDialog(
                     'Delete this backup permanently?',
@@ -1533,17 +1618,22 @@ function navigateToFolder(path) {
     loadBackups();
 }
 
-function openMoveModal(key, filename) {
+function openMoveModal(backup) {
     const modal = document.getElementById('move-backup-modal');
-    modal.dataset.backupKey = key;
-    document.getElementById('move-backup-filename').textContent = `Moving: ${filename}`;
+    modal.dataset.backupKey = backup.key;
+    document.getElementById('move-backup-filename').textContent = `Moving: ${backup.filename}`;
 
     // Populate folder dropdown
     const select = document.getElementById('move-dest-folder');
-    select.innerHTML = '<option value="/">/ (Root)</option>';
+    select.innerHTML = '';
+    if (currentFolder !== '/') {
+        select.appendChild(new Option('/ (Root)', '/'));
+    }
     folderList.forEach(f => {
         const fPath = typeof f === 'string' ? f : f.path;
-        if (fPath && fPath !== currentFolder) {
+        const managedByOtherProfile = typeof f !== 'string'
+            && f.managed && f.profileId !== backup.profileId;
+        if (fPath && fPath !== currentFolder && !managedByOtherProfile) {
             const opt = document.createElement('option');
             opt.value = fPath;
             opt.textContent = fPath;
@@ -1551,27 +1641,20 @@ function openMoveModal(key, filename) {
         }
     });
 
+    const moveButton = document.getElementById('btn-confirm-move');
+    if (select.options.length === 0) {
+        const option = new Option('No other folders available', '');
+        option.disabled = true;
+        select.appendChild(option);
+        moveButton.disabled = true;
+    } else {
+        moveButton.disabled = false;
+    }
+
     modal.classList.remove('hidden');
 }
 
 function updateFolderDropdowns() {
-    // Update the profile modal folder dropdown
-    const profileSelect = document.getElementById('profile-folder');
-    if (profileSelect) {
-        const currentVal = profileSelect.value;
-        profileSelect.innerHTML = '<option value="/">/ (Root)</option>';
-        folderList.forEach(f => {
-            const fPath = typeof f === 'string' ? f : f.path;
-            if (fPath) {
-                const opt = document.createElement('option');
-                opt.value = fPath;
-                opt.textContent = fPath;
-                profileSelect.appendChild(opt);
-            }
-        });
-        if (currentVal) profileSelect.value = currentVal;
-    }
-
     // Update the quick backup folder dropdown
     const quickSelect = document.getElementById('quick-backup-folder');
     if (quickSelect) {
@@ -1579,14 +1662,19 @@ function updateFolderDropdowns() {
         quickSelect.innerHTML = '<option value="/">/ (Root)</option>';
         folderList.forEach(f => {
             const fPath = typeof f === 'string' ? f : f.path;
-            if (fPath) {
+            const isManagedProfileFolder = typeof f !== 'string' && f.managed;
+            if (fPath && !isManagedProfileFolder) {
                 const opt = document.createElement('option');
                 opt.value = fPath;
                 opt.textContent = fPath;
                 quickSelect.appendChild(opt);
             }
         });
-        if (currentVal) quickSelect.value = currentVal;
+        if (currentVal && [...quickSelect.options].some((option) => option.value === currentVal)) {
+            quickSelect.value = currentVal;
+        } else {
+            quickSelect.value = '/';
+        }
     }
 }
 
@@ -2309,6 +2397,10 @@ async function loadDatabaseProfiles() {
                         <span class="meta-value">${escapeHtml(databaseScopeLabel(profile))}</span>
                     </div>
                     <div class="profile-meta-item">
+                        <span class="meta-label">Folder</span>
+                        <span class="meta-value" title="${escapeHtml(profile.folder || '/')}">${escapeHtml(profile.folder || '/')}</span>
+                    </div>
+                    <div class="profile-meta-item">
                         <span class="meta-label">Last run</span>
                         <span class="meta-value">${profile.lastRun ? new Date(profile.lastRun).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Never'}</span>
                     </div>
@@ -2409,24 +2501,15 @@ async function loadDatabaseProfiles() {
             edit.className = 'btn btn-ghost btn-sm';
             edit.textContent = 'Edit';
             edit.addEventListener('click', () => void openDatabaseSetup(profile));
+            const openBackups = document.createElement('button');
+            openBackups.className = 'btn btn-ghost btn-sm';
+            openBackups.textContent = 'Open Backups';
+            openBackups.addEventListener('click', () => openManagedProfileFolder(profile.folder));
             const remove = document.createElement('button');
             remove.className = 'btn btn-danger btn-sm';
             remove.textContent = 'Delete';
-            remove.addEventListener('click', async () => {
-                const confirmed = await confirmDialog(
-                    `Delete database backup "${profile.name}"? Its saved database password will also be removed. Existing encrypted snapshots stay in My Backups, but you must recreate a compatible database connection before you can restore them.`,
-                    { title: 'Delete database backup', kind: 'warning' },
-                );
-                if (!confirmed) return;
-                try {
-                    await invoke('cmd_delete_database_profile', { id: profile.id });
-                    showToast('Database backup removed.', 'success');
-                    loadDatabaseProfiles();
-                } catch (error) {
-                    showToast(friendlyError(error), 'error');
-                }
-            });
-            actions.append(run, edit, remove);
+            remove.addEventListener('click', () => openProfileDeleteModal(profile, 'database'));
+            actions.append(run, edit, openBackups, remove);
             container.appendChild(row);
         });
     } catch (error) {
@@ -2437,6 +2520,51 @@ async function loadDatabaseProfiles() {
 // ────────────────────────────────────────────────────────────────
 // Profiles
 // ────────────────────────────────────────────────────────────────
+function profileFolderName(name) {
+    const normalized = String(name || '')
+        .replaceAll('/', ' ')
+        .replaceAll('\\', ' ')
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .replace(/[^a-zA-Z0-9 _-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 50)
+        .trim();
+    return normalized && normalized !== '.' && normalized !== '..' ? normalized : 'Backup Profile';
+}
+
+function updateProfileFolderPreview() {
+    const preview = document.getElementById('profile-folder-preview');
+    if (!preview) return;
+    preview.textContent = `/${profileFolderName(document.getElementById('profile-name')?.value)}`;
+}
+
+function openManagedProfileFolder(folder) {
+    currentFolder = folder || '/';
+    navigateTo('backups');
+}
+
+function openProfileDeleteModal(profile, kind) {
+    pendingProfileDeletion = {
+        id: profile.id,
+        name: profile.name,
+        folder: profile.folder || '/',
+        kind,
+    };
+    document.getElementById('profile-delete-title').textContent = `Delete "${profile.name}"?`;
+    document.getElementById('profile-delete-copy').textContent = kind === 'database'
+        ? `The database connection and saved password will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every restore point.`
+        : `The schedule and profile settings will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every backup.`;
+    document.getElementById('profile-delete-backups').checked = false;
+    document.getElementById('profile-delete-modal').classList.remove('hidden');
+}
+
+function closeProfileDeleteModal() {
+    pendingProfileDeletion = null;
+    document.getElementById('profile-delete-modal').classList.add('hidden');
+    document.getElementById('profile-delete-backups').checked = false;
+}
+
 async function loadProfiles() {
     const container = document.getElementById('profiles-list');
     try {
@@ -2594,26 +2722,19 @@ async function loadProfiles() {
             editBtn.textContent = '✏️ Edit';
             editBtn.addEventListener('click', () => openProfileModal(p));
 
+            const openBackupsBtn = document.createElement('button');
+            openBackupsBtn.className = 'btn btn-ghost btn-sm';
+            openBackupsBtn.textContent = 'Open Backups';
+            openBackupsBtn.addEventListener('click', () => openManagedProfileFolder(p.folder));
+
             const deleteBtn = document.createElement('button');
             deleteBtn.className = 'btn btn-danger btn-sm';
             deleteBtn.textContent = '🗑️ Delete';
-            deleteBtn.addEventListener('click', async () => {
-                const confirmed = await confirmDialog(
-                    `Delete profile "${p.name}"?`,
-                    { title: 'Delete backup profile', kind: 'warning' },
-                );
-                if (!confirmed) return;
-                try {
-                    await invoke('cmd_delete_profile', { id: p.id });
-                    showToast('Profile deleted', 'success');
-                    loadProfiles();
-                } catch (err) {
-                    showToast(String(err), 'error');
-                }
-            });
+            deleteBtn.addEventListener('click', () => openProfileDeleteModal(p, 'file'));
 
             actions.appendChild(runBtn);
             actions.appendChild(editBtn);
+            actions.appendChild(openBackupsBtn);
             actions.appendChild(deleteBtn);
             container.appendChild(card);
         });
@@ -2648,20 +2769,15 @@ function openProfileModal(profile = null) {
             document.getElementById('profile-schedule-interval').value = 1;
         }
         document.getElementById('profile-retention').value = profile.retention || 0;
-        if (document.getElementById('profile-folder')) {
-            document.getElementById('profile-folder').value = profile.folder || '/';
-        }
     } else {
         title.textContent = 'Create Backup Profile';
         form.reset();
         document.getElementById('profile-edit-id').value = '';
         document.getElementById('profile-schedule-interval').value = 1;
-        if (document.getElementById('profile-folder')) {
-            document.getElementById('profile-folder').value = '/';
-        }
     }
 
     modal.classList.remove('hidden');
+    updateProfileFolderPreview();
     updateScheduleTimePreview();
 }
 

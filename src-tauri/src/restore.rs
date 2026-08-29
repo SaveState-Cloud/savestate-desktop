@@ -586,6 +586,10 @@ pub async fn cmd_list_backups(
                 "lastModified": snap.start_time,
                 "backupKind": snap.backup_kind,
                 "databaseProfileId": snap.database_profile_id,
+                "profileId": snap.profile_id,
+                "profileName": snap.profile_name,
+                "trigger": snap.trigger,
+                "versionNumber": snap.version_number,
             })
         })
         .collect();
