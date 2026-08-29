@@ -1395,22 +1395,25 @@ async function loadBackups() {
         subfolders.forEach(sf => {
             const card = document.createElement('div');
             card.className = 'folder-card';
-            card.innerHTML = `
+            const openButton = document.createElement('button');
+            openButton.type = 'button';
+            openButton.className = 'folder-card-open';
+            openButton.setAttribute('aria-label', `Open folder ${sf.name}`);
+            openButton.innerHTML = `
                 <span class="folder-card-icon">📁</span>
                 <div class="folder-card-name" title="${escapeHtml(sf.name)}">${escapeHtml(sf.name)}</div>
                 <div class="folder-card-count">${sf.itemCount} item${sf.itemCount !== 1 ? 's' : ''}</div>
                 ${sf.managed ? `<div class="folder-card-managed">${escapeHtml(sf.profileName || 'Backup profile')}</div>` : ''}
             `;
-            card.addEventListener('click', (e) => {
-                if (e.target.closest('.folder-card-delete')) return;
-                navigateToFolder(sf.path);
-            });
+            openButton.addEventListener('click', () => navigateToFolder(sf.path));
+            card.appendChild(openButton);
 
             // Delete folder button
             const delBtn = document.createElement('button');
             delBtn.className = 'folder-card-delete';
             delBtn.textContent = '✕';
             delBtn.title = 'Delete folder';
+            delBtn.setAttribute('aria-label', `Delete folder ${sf.name}`);
             delBtn.addEventListener('click', async (e) => {
                 e.stopPropagation();
                 const containedBackups = allBackups.filter((backup) => folderContainsPath(sf.path, backup.folder || '/'));
@@ -1507,6 +1510,7 @@ async function loadBackups() {
             restoreBtn.className = 'btn btn-primary btn-sm btn-icon';
             restoreBtn.textContent = '↗';
             restoreBtn.title = b.backupKind === 'database' ? 'Restore from the Databases page' : 'Restore backup';
+            restoreBtn.setAttribute('aria-label', restoreBtn.title);
             restoreBtn.addEventListener('click', () => {
                 if (b.backupKind === 'database') {
                     navigateTo('databases');
@@ -1521,6 +1525,7 @@ async function loadBackups() {
             moveBtn.className = 'btn btn-ghost btn-sm btn-icon';
             moveBtn.textContent = '→';
             moveBtn.title = 'Move to folder';
+            moveBtn.setAttribute('aria-label', `Move ${b.filename} to another folder`);
             moveBtn.addEventListener('click', () => openMoveModal(b));
 
             // Delete button
@@ -1528,6 +1533,7 @@ async function loadBackups() {
             deleteBtn.className = 'btn btn-danger btn-sm btn-icon';
             deleteBtn.textContent = '🗑';
             deleteBtn.title = 'Delete backup';
+            deleteBtn.setAttribute('aria-label', `Delete backup ${b.filename}`);
             deleteBtn.addEventListener('click', async () => {
                 const confirmed = await confirmDialog(
                     'Delete this backup permanently?',

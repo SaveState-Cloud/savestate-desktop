@@ -1693,12 +1693,28 @@ code {
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 1.25rem;
-  cursor: pointer;
   transition: var(--transition);
   text-align: center;
   position: relative;
   overflow: hidden;
+}
+
+.folder-card-open {
+  width: 100%;
+  min-height: 100%;
+  padding: 1.25rem;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: center;
+}
+
+.folder-card-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
 }
 
 .folder-card::before {
@@ -1772,13 +1788,20 @@ code {
   transition: var(--transition);
 }
 
-.folder-card:hover .folder-card-delete {
+.folder-card:hover .folder-card-delete,
+.folder-card:focus-within .folder-card-delete {
   opacity: 1;
 }
 
 .folder-card-delete:hover {
   background: var(--danger);
   color: #fff;
+}
+
+.folder-card-delete:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--text-primary);
+  outline-offset: 2px;
 }
 
 /* Context Actions in Backup Table Rows */

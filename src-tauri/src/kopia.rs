@@ -1683,8 +1683,31 @@ pub async fn prune_profile_snapshots(
     if keep_latest == 0 {
         return Ok(Vec::new());
     }
-    let mut snapshots: Vec<KopiaSnapshot> = list_snapshots(app, state)
-        .await?
+    let expired = expired_profile_snapshot_ids(
+        list_snapshots(app, state).await?,
+        profile_id,
+        profile_folder,
+        keep_latest,
+    );
+    for snapshot_id in &expired {
+        delete_snapshot(app, state, snapshot_id).await?;
+    }
+    if !expired.is_empty() {
+        schedule_storage_cleanup(app.clone());
+    }
+    Ok(expired)
+}
+
+fn expired_profile_snapshot_ids(
+    snapshots: Vec<KopiaSnapshot>,
+    profile_id: &str,
+    profile_folder: &str,
+    keep_latest: usize,
+) -> Vec<String> {
+    if keep_latest == 0 {
+        return Vec::new();
+    }
+    let mut snapshots: Vec<KopiaSnapshot> = snapshots
         .into_iter()
         .filter(|snapshot| {
             snapshot.profile_id.as_deref() == Some(profile_id)
@@ -1697,18 +1720,11 @@ pub async fn prune_profile_snapshots(
             .cmp(&left.version_number)
             .then_with(|| right.start_time.cmp(&left.start_time))
     });
-    let expired: Vec<String> = snapshots
+    snapshots
         .into_iter()
         .skip(keep_latest)
         .map(|snapshot| snapshot.id)
-        .collect();
-    for snapshot_id in &expired {
-        delete_snapshot(app, state, snapshot_id).await?;
-    }
-    if !expired.is_empty() {
-        schedule_storage_cleanup(app.clone());
-    }
-    Ok(expired)
+        .collect()
 }
 
 async fn list_snapshots_from_repository(
@@ -2856,8 +2872,8 @@ mod tests {
     use super::{
         backup_reliability_policy_args, begin_operation, cancel_restore, classify_kopia_error,
         clear_restore_cancellation, database_content_object_from_value,
-        ensure_restore_not_cancelled, execute_rollback_steps, parse_snapshot,
-        repository_is_missing, try_begin_update,
+        ensure_restore_not_cancelled, execute_rollback_steps, expired_profile_snapshot_ids,
+        parse_snapshot, repository_is_missing, try_begin_update,
     };
     use std::sync::{Arc, Mutex};
 
@@ -2891,6 +2907,38 @@ mod tests {
         assert_eq!(snapshot.id, "abc123");
         assert_eq!(snapshot.size, 1024);
         assert_eq!(snapshot.file_count, 3);
+    }
+
+    #[test]
+    fn profile_retention_never_prunes_versions_moved_out_of_the_managed_folder() {
+        let snapshot = |id: &str, profile_id: &str, folder: &str, version_number: u64| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "sourcePath": "C:\\Screenshots",
+                "startTime": format!("2026-08-{version_number:02}T10:00:00Z"),
+                "size": 100,
+                "fileCount": 1,
+                "folder": folder,
+                "profileId": profile_id,
+                "profileName": "Screenshots",
+                "trigger": "manual",
+                "versionNumber": version_number
+            }))
+            .unwrap()
+        };
+        let expired = expired_profile_snapshot_ids(
+            vec![
+                snapshot("newest", "profile-a", "/Screenshots", 4),
+                snapshot("middle", "profile-a", "/Screenshots", 3),
+                snapshot("saved-elsewhere", "profile-a", "/Tested working DB", 2),
+                snapshot("oldest", "profile-a", "/Screenshots", 1),
+                snapshot("other-profile", "profile-b", "/Screenshots", 99),
+            ],
+            "profile-a",
+            "/Screenshots",
+            2,
+        );
+        assert_eq!(expired, vec!["oldest"]);
     }
 
     #[test]

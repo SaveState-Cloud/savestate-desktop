@@ -10,6 +10,7 @@ const profiles = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'profiles.r
 const databases = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'databases.rs'), 'utf8');
 const backup = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'backup.rs'), 'utf8');
 const kopia = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'kopia.rs'), 'utf8');
+const styles = fs.readFileSync(path.join(root, 'src', 'styles.css'), 'utf8');
 
 test('profiles use an automatic folder instead of a user-selected destination', () => {
   assert.match(html, /id="profile-folder-preview"/);
@@ -48,4 +49,13 @@ test('quick backups keep root available and cannot target another managed profil
   assert.match(html, /id="quick-backup-folder"[\s\S]*?value="\/"/);
   assert.match(app, /const isManagedProfileFolder = typeof f !== 'string' && f\.managed/);
   assert.match(app, /managedByOtherProfile/);
+});
+
+test('folder and backup actions remain named and keyboard reachable', () => {
+  assert.match(app, /openButton\.className = 'folder-card-open'/);
+  assert.match(app, /openButton\.setAttribute\('aria-label', `Open folder \$\{sf\.name\}`\)/);
+  assert.match(app, /delBtn\.setAttribute\('aria-label', `Delete folder \$\{sf\.name\}`\)/);
+  assert.match(app, /moveBtn\.setAttribute\('aria-label', `Move \$\{b\.filename\} to another folder`\)/);
+  assert.match(styles, /\.folder-card-open:focus-visible/);
+  assert.match(styles, /\.folder-card:focus-within \.folder-card-delete/);
 });

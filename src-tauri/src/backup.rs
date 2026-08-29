@@ -756,7 +756,12 @@ pub async fn cmd_delete_folder(
             .map_err(|error| error.to_string())?;
         let database_profiles = db::list_database_profiles_for_account(&guard.db, &owner_account)
             .map_err(|error| error.to_string())?;
-        (guard.api.clone(), owner_account, file_profiles, database_profiles)
+        (
+            guard.api.clone(),
+            owner_account,
+            file_profiles,
+            database_profiles,
+        )
     };
     let deleted_snapshots = delete_snapshots_in_folder(&app, state.inner(), &name)
         .await

@@ -238,8 +238,8 @@ pub async fn cmd_update_profile(
             .ok_or_else(|| "Sign in before editing a backup profile".to_string())?;
         let existing = db::get_profile_for_account(&guard.db, &id, &owner_account)
             .map_err(|e| e.to_string())?;
-        let profiles = db::list_profiles_for_account(&guard.db, &owner_account)
-            .map_err(|e| e.to_string())?;
+        let profiles =
+            db::list_profiles_for_account(&guard.db, &owner_account).map_err(|e| e.to_string())?;
         let database_profiles =
             db::count_scheduled_database_profiles_for_account(&guard.db, &owner_account)
                 .map_err(|e| e.to_string())?;
@@ -335,8 +335,7 @@ pub async fn cmd_list_profiles(
             .account_scope()
             .ok_or_else(|| "Sign in before listing backup profiles".to_string())?;
         (
-            db::list_profiles_for_account(&guard.db, &owner_account)
-                .map_err(|e| e.to_string())?,
+            db::list_profiles_for_account(&guard.db, &owner_account).map_err(|e| e.to_string())?,
             guard.api.clone(),
         )
     };
