@@ -625,6 +625,51 @@
                         </div>
                     </div>
 
+                    <!-- Organization Installation -->
+                    <div class="settings-section glass-card" id="organization-installation-section">
+                        <div class="organization-installation-heading">
+                            <div>
+                                <h3>Organization installation</h3>
+                                <p id="organization-installation-status" class="text-muted" role="status" aria-live="polite">Checking connection…</p>
+                            </div>
+                            <button class="btn btn-primary btn-sm" type="button" id="btn-open-organization-enrollment" aria-expanded="false" aria-controls="organization-enrollment-form">Connect installation</button>
+                        </div>
+
+                        <form id="organization-enrollment-form" class="organization-enrollment-form hidden" autocomplete="off">
+                            <div class="form-group">
+                                <label for="organization-setup-token">One-time setup token</label>
+                                <p class="text-muted text-sm">Paste the token supplied by your hosting provider. You will review the organization and server before anything changes.</p>
+                                <div class="input-row">
+                                    <input type="password" id="organization-setup-token" required minlength="24" maxlength="256" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Paste setup token" />
+                                    <button class="btn btn-ghost btn-sm" type="submit" id="btn-review-organization-enrollment">Review</button>
+                                </div>
+                            </div>
+
+                            <p id="organization-enrollment-error" class="organization-enrollment-message organization-enrollment-error hidden" role="alert"></p>
+                            <p id="organization-enrollment-warning" class="organization-enrollment-message organization-enrollment-warning hidden" role="status"></p>
+
+                            <div id="organization-enrollment-preview" class="organization-enrollment-preview hidden" aria-live="polite">
+                                <div class="organization-preview-heading">
+                                    <span class="organization-preview-mark" aria-hidden="true">✓</span>
+                                    <div>
+                                        <strong>Confirm this installation</strong>
+                                        <p>The organization can manage entitlement and installation health. It never receives your password, recovery keys, or decrypted backups.</p>
+                                    </div>
+                                </div>
+                                <dl class="organization-preview-details">
+                                    <div><dt>Organization</dt><dd id="organization-preview-name"></dd></div>
+                                    <div><dt>Customer</dt><dd id="organization-preview-customer"></dd></div>
+                                    <div><dt>Server</dt><dd id="organization-preview-server"></dd></div>
+                                    <div><dt>Token expires</dt><dd id="organization-preview-expiry"></dd></div>
+                                </dl>
+                                <div class="organization-enrollment-actions">
+                                    <button class="btn btn-ghost btn-sm" type="button" id="btn-cancel-organization-enrollment">Cancel</button>
+                                    <button class="btn btn-primary btn-sm" type="button" id="btn-confirm-organization-enrollment">Connect installation</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+
                     <!-- Encryption Info -->
                     <div class="settings-section glass-card">
                         <h3>🔐 Encryption</h3>

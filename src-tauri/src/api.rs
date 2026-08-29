@@ -181,6 +181,67 @@ pub struct GenericSuccess {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentPreviewResponse {
+    pub enrollment: OrganizationEnrollmentPreview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentPreview {
+    pub organization: OrganizationEnrollmentOrganization,
+    pub customer: OrganizationEnrollmentCustomer,
+    pub installation: OrganizationEnrollmentInstallationPreview,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationEnrollmentOrganization {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentCustomer {
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentInstallationPreview {
+    pub server_label: String,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentRedeemResponse {
+    pub installation: OrganizationEnrollmentInstallation,
+    pub device_credential: String,
+    pub account_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationEnrollmentInstallation {
+    pub id: String,
+    pub server_label: String,
+    pub connected_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationBackupHeartbeat {
+    pub event_id: String,
+    pub status: String,
+    pub occurred_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+}
+
 /// Privacy-safe schedule metadata sent to Engine. Profile names and source
 /// paths are deliberately excluded.
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +290,29 @@ async fn parse_api_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", operation))
 }
 
+async fn parse_organization_enrollment_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        if let Ok(api_error) = serde_json::from_str::<ApiError>(&text) {
+            let code = api_error
+                .error
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "organization_enrollment_failed".to_string());
+            let message = api_error
+                .message
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("{} failed ({})", operation, status));
+            return Err(anyhow!("{}: {}", code, message));
+        }
+        return Err(anyhow!("{} failed ({})", operation, status));
+    }
+    serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", operation))
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Client
 // ────────────────────────────────────────────────────────────────────
@@ -237,6 +321,7 @@ async fn parse_api_json<T: serde::de::DeserializeOwned>(
 pub struct SaveStateClient {
     pub base_url: String,
     pub token: Option<String>,
+    pub installation_id: String,
     client: Client,
     transfer_client: Client,
 }
@@ -324,6 +409,7 @@ impl SaveStateClient {
         Self {
             base_url: "https://api.savestate.dk".to_string(),
             token: None,
+            installation_id,
             client: Client::builder()
                 .default_headers(default_headers)
                 .timeout(std::time::Duration::from_secs(600))
@@ -353,6 +439,72 @@ impl SaveStateClient {
             .as_ref()
             .map(|t| format!("Bearer {}", t))
             .ok_or_else(|| anyhow!("Not authenticated"))
+    }
+
+    pub async fn inspect_organization_installation(
+        &self,
+        setup_token: &str,
+    ) -> Result<OrganizationEnrollmentPreviewResponse> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/inspect",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header()?)
+            .json(&serde_json::json!({ "token": setup_token }))
+            .send()
+            .await
+            .context("Failed to inspect the organization installation")?;
+        parse_organization_enrollment_json(response, "Organization installation review").await
+    }
+
+    pub async fn redeem_organization_installation(
+        &self,
+        setup_token: &str,
+    ) -> Result<OrganizationEnrollmentRedeemResponse> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/redeem",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header()?)
+            .json(&serde_json::json!({
+                "token": setup_token,
+                "deviceId": self.installation_id,
+            }))
+            .send()
+            .await
+            .context("Failed to connect the organization installation")?;
+        parse_organization_enrollment_json(response, "Organization installation connection").await
+    }
+
+    pub async fn organization_installation_heartbeat(
+        &self,
+        device_credential: &str,
+        backup: Option<OrganizationBackupHeartbeat>,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/heartbeat",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {device_credential}"))
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&serde_json::json!({ "backup": backup }))
+            .send()
+            .await
+            .context("Failed to report organization installation health")?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        Err(anyhow!(
+            "Organization installation heartbeat failed ({status}): {text}"
+        ))
     }
 
     /// Best-effort metadata-only job lifecycle reporting. This is intentionally
@@ -1531,6 +1683,7 @@ pub struct EngineJobReporter {
     heartbeat_stage: Arc<Mutex<&'static str>>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     started_at: String,
+    organization_account_scope: Option<String>,
     finished: bool,
 }
 
@@ -1540,6 +1693,25 @@ impl EngineJobReporter {
         id: String,
         kind: &'static str,
         trigger: &'static str,
+    ) -> Self {
+        Self::start_with_organization_scope(api, id, kind, trigger, None)
+    }
+
+    pub fn start_backup(
+        api: SaveStateClient,
+        id: String,
+        trigger: &'static str,
+        account_scope: String,
+    ) -> Self {
+        Self::start_with_organization_scope(api, id, "backup", trigger, Some(account_scope))
+    }
+
+    fn start_with_organization_scope(
+        api: SaveStateClient,
+        id: String,
+        kind: &'static str,
+        trigger: &'static str,
+        organization_account_scope: Option<String>,
     ) -> Self {
         let started_at = chrono::Utc::now().to_rfc3339();
         api.report_job_event(
@@ -1589,6 +1761,7 @@ impl EngineJobReporter {
             heartbeat_stage,
             heartbeat_task: Some(heartbeat_task),
             started_at,
+            organization_account_scope,
             finished: false,
         }
     }
@@ -1654,6 +1827,21 @@ impl EngineJobReporter {
             error_message,
             &self.started_at,
         );
+        if self.kind == "backup" && matches!(status, "succeeded" | "failed") {
+            if let Some(account_scope) = self.organization_account_scope.as_deref() {
+                crate::organization_enrollment::queue_organization_installation_backup_heartbeat(
+                    &self.api,
+                    account_scope,
+                    OrganizationBackupHeartbeat {
+                        event_id: self.id.clone(),
+                        status: status.to_string(),
+                        occurred_at: chrono::Utc::now().to_rfc3339(),
+                        error_code: error_code.map(str::to_string),
+                        error_reason: error_message.map(str::to_string),
+                    },
+                );
+            }
+        }
         self.finished = true;
     }
 

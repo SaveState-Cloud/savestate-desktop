@@ -58,6 +58,7 @@ let databaseConnectionFingerprint = null;
 let databaseSelectedDatabases = new Set();
 let databaseSelectedTables = new Set();
 let pendingProfileDeletion = null;
+let organizationEnrollmentPreview = null;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -538,6 +539,16 @@ function setupEventListeners() {
     document.getElementById('btn-test-notification').addEventListener('click', testNotification);
     document.getElementById('btn-remove-webhook').addEventListener('click', removeWebhook);
     document.getElementById('btn-toggle-webhook-visibility').addEventListener('click', toggleWebhookVisibility);
+    document.getElementById('btn-open-organization-enrollment').addEventListener('click', openOrganizationEnrollment);
+    document.getElementById('organization-enrollment-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        void reviewOrganizationEnrollment();
+    });
+    document.getElementById('organization-setup-token').addEventListener('input', resetOrganizationEnrollmentPreview);
+    document.getElementById('btn-cancel-organization-enrollment').addEventListener('click', closeOrganizationEnrollment);
+    document.getElementById('btn-confirm-organization-enrollment').addEventListener('click', () => {
+        void confirmOrganizationEnrollment();
+    });
 
     // ── Folder Management ─────────────────────────────────────────
     document.getElementById('btn-create-folder').addEventListener('click', () => {
@@ -1014,6 +1025,24 @@ function friendlyError(error) {
     }
     if (lower.includes('database_unreachable')) {
         return 'SaveState could not reach the database. Check that MySQL or MariaDB is running and that the host and port are correct.';
+    }
+    if (lower.includes('setup_token_expired')) {
+        return 'This setup token has expired. Ask the organization for a new token.';
+    }
+    if (lower.includes('setup_token_used')) {
+        return 'This setup token has already been used. Ask the organization for a replacement if this PC is not connected.';
+    }
+    if (lower.includes('customer_approval_required')) {
+        return 'Approve the organization request for this account before connecting the installation.';
+    }
+    if (lower.includes('installation_disabled')) {
+        return 'This organization installation has been disabled. Contact the organization before trying again.';
+    }
+    if (lower.includes('device_already_connected')) {
+        return 'This SaveState app is already connected to an organization installation.';
+    }
+    if (lower.includes('storage_service_unavailable')) {
+        return 'The organization storage service is not ready yet. Contact the organization and try again.';
     }
     if (lower.includes('database_tool_not_found') || lower.includes('database_tool_invalid')) {
         return 'The configured MySQL or MariaDB tools could not be verified. Scan this PC again or choose their executable locations.';
@@ -2859,6 +2888,7 @@ function shortenPath(path) {
 // Settings — Notifications
 // ────────────────────────────────────────────────────────────────
 async function loadSettings() {
+    void loadOrganizationInstallationStatus();
     try {
         const settings = await invoke('cmd_get_settings');
         const webhookInput = document.getElementById('settings-webhook-url');
@@ -2876,6 +2906,125 @@ async function loadSettings() {
         document.getElementById('pref-backup-scheduled').checked = (prefs.backupScheduled ?? prefs.backup_scheduled) !== false;
     } catch {
         // Settings may not exist yet — that's OK
+    }
+}
+
+function setOrganizationEnrollmentMessage(message, kind = 'error') {
+    const error = document.getElementById('organization-enrollment-error');
+    const warning = document.getElementById('organization-enrollment-warning');
+    error.classList.add('hidden');
+    warning.classList.add('hidden');
+    if (!message) return;
+    const target = kind === 'warning' ? warning : error;
+    target.textContent = message;
+    target.classList.remove('hidden');
+}
+
+function renderOrganizationInstallationStatus(status) {
+    const connected = status?.connected === true;
+    const statusText = document.getElementById('organization-installation-status');
+    const openButton = document.getElementById('btn-open-organization-enrollment');
+    if (connected) {
+        statusText.textContent = `Connected to organization-managed storage for ${status.serverLabel || 'this server'}.`;
+        openButton.classList.add('hidden');
+        closeOrganizationEnrollment();
+        return;
+    }
+    statusText.textContent = 'Not connected. Use a one-time token from your hosting provider.';
+    openButton.classList.remove('hidden');
+}
+
+async function loadOrganizationInstallationStatus() {
+    try {
+        renderOrganizationInstallationStatus(await invoke('cmd_get_organization_installation_status'));
+    } catch {
+        document.getElementById('organization-installation-status').textContent = 'Connection status is unavailable right now.';
+    }
+}
+
+function openOrganizationEnrollment() {
+    const form = document.getElementById('organization-enrollment-form');
+    const button = document.getElementById('btn-open-organization-enrollment');
+    form.classList.remove('hidden');
+    button.setAttribute('aria-expanded', 'true');
+    setOrganizationEnrollmentMessage('');
+    document.getElementById('organization-setup-token').focus();
+}
+
+function resetOrganizationEnrollmentPreview() {
+    organizationEnrollmentPreview = null;
+    document.getElementById('organization-enrollment-preview').classList.add('hidden');
+    setOrganizationEnrollmentMessage('');
+}
+
+function closeOrganizationEnrollment() {
+    organizationEnrollmentPreview = null;
+    document.getElementById('organization-enrollment-form').classList.add('hidden');
+    document.getElementById('organization-enrollment-preview').classList.add('hidden');
+    document.getElementById('organization-setup-token').value = '';
+    document.getElementById('btn-open-organization-enrollment').setAttribute('aria-expanded', 'false');
+    setOrganizationEnrollmentMessage('');
+}
+
+function enrollmentDate(value) {
+    if (!value) return 'Unknown';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return 'Unknown';
+    return parsed.toLocaleString();
+}
+
+async function reviewOrganizationEnrollment() {
+    const token = document.getElementById('organization-setup-token').value.trim();
+    const button = document.getElementById('btn-review-organization-enrollment');
+    if (!token) {
+        setOrganizationEnrollmentMessage('Paste the one-time setup token first.');
+        return;
+    }
+    setOrganizationEnrollmentMessage('');
+    button.disabled = true;
+    button.textContent = 'Reviewing…';
+    try {
+        const result = await invoke('cmd_inspect_organization_installation', { token });
+        organizationEnrollmentPreview = result.enrollment;
+        document.getElementById('organization-preview-name').textContent = result.enrollment.organization.name;
+        document.getElementById('organization-preview-customer').textContent = result.enrollment.customer.displayName;
+        document.getElementById('organization-preview-server').textContent = result.enrollment.installation.serverLabel;
+        document.getElementById('organization-preview-expiry').textContent = enrollmentDate(result.enrollment.expiresAt);
+        document.getElementById('organization-enrollment-preview').classList.remove('hidden');
+    } catch (error) {
+        organizationEnrollmentPreview = null;
+        document.getElementById('organization-enrollment-preview').classList.add('hidden');
+        setOrganizationEnrollmentMessage(friendlyError(error));
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Review';
+    }
+}
+
+async function confirmOrganizationEnrollment() {
+    if (!organizationEnrollmentPreview) {
+        setOrganizationEnrollmentMessage('Review the setup token before connecting.');
+        return;
+    }
+    const token = document.getElementById('organization-setup-token').value.trim();
+    const button = document.getElementById('btn-confirm-organization-enrollment');
+    setOrganizationEnrollmentMessage('');
+    button.disabled = true;
+    button.textContent = 'Connecting…';
+    try {
+        const result = await invoke('cmd_redeem_organization_installation', { token });
+        renderOrganizationInstallationStatus(result);
+        if (result.persistenceWarning) {
+            setOrganizationEnrollmentMessage(result.persistenceWarning, 'warning');
+        } else {
+            showToast(`Organization installation connected for ${result.serverLabel}.`, 'success');
+        }
+        warmRepositoryInBackground();
+    } catch (error) {
+        setOrganizationEnrollmentMessage(friendlyError(error));
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Connect installation';
     }
 }
 

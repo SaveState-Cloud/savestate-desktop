@@ -79,6 +79,20 @@ fn clear_persisted_session() {
     let _ = std::fs::remove_file(legacy_creds_path());
 }
 
+pub(crate) fn refresh_remembered_session_token(
+    email: &str,
+    token: &str,
+    master_key: &[u8; 32],
+) -> Result<()> {
+    let Some((stored, _)) = load_session() else {
+        return Ok(());
+    };
+    if !stored.email.trim().eq_ignore_ascii_case(email.trim()) {
+        return Ok(());
+    }
+    save_session(email, token, master_key)
+}
+
 // Legacy password wrapper (read compatibility and initialize-once fallback).
 fn derive_wrapping_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
