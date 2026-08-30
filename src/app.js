@@ -1116,7 +1116,7 @@ function friendlyError(error) {
         return 'This folder is not empty. Move its backups and remove nested folders first.';
     }
     if (lower.includes('source_quota_exceeded') || lower.includes('backup data allowance exceeded')) {
-        return 'This backup would exceed the workspace’s original-data allowance. Remove an older backup, select a smaller source, or ask the workspace owner for more storage, then try again.';
+        return 'This backup was blocked by an outdated source-data quota check. Update SaveState and try again.';
     }
     if (lower.includes('optimized_storage_quota_exceeded')) {
         return raw.split(':').slice(1).join(':').trim() || 'Your optimized backup storage is full after cleanup. Remove an older backup or choose a larger plan, then try again.';
@@ -1303,15 +1303,18 @@ async function loadDashboard() {
             : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
         if (usage === null) {
             backupValue.textContent = 'Calculating…';
-            backupValue.title = 'Original backup size is being measured';
+            backupValue.title = 'Optimized encrypted storage is being measured';
             document.getElementById('usage-backup-meta').textContent = `${retained}${files}`;
         } else {
             backupValue.textContent = limitBytes > 0
                 ? `${formatBytes(usage)} of ${formatBytes(limitBytes)}`
                 : formatBytes(usage);
-            backupValue.title = `${usage.toLocaleString()} original bytes across restore points${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+            backupValue.title = `${usage.toLocaleString()} optimized encrypted repository bytes${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+            const sourceSummary = sourceStatistics.sourceBytes === null
+                ? 'Source data measurement pending'
+                : `${formatBytes(sourceStatistics.sourceBytes)} source data protected`;
             document.getElementById('usage-backup-meta').textContent =
-                `${usage.toLocaleString()} original bytes · ${retained}${files}`;
+                `${usage.toLocaleString()} optimized bytes · ${sourceSummary} · ${retained}${files}`;
         }
         document.getElementById('backup-fill').style.width = `${pct}%`;
         document.getElementById('backup-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;

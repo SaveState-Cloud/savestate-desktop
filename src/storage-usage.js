@@ -3,10 +3,12 @@
     if (typeof module === 'object' && module.exports) module.exports = api;
     if (root) root.SaveStateStorageUsage = api;
 })(typeof window !== 'undefined' ? window : globalThis, function createStorageUsage() {
-    // Customers are measured only by the original data represented by their
-    // retained restore points. Encrypted physical repository bytes are an
-    // operator-only capacity and safety metric.
+    // Plans are measured from the encrypted repository footprint after Kopia
+    // compression and deduplication. Original source bytes remain a separate
+    // protection statistic so customers can see how much data is recoverable.
     function customerVisibleUsage(usage, backupState) {
+        const optimizedBytes = optionalWholeNumber(usage?.bytes);
+        if (optimizedBytes !== null) return optimizedBytes;
         return sourceStatistics(usage, backupState).sourceBytes;
     }
 
