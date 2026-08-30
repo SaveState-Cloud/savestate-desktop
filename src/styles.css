@@ -2163,6 +2163,10 @@ code {
 }
 
 .backup-name-cell {
+  vertical-align: middle;
+}
+
+.backup-name-content {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
