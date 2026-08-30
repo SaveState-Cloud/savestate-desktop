@@ -1119,6 +1119,11 @@ pub async fn backup_paths_with_operation(
         }
         Err(error) => {
             engine_job.fail_with_error("backup_failed", &error, None, None);
+            // Send the actionable failure chain as the terminal event. The
+            // command rejection carries the same detail, so the UI de-duplicates
+            // manual runs while scheduled runs still receive a useful message.
+            emit_progress(app, &op_id, "error", 0.0, &format!("{error:#}"));
+            terminal_progress.finish();
             Err(error)
         }
     }
@@ -1551,6 +1556,7 @@ pub async fn backup_stream_with_operation(
             Err(error)
         }
         Err(error) => {
+            emit_progress(app, &op_id, "error", 0.0, &format!("{error:#}"));
             emit_database_progress(
                 app,
                 profile_id,
@@ -1559,6 +1565,7 @@ pub async fn backup_stream_with_operation(
                 "Database backup failed. Check the error message and try again.",
             );
             engine_job.fail_with_error("database_backup_failed", &error, None, None);
+            terminal_progress.finish();
             Err(error)
         }
     }

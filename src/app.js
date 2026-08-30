@@ -1116,7 +1116,7 @@ function friendlyError(error) {
         return 'This folder is not empty. Move its backups and remove nested folders first.';
     }
     if (lower.includes('source_quota_exceeded') || lower.includes('backup data allowance exceeded')) {
-        return 'Your retained backups exceed this plan’s original-data allowance. Remove an older backup or choose a larger plan, then try again.';
+        return 'This backup would exceed the workspace’s original-data allowance. Remove an older backup, select a smaller source, or ask the workspace owner for more storage, then try again.';
     }
     if (lower.includes('optimized_storage_quota_exceeded')) {
         return raw.split(':').slice(1).join(':').trim() || 'Your optimized backup storage is full after cleanup. Remove an older backup or choose a larger plan, then try again.';

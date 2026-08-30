@@ -1004,7 +1004,7 @@ pub async fn cmd_run_database_backup(
             .await;
         }
     }
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
