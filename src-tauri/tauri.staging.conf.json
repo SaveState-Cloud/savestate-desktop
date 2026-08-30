@@ -1,0 +1,22 @@
+{
+  "productName": "SaveState Vault Staging",
+  "identifier": "dk.savestate.vault.staging",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SaveState Vault Staging"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https://api-staging.savestate.dk https://*.backblazeb2.com https://*.r2.cloudflarestorage.com; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://api-staging.savestate.dk/updater/{{target}}/{{current_version}}"
+      ]
+    }
+  }
+}

@@ -11,15 +11,18 @@
   "homepage": "https://savestate.dk",
   "scripts": {
     "tauri": "tauri",
-    "dev": "tauri dev",
+    "dev": "cross-env SAVESTATE_ENVIRONMENT=development SAVESTATE_API_BASE_URL=https://api-dev.savestate.dk tauri dev --config src-tauri/tauri.development.conf.json",
     "test:ui": "node --test test/*.test.cjs",
     "bundle:kopia": "node scripts/bundle-kopia.mjs",
     "test:js": "node --test tests/*.test.cjs",
     "build": "node scripts/bundle-kopia.mjs && tauri build",
+    "build:development": "cross-env SAVESTATE_ENVIRONMENT=development SAVESTATE_API_BASE_URL=https://api-dev.savestate.dk node scripts/bundle-kopia.mjs && cross-env SAVESTATE_ENVIRONMENT=development SAVESTATE_API_BASE_URL=https://api-dev.savestate.dk tauri build --config src-tauri/tauri.development.conf.json",
+    "build:staging": "cross-env SAVESTATE_ENVIRONMENT=staging SAVESTATE_API_BASE_URL=https://api-staging.savestate.dk node scripts/bundle-kopia.mjs && cross-env SAVESTATE_ENVIRONMENT=staging SAVESTATE_API_BASE_URL=https://api-staging.savestate.dk tauri build --config src-tauri/tauri.staging.conf.json",
     "build:release": "node scripts/bundle-kopia.mjs && tauri build --config src-tauri/tauri.release.conf.json"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "cross-env": "^10.1.0"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

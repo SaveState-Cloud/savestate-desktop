@@ -2,11 +2,9 @@ name: Windows CI
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [development, staging, main]
   push:
-    branches:
-      - main
+    branches: [development, staging, main]
   workflow_dispatch:
 
 permissions:
