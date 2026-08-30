@@ -1,6 +1,6 @@
 use crate::api::{
-    OrganizationBackupHeartbeat, OrganizationEnrollmentPreviewResponse,
-    OrganizationEnrollmentRedeemResponse, SaveStateClient,
+    OrganizationAvailableInstallationsResponse, OrganizationBackupHeartbeat,
+    OrganizationEnrollmentPreviewResponse, OrganizationEnrollmentRedeemResponse, SaveStateClient,
 };
 use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Context, Result};
@@ -253,6 +253,35 @@ pub async fn cmd_inspect_organization_installation(
 }
 
 #[tauri::command]
+pub async fn cmd_list_available_organization_installations(
+    state: tauri::State<'_, AppStateWrapper>,
+) -> std::result::Result<OrganizationAvailableInstallationsResponse, String> {
+    let api = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|error| format!("Lock error: {error}"))?;
+        if guard.account_scope().is_none() {
+            return Err("Sign in and unlock this vault to view organization storage".into());
+        }
+        guard.api.clone()
+    };
+    api.available_organization_installations()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_connect_organization_installation(
+    state: tauri::State<'_, AppStateWrapper>,
+    installation_id: String,
+) -> std::result::Result<OrganizationInstallationConnection, String> {
+    connect_organization_installation(state.inner(), installation_id.trim())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn cmd_redeem_organization_installation(
     state: tauri::State<'_, AppStateWrapper>,
     token: String,
@@ -266,7 +295,36 @@ async fn redeem_organization_installation(
     state: &AppStateWrapper,
     token: &str,
 ) -> Result<OrganizationInstallationConnection> {
-    let (api, session_generation, account_email, master_key) = {
+    let (api, session_generation, account_email, master_key) = connection_context(state)?;
+    let response = api.redeem_organization_installation(token).await?;
+    finish_organization_installation_connection(
+        state,
+        response,
+        session_generation,
+        account_email,
+        master_key,
+    )
+}
+
+async fn connect_organization_installation(
+    state: &AppStateWrapper,
+    installation_id: &str,
+) -> Result<OrganizationInstallationConnection> {
+    let (api, session_generation, account_email, master_key) = connection_context(state)?;
+    let response = api
+        .connect_organization_installation(installation_id)
+        .await?;
+    finish_organization_installation_connection(
+        state,
+        response,
+        session_generation,
+        account_email,
+        master_key,
+    )
+}
+
+fn connection_context(state: &AppStateWrapper) -> Result<(SaveStateClient, u64, String, [u8; 32])> {
+    {
         let guard = state
             .0
             .lock()
@@ -277,17 +335,22 @@ async fn redeem_organization_installation(
         let master_key = guard.master_key.ok_or_else(|| {
             anyhow!("Unlock this vault before connecting an organization installation")
         })?;
-        (
+        Ok((
             guard.api.clone(),
             guard.session_generation,
             account_email,
             master_key,
-        )
-    };
+        ))
+    }
+}
 
-    let response: OrganizationEnrollmentRedeemResponse =
-        api.redeem_organization_installation(token).await?;
-
+fn finish_organization_installation_connection(
+    state: &AppStateWrapper,
+    response: OrganizationEnrollmentRedeemResponse,
+    session_generation: u64,
+    account_email: String,
+    master_key: [u8; 32],
+) -> Result<OrganizationInstallationConnection> {
     {
         let guard = state
             .0

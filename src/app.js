@@ -59,6 +59,8 @@ let databaseSelectedDatabases = new Set();
 let databaseSelectedTables = new Set();
 let pendingProfileDeletion = null;
 let organizationEnrollmentPreview = null;
+let organizationAvailableInstallations = [];
+let selectedOrganizationInstallationId = null;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -540,6 +542,9 @@ function setupEventListeners() {
     document.getElementById('btn-remove-webhook').addEventListener('click', removeWebhook);
     document.getElementById('btn-toggle-webhook-visibility').addEventListener('click', toggleWebhookVisibility);
     document.getElementById('btn-open-organization-enrollment').addEventListener('click', openOrganizationEnrollment);
+    document.getElementById('btn-connect-account-organization').addEventListener('click', () => {
+        void connectAccountOrganizationInstallation();
+    });
     document.getElementById('btn-paste-organization-token').addEventListener('click', () => {
         void pasteOrganizationSetupToken();
     });
@@ -1041,11 +1046,20 @@ function friendlyError(error) {
     if (lower.includes('installation_disabled')) {
         return 'This organization installation has been disabled. Contact the organization before trying again.';
     }
+    if (lower.includes('installation_not_found') || lower.includes('organization_assignment_not_found')) {
+        return 'This organization installation is no longer assigned to your account. Refresh or contact the organization.';
+    }
+    if (lower.includes('installation_already_connected')) {
+        return 'This organization installation is already connected to another SaveState app.';
+    }
     if (lower.includes('device_already_connected')) {
         return 'This SaveState app is already connected to an organization installation.';
     }
-    if (lower.includes('storage_service_unavailable')) {
+    if (lower.includes('storage_service_unavailable') || lower.includes('organization_service_unavailable')) {
         return 'The organization storage service is not ready yet. Contact the organization and try again.';
+    }
+    if (lower.includes('organization_service_provisioning_failed')) {
+        return 'SaveState could not prepare the organization storage right now. Try again shortly.';
     }
     if (lower.includes('database_tool_not_found') || lower.includes('database_tool_invalid')) {
         return 'The configured MySQL or MariaDB tools could not be verified. Scan this PC again or choose their executable locations.';
@@ -2923,18 +2937,116 @@ function renderOrganizationInstallationStatus(status) {
     if (connected) {
         statusText.textContent = `Connected to organization-managed storage for ${status.serverLabel || 'this server'}.`;
         openButton.classList.add('hidden');
+        document.getElementById('organization-account-enrollments').classList.add('hidden');
         closeOrganizationEnrollment();
         return;
     }
-    statusText.textContent = 'Not connected. Use a one-time token from your hosting provider.';
+    statusText.textContent = 'Checking this account for organization-managed storage…';
     openButton.classList.remove('hidden');
 }
 
 async function loadOrganizationInstallationStatus() {
     try {
-        renderOrganizationInstallationStatus(await invoke('cmd_get_organization_installation_status'));
-    } catch {
+        const status = await invoke('cmd_get_organization_installation_status');
+        renderOrganizationInstallationStatus(status);
+        if (!status?.connected) await loadAvailableOrganizationInstallations();
+    } catch (error) {
         document.getElementById('organization-installation-status').textContent = 'Connection status is unavailable right now.';
+        document.getElementById('btn-open-organization-enrollment').classList.remove('hidden');
+        setOrganizationEnrollmentMessage(friendlyError(error));
+    }
+}
+
+function renderAvailableOrganizationInstallations(installations) {
+    organizationAvailableInstallations = Array.isArray(installations) ? installations : [];
+    selectedOrganizationInstallationId = organizationAvailableInstallations[0]?.id || null;
+    const section = document.getElementById('organization-account-enrollments');
+    const list = document.getElementById('organization-account-installation-list');
+    const status = document.getElementById('organization-installation-status');
+    const connectButton = document.getElementById('btn-connect-account-organization');
+    list.replaceChildren();
+
+    if (organizationAvailableInstallations.length === 0) {
+        section.classList.add('hidden');
+        status.textContent = 'No organization installation is assigned to this account.';
+        connectButton.disabled = true;
+        return;
+    }
+
+    section.classList.remove('hidden');
+    status.textContent = organizationAvailableInstallations.length === 1
+        ? 'Organization-managed storage is ready to connect.'
+        : `${organizationAvailableInstallations.length} organization installations are ready to connect.`;
+    connectButton.disabled = false;
+
+    organizationAvailableInstallations.forEach((installation, index) => {
+        const label = document.createElement('label');
+        label.className = 'organization-account-installation';
+
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'organization-account-installation';
+        radio.value = installation.id;
+        radio.checked = index === 0;
+        radio.addEventListener('change', () => {
+            selectedOrganizationInstallationId = radio.value;
+        });
+
+        const copy = document.createElement('span');
+        copy.className = 'organization-account-installation-copy';
+        const title = document.createElement('strong');
+        title.textContent = installation.organizationName;
+        const detail = document.createElement('span');
+        detail.textContent = `${installation.customerName} · ${installation.serverLabel} · ${installation.platform}`;
+        copy.append(title, detail);
+
+        const quota = document.createElement('span');
+        quota.className = 'organization-account-installation-quota';
+        quota.textContent = `${formatBytes(installation.quotaBytes)} assigned`;
+        label.append(radio, copy, quota);
+        list.appendChild(label);
+    });
+}
+
+async function loadAvailableOrganizationInstallations() {
+    try {
+        const result = await invoke('cmd_list_available_organization_installations');
+        renderAvailableOrganizationInstallations(result.installations);
+    } catch (error) {
+        organizationAvailableInstallations = [];
+        selectedOrganizationInstallationId = null;
+        document.getElementById('organization-account-enrollments').classList.add('hidden');
+        document.getElementById('organization-installation-status').textContent = 'Organization assignments could not be loaded.';
+        setOrganizationEnrollmentMessage(friendlyError(error));
+    }
+}
+
+async function connectAccountOrganizationInstallation() {
+    if (!selectedOrganizationInstallationId) {
+        setOrganizationEnrollmentMessage('Choose an organization installation for this PC.');
+        return;
+    }
+    const button = document.getElementById('btn-connect-account-organization');
+    setOrganizationEnrollmentMessage('');
+    button.disabled = true;
+    button.textContent = 'Connecting…';
+    try {
+        const result = await invoke('cmd_connect_organization_installation', {
+            installationId: selectedOrganizationInstallationId,
+        });
+        renderOrganizationInstallationStatus(result);
+        if (result.persistenceWarning) {
+            setOrganizationEnrollmentMessage(result.persistenceWarning, 'warning');
+        } else {
+            showToast(`Organization installation connected for ${result.serverLabel}.`, 'success');
+        }
+        warmRepositoryInBackground();
+    } catch (error) {
+        setOrganizationEnrollmentMessage(friendlyError(error));
+        await loadAvailableOrganizationInstallations();
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Connect this PC';
     }
 }
 

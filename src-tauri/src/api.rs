@@ -232,6 +232,24 @@ pub struct OrganizationEnrollmentInstallation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OrganizationAvailableInstallationsResponse {
+    pub installations: Vec<OrganizationAvailableInstallation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationAvailableInstallation {
+    pub id: String,
+    pub organization_name: String,
+    pub customer_name: String,
+    pub server_label: String,
+    pub platform: String,
+    pub quota_bytes: u64,
+    pub service_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizationBackupHeartbeat {
     pub event_id: String,
     pub status: String,
@@ -457,6 +475,43 @@ impl SaveStateClient {
             .await
             .context("Failed to inspect the organization installation")?;
         parse_organization_enrollment_json(response, "Organization installation review").await
+    }
+
+    pub async fn available_organization_installations(
+        &self,
+    ) -> Result<OrganizationAvailableInstallationsResponse> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/organization/installations/available",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header()?)
+            .send()
+            .await
+            .context("Failed to find organization installations for this account")?;
+        parse_organization_enrollment_json(response, "Organization installation discovery").await
+    }
+
+    pub async fn connect_organization_installation(
+        &self,
+        installation_id: &str,
+    ) -> Result<OrganizationEnrollmentRedeemResponse> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/connect",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header()?)
+            .json(&serde_json::json!({
+                "installationId": installation_id,
+                "deviceId": self.installation_id,
+            }))
+            .send()
+            .await
+            .context("Failed to connect the organization installation")?;
+        parse_organization_enrollment_json(response, "Organization installation connection").await
     }
 
     pub async fn redeem_organization_installation(

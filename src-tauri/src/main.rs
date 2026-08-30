@@ -275,6 +275,8 @@ fn main() {
             notifications::cmd_test_notification,
             // Organization installation enrollment
             organization_enrollment::cmd_get_organization_installation_status,
+            organization_enrollment::cmd_list_available_organization_installations,
+            organization_enrollment::cmd_connect_organization_installation,
             organization_enrollment::cmd_inspect_organization_installation,
             organization_enrollment::cmd_redeem_organization_installation,
             // Updates
