@@ -983,7 +983,8 @@ pub async fn backup_paths_with_trigger(
     };
     let operation = backup_operations::begin(state, display_name)?;
     prepare_repository_for_backup(app, &operation).await?;
-    let result = backup_paths_with_operation(app, &operation, paths, trigger, folder, None).await;
+    let result =
+        backup_paths_with_operation(app, &operation, paths, trigger, folder, None, None).await;
     operation.finish_tracking().await;
     result
 }
@@ -995,6 +996,7 @@ pub async fn backup_paths_with_operation(
     trigger: &'static str,
     folder: &str,
     profile: Option<(&str, &str)>,
+    keep_latest: Option<usize>,
 ) -> Result<String> {
     let _operation_guard = begin_operation().await;
 
@@ -1065,7 +1067,12 @@ pub async fn backup_paths_with_operation(
         }
 
         engine_job.progress("manifest_sync");
-        if let Err(error) = upsert_manifest_snapshot(&operation.context.api, snapshot.clone()).await {
+        let retention = profile
+            .as_ref()
+            .and_then(|(profile_id, _)| keep_latest.map(|keep| (profile_id.as_str(), keep)));
+        if let Err(error) =
+            upsert_manifest_snapshot(&operation.context.api, snapshot.clone(), retention).await
+        {
             rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
             return Err(error.context("Snapshot creation was rolled back because its server manifest could not be synchronized"));
         }
@@ -1111,7 +1118,7 @@ pub async fn backup_paths_with_operation(
             Err(error)
         }
         Err(error) => {
-            engine_job.fail("backup_failed", None, None);
+            engine_job.fail_with_error("backup_failed", &error, None, None);
             Err(error)
         }
     }
@@ -1367,6 +1374,7 @@ pub async fn backup_stream_with_operation(
     profile_name: &str,
     trigger: &'static str,
     folder: &str,
+    keep_latest: Option<usize>,
 ) -> Result<String> {
     let _operation_guard = begin_operation().await;
     let folder = normalize_snapshot_folder(folder)?;
@@ -1498,7 +1506,12 @@ pub async fn backup_stream_with_operation(
             "Verifying encrypted snapshot…",
         );
         engine_job.progress("manifest_sync");
-        if let Err(error) = upsert_manifest_snapshot(&operation.context.api, snapshot.clone()).await
+        if let Err(error) = upsert_manifest_snapshot(
+            &operation.context.api,
+            snapshot.clone(),
+            keep_latest.map(|keep| (profile_id, keep)),
+        )
+        .await
         {
             rollback_uncommitted_snapshot(app, operation, &session, &snapshot.id, true).await?;
             return Err(error.context(
@@ -1545,7 +1558,7 @@ pub async fn backup_stream_with_operation(
                 0.0,
                 "Database backup failed. Check the error message and try again.",
             );
-            engine_job.fail("database_backup_failed", None, None);
+            engine_job.fail_with_error("database_backup_failed", &error, None, None);
             Err(error)
         }
     }
@@ -1863,11 +1876,12 @@ fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
 async fn upload_manifest_with_retry(
     api: &SaveStateClient,
     snapshots: &[KopiaSnapshot],
+    retention: Option<(&str, usize)>,
 ) -> Result<()> {
     let json = serde_json::to_string(snapshots)?;
     let mut last_error = None;
     for attempt in 1..=3 {
-        match api.upload_kopia_manifest(&json).await {
+        match api.upload_kopia_manifest(&json, retention).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let message = error.to_string();
@@ -1892,7 +1906,11 @@ async fn upload_manifest_with_retry(
     ))
 }
 
-async fn upsert_manifest_snapshot(api: &SaveStateClient, snapshot: KopiaSnapshot) -> Result<()> {
+async fn upsert_manifest_snapshot(
+    api: &SaveStateClient,
+    snapshot: KopiaSnapshot,
+    retention: Option<(&str, usize)>,
+) -> Result<()> {
     let _manifest_guard = manifest_update_lock().lock().await;
     let current = api.get_kopia_manifest().await?;
     let mut snapshots: Vec<KopiaSnapshot> =
@@ -1900,7 +1918,7 @@ async fn upsert_manifest_snapshot(api: &SaveStateClient, snapshot: KopiaSnapshot
     snapshots.retain(|item| item.id != snapshot.id);
     snapshots.push(snapshot);
     snapshots.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-    upload_manifest_with_retry(api, &snapshots).await
+    upload_manifest_with_retry(api, &snapshots, retention).await
 }
 
 async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> Result<()> {
@@ -1909,7 +1927,7 @@ async fn remove_manifest_snapshot(api: &SaveStateClient, snapshot_id: &str) -> R
     let mut snapshots: Vec<KopiaSnapshot> =
         serde_json::from_value(current).context("Invalid Kopia snapshot manifest")?;
     snapshots.retain(|item| item.id != snapshot_id);
-    upload_manifest_with_retry(api, &snapshots).await
+    upload_manifest_with_retry(api, &snapshots, None).await
 }
 
 fn database_content_object(
@@ -2902,7 +2920,7 @@ pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper
         AccountContext::capture(&guard)?
     };
     let snapshots = list_snapshots_from_repository(app, &context).await?;
-    upload_manifest_with_retry(&context.api, &snapshots).await
+    upload_manifest_with_retry(&context.api, &snapshots, None).await
 }
 
 #[cfg(test)]

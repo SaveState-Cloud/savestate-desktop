@@ -730,6 +730,20 @@ pub async fn run_profile_backup_with_context(
             ));
         }
 
+        // Finish any retention pass left incomplete by a prior interruption
+        // before creating another repository snapshot. This keeps the API's
+        // one-replacement quota grace bounded to a single in-flight version.
+        if profile.retention > 0 {
+            crate::kopia::prune_profile_snapshots_with_operation(
+                &app,
+                &operation,
+                &profile.id,
+                &profile.folder,
+                profile.retention as usize,
+            )
+            .await?;
+        }
+
         let backup_id = crate::kopia::backup_paths_with_operation(
             &app,
             &operation,
@@ -737,6 +751,7 @@ pub async fn run_profile_backup_with_context(
             trigger,
             &profile.folder,
             Some((&profile.id, &profile.name)),
+            (profile.retention > 0).then_some(profile.retention as usize),
         )
         .await?;
         if profile.retention > 0 {

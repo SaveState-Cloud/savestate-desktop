@@ -1709,15 +1709,25 @@ impl SaveStateClient {
             .context("Failed to parse folder list response")
     }
 
-    pub async fn upload_kopia_manifest(&self, manifest_json: &str) -> Result<()> {
+    pub async fn upload_kopia_manifest(
+        &self,
+        manifest_json: &str,
+        retention: Option<(&str, usize)>,
+    ) -> Result<()> {
         let url = format!("{}/backup/kopia-manifest", self.base_url);
         let auth = self.auth_header()?;
 
-        let resp = self
+        let mut request = self
             .client
             .post(&url)
             .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if let Some((profile_id, keep_latest)) = retention {
+            request = request
+                .header("X-SaveState-Profile-Id", profile_id)
+                .header("X-SaveState-Keep-Latest", keep_latest);
+        }
+        let resp = request
             .body(manifest_json.to_string())
             .send()
             .await
@@ -1997,6 +2007,33 @@ impl EngineJobReporter {
             Some(error_code),
             Some(&message),
         );
+    }
+
+    pub fn fail_with_error(
+        &mut self,
+        default_error_code: &'static str,
+        error: &anyhow::Error,
+        bytes: Option<u64>,
+        files: Option<u64>,
+    ) {
+        let detail = format!("{error:#}");
+        if detail.contains("SOURCE_QUOTA_EXCEEDED")
+            || detail.contains("Backup data allowance exceeded")
+        {
+            let stage = self.stage;
+            self.finish_with_message(
+                "failed",
+                stage,
+                bytes,
+                files,
+                Some("source_quota_exceeded"),
+                Some(
+                    "Backup could not be committed because the workspace source-data allowance would be exceeded after retention.",
+                ),
+            );
+            return;
+        }
+        self.fail(default_error_code, bytes, files);
     }
 }
 
