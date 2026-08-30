@@ -37,6 +37,8 @@ jobs:
       - run: npm audit --audit-level=high
       - run: npm run test:js
       - run: npm run test:ui
+      - name: Bundle Kopia
+        run: npm run bundle:kopia
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Build isolated environment app
         shell: pwsh
