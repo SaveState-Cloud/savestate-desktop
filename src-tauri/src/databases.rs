@@ -1081,6 +1081,16 @@ pub async fn run_database_backup_with_context(
             let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
             db::update_database_profile(&guard.db, &profile)?;
         }
+        if profile.retention > 0 {
+            crate::kopia::prune_profile_snapshots_with_operation(
+                &app,
+                &operation,
+                &profile.id,
+                &profile.folder,
+                profile.retention as usize,
+            )
+            .await?;
+        }
         let password = load_password(operation.account_scope(), profile_id)?;
         let connection = test_connection(
             &profile.connection_url,
@@ -1098,8 +1108,19 @@ pub async fn run_database_backup_with_context(
             &profile.name,
             trigger,
             &profile.folder,
+            (profile.retention > 0).then_some(profile.retention as usize),
         )
         .await?;
+        if profile.retention > 0 {
+            crate::kopia::prune_profile_snapshots_with_operation(
+                &app,
+                &operation,
+                &profile.id,
+                &profile.folder,
+                profile.retention as usize,
+            )
+            .await?;
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let next = crate::profiles::compute_next_run(profile.schedule.as_deref());
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
