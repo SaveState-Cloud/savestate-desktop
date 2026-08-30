@@ -15,13 +15,13 @@ test('profile command preserves nested API error codes for the UI', () => {
 });
 
 test('backup terminal event carries the actionable error and disarms the generic guard', () => {
-  const failureArm = kopia.match(/Err\(error\) => \{[\s\S]*?engine_job\.fail_with_error\("backup_failed"[\s\S]*?Err\(error\)\n\s*\}/)?.[0] || '';
+  const failureArm = kopia.match(/Err\(error\) => \{[\s\S]*?engine_job\.fail_with_error\("backup_failed"[\s\S]*?Err\(error\)\r?\n\s*\}/)?.[0] || '';
   assert.match(failureArm, /emit_progress\([\s\S]*?"error"[\s\S]*?format!\("\{error:#\}"\)/);
   assert.match(failureArm, /terminal_progress\.finish\(\)/);
 });
 
 test('database backups use the same detailed terminal failure contract', () => {
-  const failureArm = kopia.match(/Err\(error\) => \{\n\s*emit_progress\(app, &op_id, "error", 0\.0, &format!\("\{error:#\}"\)\);[\s\S]*?engine_job\.fail_with_error\("database_backup_failed"[\s\S]*?Err\(error\)\n\s*\}/)?.[0] || '';
+  const failureArm = kopia.match(/Err\(error\) => \{\r?\n\s*emit_progress\(app, &op_id, "error", 0\.0, &format!\("\{error:#\}"\)\);[\s\S]*?engine_job\.fail_with_error\("database_backup_failed"[\s\S]*?Err\(error\)\r?\n\s*\}/)?.[0] || '';
   assert.match(failureArm, /terminal_progress\.finish\(\)/);
 });
 
