@@ -9,6 +9,7 @@ mod db;
 mod incremental;
 mod kopia;
 mod notifications;
+mod organization_enrollment;
 mod profiles;
 mod restore;
 mod scheduler;
@@ -132,6 +133,29 @@ fn main() {
                 });
             });
 
+            // Organization device health is intentionally independent of the
+            // backup scheduler. A connected Windows app reports every five
+            // minutes even when no profile is currently due.
+            let heartbeat_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    loop {
+                        let state = heartbeat_handle.state::<AppStateWrapper>();
+                        if let Err(error) =
+                            organization_enrollment::send_organization_installation_heartbeat(
+                                state.inner(),
+                            )
+                            .await
+                        {
+                            eprintln!("Organization installation heartbeat failed: {error}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    }
+                });
+            });
+
             // ── System Tray ─────────────────────────────────────
             let open_item = MenuItemBuilder::with_id("open", "Open SaveState").build(app)?;
             let backup_item = MenuItemBuilder::with_id("backup_now", "Backup Now").build(app)?;
@@ -249,6 +273,10 @@ fn main() {
             notifications::cmd_save_settings,
             notifications::cmd_get_settings,
             notifications::cmd_test_notification,
+            // Organization installation enrollment
+            organization_enrollment::cmd_get_organization_installation_status,
+            organization_enrollment::cmd_inspect_organization_installation,
+            organization_enrollment::cmd_redeem_organization_installation,
             // Updates
             updates::cmd_install_update,
         ])

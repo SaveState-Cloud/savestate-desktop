@@ -1005,11 +1005,11 @@ pub async fn backup_paths_with_operation(
     let profile = profile.map(|(id, name)| (id.to_string(), name.to_string()));
 
     let op_id = uuid::Uuid::new_v4().to_string();
-    let mut engine_job = EngineJobReporter::start(
+    let mut engine_job = EngineJobReporter::start_backup(
         operation.context.api.clone(),
         op_id.clone(),
-        "backup",
         trigger,
+        operation.account_scope().to_string(),
     );
     let mut terminal_progress = TerminalProgressGuard::backup(app, &op_id);
     emit_progress(app, &op_id, "compressing", 0.1, "Connecting to repository…");
@@ -1371,11 +1371,11 @@ pub async fn backup_stream_with_operation(
     let _operation_guard = begin_operation().await;
     let folder = normalize_snapshot_folder(folder)?;
     let op_id = uuid::Uuid::new_v4().to_string();
-    let mut engine_job = EngineJobReporter::start(
+    let mut engine_job = EngineJobReporter::start_backup(
         operation.context.api.clone(),
         op_id.clone(),
-        "backup",
         trigger,
+        operation.account_scope().to_string(),
     );
     let mut terminal_progress = TerminalProgressGuard::backup(app, &op_id);
     emit_progress(
