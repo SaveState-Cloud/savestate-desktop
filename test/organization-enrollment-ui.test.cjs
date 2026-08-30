@@ -12,9 +12,12 @@ const enrollment = fs.readFileSync(
   'utf8',
 );
 
-test('Settings requires review and explicit confirmation before connecting', () => {
+test('Settings discovers account assignments first and keeps token enrollment as fallback', () => {
   for (const id of [
     'organization-installation-section',
+    'organization-account-enrollments',
+    'organization-account-installation-list',
+    'btn-connect-account-organization',
     'organization-setup-token',
     'btn-paste-organization-token',
     'btn-review-organization-enrollment',
@@ -28,12 +31,18 @@ test('Settings requires review and explicit confirmation before connecting', () 
     assert.match(html, new RegExp(`id=["']${id}["']`));
   }
   assert.match(html, /type="password"[^>]+id="organization-setup-token"|id="organization-setup-token"[^>]+type="password"/);
+  assert.match(html, /Storage assigned to your account/i);
+  assert.match(html, /Use setup token/i);
   assert.match(html, /review the organization and server before anything changes/i);
   assert.match(html, /never receives your password, recovery keys, or decrypted backups/i);
   assert.match(app, /cmd_inspect_organization_installation/);
   assert.match(app, /navigator\.clipboard\.readText\(\)/);
   assert.match(app, /if \(!organizationEnrollmentPreview\)/);
   assert.match(app, /cmd_redeem_organization_installation/);
+  assert.match(app, /cmd_list_available_organization_installations/);
+  assert.match(app, /cmd_connect_organization_installation/);
+  assert.match(api, /organization\/installations\/available/);
+  assert.match(api, /organization\/installations\/connect/);
 });
 
 test('successful redemption switches the service session and warms the repository', () => {
@@ -63,6 +72,8 @@ test('stable enrollment failures have short customer-facing messages', () => {
     'setup_token_used',
     'customer_approval_required',
     'installation_disabled',
+    'installation_not_found',
+    'installation_already_connected',
     'device_already_connected',
     'storage_service_unavailable',
   ]) {

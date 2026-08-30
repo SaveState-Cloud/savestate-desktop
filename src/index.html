@@ -623,22 +623,33 @@
                                 <h3>Organization installation</h3>
                                 <p id="organization-installation-status" class="text-muted" role="status" aria-live="polite">Checking connection…</p>
                             </div>
-                            <button class="btn btn-primary btn-sm" type="button" id="btn-open-organization-enrollment" aria-expanded="false" aria-controls="organization-enrollment-form">Connect installation</button>
+                            <button class="btn btn-ghost btn-sm hidden" type="button" id="btn-open-organization-enrollment" aria-expanded="false" aria-controls="organization-enrollment-form">Use setup token</button>
                         </div>
+
+                        <div id="organization-account-enrollments" class="organization-account-enrollments hidden" aria-live="polite">
+                            <div>
+                                <strong>Storage assigned to your account</strong>
+                                <p class="text-muted text-sm">Choose the installation for this PC. SaveState will connect it without sharing your password, recovery keys, or decrypted backups with the organization.</p>
+                            </div>
+                            <div id="organization-account-installation-list" class="organization-account-installation-list"></div>
+                            <div class="organization-enrollment-actions">
+                                <button class="btn btn-primary btn-sm" type="button" id="btn-connect-account-organization">Connect this PC</button>
+                            </div>
+                        </div>
+
+                        <p id="organization-enrollment-error" class="organization-enrollment-message organization-enrollment-error hidden" role="alert"></p>
+                        <p id="organization-enrollment-warning" class="organization-enrollment-message organization-enrollment-warning hidden" role="status"></p>
 
                         <form id="organization-enrollment-form" class="organization-enrollment-form hidden" autocomplete="off">
                             <div class="form-group">
-                                <label for="organization-setup-token">One-time setup token</label>
-                                <p class="text-muted text-sm">Paste the token supplied by your hosting provider. You will review the organization and server before anything changes.</p>
+                                <label for="organization-setup-token">Recovery setup token</label>
+                                <p class="text-muted text-sm">Use this only when the organization is not shown above. Paste the token supplied by your hosting provider; you will review the organization and server before anything changes.</p>
                                 <div class="input-row">
                                     <input type="password" id="organization-setup-token" required minlength="24" maxlength="256" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Paste setup token" />
                                     <button class="btn btn-ghost btn-sm" type="button" id="btn-paste-organization-token">Paste</button>
                                     <button class="btn btn-ghost btn-sm" type="submit" id="btn-review-organization-enrollment">Review</button>
                                 </div>
                             </div>
-
-                            <p id="organization-enrollment-error" class="organization-enrollment-message organization-enrollment-error hidden" role="alert"></p>
-                            <p id="organization-enrollment-warning" class="organization-enrollment-message organization-enrollment-warning hidden" role="status"></p>
 
                             <div id="organization-enrollment-preview" class="organization-enrollment-preview hidden" aria-live="polite">
                                 <div class="organization-preview-heading">
