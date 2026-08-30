@@ -1,3 +1,4 @@
+use crate::backup_operations::AccountContext;
 use crate::db::{self, DatabaseProfile};
 use crate::kopia::StreamSourceCommand;
 use crate::state::AppStateWrapper;
@@ -351,11 +352,29 @@ fn save_password(owner_account: &str, profile_id: &str, password: &str) -> Resul
 }
 
 fn load_password(owner_account: &str, profile_id: &str) -> Result<String> {
-    let secret = credential_entry(owner_account, profile_id)?
-        .get_secret()
-        .context(
-            "Database credentials are missing; edit the connection and enter the password again",
-        )?;
+    let secret = match credential_entry(owner_account, profile_id)?.get_secret() {
+        Ok(secret) => secret,
+        Err(primary_error) => {
+            let legacy_owner = owner_account
+                .split("::service:")
+                .next()
+                .unwrap_or(owner_account);
+            if legacy_owner == owner_account {
+                return Err(primary_error).context(
+                    "Database credentials are missing; edit the connection and enter the password again",
+                );
+            }
+            let legacy = credential_entry(legacy_owner, profile_id)?
+                .get_secret()
+                .context(
+                    "Database credentials are missing; edit the connection and enter the password again",
+                )?;
+            credential_entry(owner_account, profile_id)?
+                .set_secret(&legacy)
+                .context("Could not migrate database credentials into the selected workspace")?;
+            legacy
+        }
+    };
     let stored = String::from_utf8(secret).context("Stored database credentials are invalid")?;
     stored
         .strip_prefix("v1:")
@@ -366,6 +385,13 @@ fn load_password(owner_account: &str, profile_id: &str) -> Result<String> {
 pub(crate) fn delete_profile_password(owner_account: &str, profile_id: &str) {
     if let Ok(entry) = credential_entry(owner_account, profile_id) {
         let _ = entry.delete_credential();
+    }
+    if let Some(legacy_owner) = owner_account.split("::service:").next() {
+        if legacy_owner != owner_account {
+            if let Ok(entry) = credential_entry(legacy_owner, profile_id) {
+                let _ = entry.delete_credential();
+            }
+        }
     }
 }
 
@@ -1023,7 +1049,22 @@ pub async fn run_database_backup_inner(
     profile_id: &str,
     trigger: &'static str,
 ) -> Result<String> {
-    let operation = crate::backup_operations::begin(state, "Database backup")?;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+        AccountContext::capture(&guard)?
+    };
+    run_database_backup_with_context(app, state, profile_id, trigger, context).await
+}
+
+pub async fn run_database_backup_with_context(
+    app: tauri::AppHandle,
+    state: &AppStateWrapper,
+    profile_id: &str,
+    trigger: &'static str,
+    context: AccountContext,
+) -> Result<String> {
+    let operation =
+        crate::backup_operations::begin_with_context(state, context, "Database backup")?;
     crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
     let result: Result<String> = async {
         let mut profile = {

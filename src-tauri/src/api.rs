@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -179,6 +181,38 @@ pub struct UserSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenericSuccess {
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWorkspace {
+    pub id: String,
+    pub service_id: u64,
+    pub kind: String,
+    pub label: String,
+    pub organization_id: Option<String>,
+    pub customer_id: Option<String>,
+    pub plan: String,
+    pub service_status: String,
+    pub lifecycle_state: Option<String>,
+    pub storage_limit_bytes: u64,
+    pub profile_limit: u32,
+    pub unlimited: bool,
+    pub available: bool,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWorkspacesResponse {
+    pub workspaces: Vec<AccountWorkspace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWorkspaceSwitchResponse {
+    pub token: String,
+    pub workspace: AccountWorkspace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +486,14 @@ impl SaveStateClient {
         self.token = None;
     }
 
+    pub fn workspace_id(&self) -> Option<String> {
+        let payload = self.token.as_deref()?.split('.').nth(1)?;
+        let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        let service_id = claims.get("serviceId")?.as_u64()?;
+        (service_id > 0).then(|| format!("service:{service_id}"))
+    }
+
     fn auth_header(&self) -> Result<String> {
         self.token
             .as_ref()
@@ -711,6 +753,32 @@ impl SaveStateClient {
             .await
             .context("Failed to fetch account entitlements")?;
         parse_api_json(response, "Get account entitlements").await
+    }
+
+    pub async fn get_account_workspaces(&self) -> Result<AccountWorkspacesResponse> {
+        let response = self
+            .client
+            .get(format!("{}/account/workspaces", self.base_url))
+            .header("Authorization", self.auth_header()?)
+            .send()
+            .await
+            .context("Failed to fetch account workspaces")?;
+        parse_api_json(response, "Get account workspaces").await
+    }
+
+    pub async fn switch_account_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<AccountWorkspaceSwitchResponse> {
+        let response = self
+            .client
+            .post(format!("{}/account/workspaces/switch", self.base_url))
+            .header("Authorization", self.auth_header()?)
+            .json(&serde_json::json!({ "workspaceId": workspace_id }))
+            .send()
+            .await
+            .context("Failed to switch account workspace")?;
+        parse_api_json(response, "Switch account workspace").await
     }
 
     // ── Phase 1: Kopia repository session (short-lived B2 creds) ─────

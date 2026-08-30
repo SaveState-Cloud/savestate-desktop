@@ -1,5 +1,6 @@
 use crate::api::EngineScheduleSnapshot;
 use crate::backup;
+use crate::backup_operations::AccountContext;
 use crate::db::{self, BackupProfile, DatabaseProfile};
 use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Result};
@@ -539,18 +540,46 @@ pub fn report_schedule_snapshot(state: &AppStateWrapper) {
 }
 
 pub fn report_schedule_snapshot_from_profiles(state: &AppStateWrapper, profiles: &[BackupProfile]) {
-    let (api, owner_account, database_profiles) = {
+    let context = {
         let Ok(guard) = state.0.lock() else { return };
-        let Some(owner_account) = guard.account_scope() else {
+        let Ok(context) = AccountContext::capture(&guard) else {
             return;
         };
+        context
+    };
+    report_schedule_snapshot_for_context(state, &context, profiles);
+}
+
+pub fn report_schedule_snapshot_for_account_context(
+    state: &AppStateWrapper,
+    context: &AccountContext,
+) {
+    let profiles = {
+        let Ok(guard) = state.0.lock() else { return };
+        let Ok(profiles) = db::list_profiles_for_account(&guard.db, &context.account_scope) else {
+            return;
+        };
+        profiles
+    };
+    report_schedule_snapshot_for_context(state, context, &profiles);
+}
+
+pub fn report_schedule_snapshot_for_context(
+    state: &AppStateWrapper,
+    context: &AccountContext,
+    profiles: &[BackupProfile],
+) {
+    let owner_account = context.account_scope.clone();
+    let database_profiles = {
+        let Ok(guard) = state.0.lock() else { return };
         let Ok(database_profiles) =
             db::list_database_profiles_for_account(&guard.db, &owner_account)
         else {
             return;
         };
-        (guard.api.clone(), owner_account, database_profiles)
+        database_profiles
     };
+    let api = context.api.clone();
     let mut schedules: Vec<EngineScheduleSnapshot> = profiles
         .iter()
         .filter(|profile| profile.owner_account.as_deref() == Some(owner_account.as_str()))
@@ -655,7 +684,21 @@ pub async fn run_profile_backup_inner(
     profile_id: &str,
     trigger: &'static str,
 ) -> Result<String> {
-    let operation = crate::backup_operations::begin(state, "Backup profile")?;
+    let context = {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+        AccountContext::capture(&guard)?
+    };
+    run_profile_backup_with_context(app, state, profile_id, trigger, context).await
+}
+
+pub async fn run_profile_backup_with_context(
+    app: tauri::AppHandle,
+    state: &AppStateWrapper,
+    profile_id: &str,
+    trigger: &'static str,
+    context: AccountContext,
+) -> Result<String> {
+    let operation = crate::backup_operations::begin_with_context(state, context, "Backup profile")?;
     crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
     // Keep the full scheduled/profile workflow under one operation lease so
     // an update cannot slip into the gap between snapshot creation, retention,
@@ -697,9 +740,9 @@ pub async fn run_profile_backup_inner(
         )
         .await?;
         if profile.retention > 0 {
-            crate::kopia::prune_profile_snapshots(
+            crate::kopia::prune_profile_snapshots_with_operation(
                 &app,
-                state,
+                &operation,
                 &profile.id,
                 &profile.folder,
                 profile.retention as usize,

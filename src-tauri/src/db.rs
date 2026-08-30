@@ -619,6 +619,24 @@ pub fn claim_unowned_profiles(conn: &Connection, owner_account: &str) -> Result<
     Ok(changed as u64)
 }
 
+pub fn migrate_legacy_account_profiles_to_workspace(
+    conn: &Connection,
+    account_email: &str,
+    workspace_scope: &str,
+) -> Result<u64> {
+    let transaction = conn.unchecked_transaction()?;
+    let file_profiles = transaction.execute(
+        "UPDATE backup_profiles SET owner_account = ?1 WHERE lower(owner_account) = lower(?2)",
+        params![workspace_scope, account_email],
+    )?;
+    let database_profiles = transaction.execute(
+        "UPDATE database_profiles SET owner_account = ?1 WHERE lower(owner_account) = lower(?2)",
+        params![workspace_scope, account_email],
+    )?;
+    transaction.commit()?;
+    Ok((file_profiles + database_profiles) as u64)
+}
+
 /// Update just the last_run and next_run timestamps for a profile.
 pub fn update_profile_run_times(
     conn: &Connection,
