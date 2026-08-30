@@ -15,6 +15,7 @@ mod restore;
 mod scheduler;
 mod state;
 mod updates;
+mod workspaces;
 
 use state::{AppState, AppStateWrapper};
 use std::sync::Mutex;
@@ -279,6 +280,8 @@ fn main() {
             organization_enrollment::cmd_connect_organization_installation,
             organization_enrollment::cmd_inspect_organization_installation,
             organization_enrollment::cmd_redeem_organization_installation,
+            workspaces::cmd_list_account_workspaces,
+            workspaces::cmd_switch_account_workspace,
             // Updates
             updates::cmd_install_update,
         ])
@@ -380,304 +383,296 @@ async fn run_scheduler_tick(app_handle: &tauri::AppHandle) {
 
     // Remembered sessions restore both the token and encryption key. Leave
     // schedules pending until both are available.
-    let owner_account = state.0.lock().ok().and_then(|guard| guard.account_scope());
-    let Some(owner_account) = owner_account else {
-        return;
+    let contexts = match workspaces::scheduler_account_contexts(&state).await {
+        Ok(contexts) => contexts,
+        Err(_) => return,
     };
 
-    // Load all profiles
-    let (profiles, database_profiles) = {
-        let guard = match state.0.lock() {
-            Ok(g) => g,
-            Err(_) => return,
+    for context in contexts {
+        let owner_account = context.account_scope.clone();
+
+        // Load all profiles for this workspace. Personal and organization
+        // schedules stay isolated, but each remains active under one login.
+        let (profiles, database_profiles) = {
+            let guard = match state.0.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let Ok(profiles) = db::list_profiles_for_account(&guard.db, &owner_account) else {
+                continue;
+            };
+            let Ok(database_profiles) =
+                db::list_database_profiles_for_account(&guard.db, &owner_account)
+            else {
+                continue;
+            };
+            (profiles, database_profiles)
         };
-        let Ok(profiles) = db::list_profiles_for_account(&guard.db, &owner_account) else {
-            return;
-        };
-        let Ok(database_profiles) =
-            db::list_database_profiles_for_account(&guard.db, &owner_account)
-        else {
-            return;
-        };
-        (profiles, database_profiles)
-    };
 
-    profiles::report_schedule_snapshot_from_profiles(&state, &profiles);
+        profiles::report_schedule_snapshot_for_context(&state, &context, &profiles);
 
-    let now = chrono::Utc::now();
+        let now = chrono::Utc::now();
 
-    for profile in profiles {
-        if !scheduler::profile_is_due(&profile, now) {
-            continue;
-        }
-
-        // A needs-attention profile receives a fresh, bounded retry budget at
-        // its next regular occurrence. Missed occurrences are never replayed;
-        // this tick starts exactly one catch-up operation.
-        let previous_retry_count = if profile.schedule_state == "needs_attention" {
-            if let Ok(guard) = state.0.lock() {
-                let _ = db::begin_profile_attempt(&guard.db, &profile.id, &owner_account);
+        for profile in profiles {
+            if !scheduler::profile_is_due(&profile, now) {
+                continue;
             }
-            0
-        } else {
-            profile.retry_count
-        };
 
-        let result = profiles::run_profile_backup_inner(
-            app_handle.clone(),
-            &state,
-            &profile.id,
-            "scheduled",
-        )
-        .await;
-
-        // Send notification based on result
-        let api = {
-            match state.0.lock() {
-                Ok(g) => g.api.clone(),
-                Err(_) => continue,
-            }
-        };
-
-        match result {
-            Ok(backup_id) => {
-                let recovered = matches!(
-                    profile.schedule_state.as_str(),
-                    "retrying" | "needs_attention"
-                ) || previous_retry_count > 0;
-                notifications::send_backup_notification(
-                    &api,
-                    "backup_success",
-                    &profile.name,
-                    &if recovered {
-                        format!(
-                            "Scheduled backup recovered after an automatic retry. ID: {}",
-                            backup_id
-                        )
-                    } else {
-                        format!("Scheduled backup completed. ID: {}", backup_id)
-                    },
-                )
-                .await;
-            }
-            Err(e) => {
-                let error = e.to_string();
-                if error.contains("BACKUP_CANCELLED") {
-                    // Signing out is not a failed occurrence. Skip retries and
-                    // advance to the next normal cadence without changing the
-                    // last successful run timestamp.
-                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::advance_profile_after_cancellation(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_regular.as_deref(),
-                        );
-                    }
-                    profiles::report_schedule_snapshot(&state);
-                    continue;
+            // A needs-attention profile receives a fresh, bounded retry budget at
+            // its next regular occurrence. Missed occurrences are never replayed;
+            // this tick starts exactly one catch-up operation.
+            let previous_retry_count = if profile.schedule_state == "needs_attention" {
+                if let Ok(guard) = state.0.lock() {
+                    let _ = db::begin_profile_attempt(&guard.db, &profile.id, &owner_account);
                 }
-                let classification = scheduler::classify_schedule_failure(&error);
-                let bounded_error: String = error.chars().take(1_000).collect();
-                let next_retry_number = previous_retry_count + 1;
-                let retry_delay = classification
-                    .retryable
-                    .then(|| scheduler::retry_delay(&profile.id, next_retry_number))
-                    .flatten();
+                0
+            } else {
+                profile.retry_count
+            };
 
-                if let Some(delay) = retry_delay {
-                    let retry_at = (chrono::Utc::now() + delay).to_rfc3339();
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::schedule_profile_retry(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_retry_number,
-                            &retry_at,
-                            classification.code,
-                            &bounded_error,
-                        );
-                    }
-                    // Notify on the first failure only; intermediate retries
-                    // stay quiet and a later success produces recovery notice.
-                    if previous_retry_count == 0 {
-                        notifications::send_backup_notification(
-                            &api,
-                            "backup_failure",
-                            &profile.name,
-                            &format!(
-                                "Scheduled backup failed ({}). Automatic retry {} of {} is queued.",
-                                classification.code,
-                                next_retry_number,
-                                scheduler::MAX_SCHEDULE_RETRIES,
-                            ),
-                        )
-                        .await;
-                    }
-                } else {
-                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::mark_profile_needs_attention(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_regular.as_deref(),
-                            previous_retry_count,
-                            classification.code,
-                            &bounded_error,
-                        );
-                    }
+            let result = profiles::run_profile_backup_with_context(
+                app_handle.clone(),
+                &state,
+                &profile.id,
+                "scheduled",
+                context.clone(),
+            )
+            .await;
+
+            let api = context.api.clone();
+
+            match result {
+                Ok(backup_id) => {
+                    let recovered = matches!(
+                        profile.schedule_state.as_str(),
+                        "retrying" | "needs_attention"
+                    ) || previous_retry_count > 0;
                     notifications::send_backup_notification(
                         &api,
-                        "backup_failure",
+                        "backup_success",
                         &profile.name,
-                        &if classification.retryable {
+                        &if recovered {
                             format!(
-                                "Scheduled backup still failed after {} automatic retries ({}). It needs attention and will try again at the next regular time.",
-                                scheduler::MAX_SCHEDULE_RETRIES,
-                                classification.code,
+                                "Scheduled backup recovered after an automatic retry. ID: {}",
+                                backup_id
                             )
                         } else {
-                            format!(
-                                "Scheduled backup needs attention ({}). Automatic retries were stopped because user action is required.",
-                                classification.code,
-                            )
+                            format!("Scheduled backup completed. ID: {}", backup_id)
                         },
                     )
                     .await;
                 }
-            }
-        }
+                Err(e) => {
+                    let error = e.to_string();
+                    if error.contains("BACKUP_CANCELLED") {
+                        let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::advance_profile_after_cancellation(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_regular.as_deref(),
+                            );
+                        }
+                        profiles::report_schedule_snapshot_for_account_context(&state, &context);
+                        continue;
+                    }
+                    let classification = scheduler::classify_schedule_failure(&error);
+                    let bounded_error: String = error.chars().take(1_000).collect();
+                    let next_retry_number = previous_retry_count + 1;
+                    let retry_delay = classification
+                        .retryable
+                        .then(|| scheduler::retry_delay(&profile.id, next_retry_number))
+                        .flatten();
 
-        // Report the new future run, retry deadline, or needs-attention state
-        // immediately instead of waiting for the next minute tick.
-        profiles::report_schedule_snapshot(&state);
-    }
-
-    for profile in database_profiles {
-        if !databases::database_profile_is_due(&profile, now) {
-            continue;
-        }
-
-        let previous_retry_count = if profile.schedule_state == "needs_attention" {
-            if let Ok(guard) = state.0.lock() {
-                let _ = db::begin_database_profile_attempt(&guard.db, &profile.id, &owner_account);
-            }
-            0
-        } else {
-            profile.retry_count
-        };
-
-        let result = databases::run_database_backup_inner(
-            app_handle.clone(),
-            &state,
-            &profile.id,
-            "database_scheduled",
-        )
-        .await;
-        let api = match state.0.lock() {
-            Ok(guard) => guard.api.clone(),
-            Err(_) => continue,
-        };
-
-        match result {
-            Ok(backup_id) => {
-                let recovered = matches!(
-                    profile.schedule_state.as_str(),
-                    "retrying" | "needs_attention"
-                ) || previous_retry_count > 0;
-                notifications::send_backup_notification(
-                    &api,
-                    "backup_success",
-                    &profile.name,
-                    &if recovered {
-                        format!(
-                            "Scheduled database backup recovered after an automatic retry. ID: {}",
-                            backup_id
-                        )
+                    if let Some(delay) = retry_delay {
+                        let retry_at = (chrono::Utc::now() + delay).to_rfc3339();
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::schedule_profile_retry(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_retry_number,
+                                &retry_at,
+                                classification.code,
+                                &bounded_error,
+                            );
+                        }
+                        if previous_retry_count == 0 {
+                            notifications::send_backup_notification(
+                                &api,
+                                "backup_failure",
+                                &profile.name,
+                                &format!(
+                                    "Scheduled backup failed ({}). Automatic retry {} of {} is queued.",
+                                    classification.code,
+                                    next_retry_number,
+                                    scheduler::MAX_SCHEDULE_RETRIES,
+                                ),
+                            )
+                            .await;
+                        }
                     } else {
-                        format!("Scheduled database backup completed. ID: {}", backup_id)
-                    },
-                )
-                .await;
-            }
-            Err(error) => {
-                let error = error.to_string();
-                if error.contains("BACKUP_CANCELLED") {
-                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::advance_database_profile_after_cancellation(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_regular.as_deref(),
-                        );
+                        let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::mark_profile_needs_attention(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_regular.as_deref(),
+                                previous_retry_count,
+                                classification.code,
+                                &bounded_error,
+                            );
+                        }
+                        notifications::send_backup_notification(
+                            &api,
+                            "backup_failure",
+                            &profile.name,
+                            &if classification.retryable {
+                                format!(
+                                    "Scheduled backup still failed after {} automatic retries ({}). It needs attention and will try again at the next regular time.",
+                                    scheduler::MAX_SCHEDULE_RETRIES,
+                                    classification.code,
+                                )
+                            } else {
+                                format!(
+                                    "Scheduled backup needs attention ({}). Automatic retries were stopped because user action is required.",
+                                    classification.code,
+                                )
+                            },
+                        )
+                        .await;
                     }
-                    profiles::report_schedule_snapshot(&state);
-                    continue;
                 }
-                let classification = scheduler::classify_schedule_failure(&error);
-                let bounded_error: String = error.chars().take(1_000).collect();
-                let next_retry_number = previous_retry_count + 1;
-                let retry_delay = classification
-                    .retryable
-                    .then(|| scheduler::retry_delay(&profile.id, next_retry_number))
-                    .flatten();
+            }
 
-                if let Some(delay) = retry_delay {
-                    let retry_at = (chrono::Utc::now() + delay).to_rfc3339();
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::schedule_database_profile_retry(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_retry_number,
-                            &retry_at,
-                            classification.code,
-                            &bounded_error,
-                        );
+            profiles::report_schedule_snapshot_for_account_context(&state, &context);
+        }
+
+        for profile in database_profiles {
+            if !databases::database_profile_is_due(&profile, now) {
+                continue;
+            }
+
+            let previous_retry_count = if profile.schedule_state == "needs_attention" {
+                if let Ok(guard) = state.0.lock() {
+                    let _ =
+                        db::begin_database_profile_attempt(&guard.db, &profile.id, &owner_account);
+                }
+                0
+            } else {
+                profile.retry_count
+            };
+
+            let result = databases::run_database_backup_with_context(
+                app_handle.clone(),
+                &state,
+                &profile.id,
+                "database_scheduled",
+                context.clone(),
+            )
+            .await;
+            let api = context.api.clone();
+
+            match result {
+                Ok(backup_id) => {
+                    let recovered = matches!(
+                        profile.schedule_state.as_str(),
+                        "retrying" | "needs_attention"
+                    ) || previous_retry_count > 0;
+                    notifications::send_backup_notification(
+                        &api,
+                        "backup_success",
+                        &profile.name,
+                        &if recovered {
+                            format!(
+                                "Scheduled database backup recovered after an automatic retry. ID: {}",
+                                backup_id
+                            )
+                        } else {
+                            format!("Scheduled database backup completed. ID: {}", backup_id)
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if error.contains("BACKUP_CANCELLED") {
+                        let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::advance_database_profile_after_cancellation(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_regular.as_deref(),
+                            );
+                        }
+                        profiles::report_schedule_snapshot_for_account_context(&state, &context);
+                        continue;
                     }
-                    if previous_retry_count == 0 {
+                    let classification = scheduler::classify_schedule_failure(&error);
+                    let bounded_error: String = error.chars().take(1_000).collect();
+                    let next_retry_number = previous_retry_count + 1;
+                    let retry_delay = classification
+                        .retryable
+                        .then(|| scheduler::retry_delay(&profile.id, next_retry_number))
+                        .flatten();
+
+                    if let Some(delay) = retry_delay {
+                        let retry_at = (chrono::Utc::now() + delay).to_rfc3339();
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::schedule_database_profile_retry(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_retry_number,
+                                &retry_at,
+                                classification.code,
+                                &bounded_error,
+                            );
+                        }
+                        if previous_retry_count == 0 {
+                            notifications::send_backup_notification(
+                                &api,
+                                "backup_failure",
+                                &profile.name,
+                                &format!(
+                                    "Scheduled database backup failed ({}). Automatic retry {} of {} is queued.",
+                                    classification.code,
+                                    next_retry_number,
+                                    scheduler::MAX_SCHEDULE_RETRIES,
+                                ),
+                            )
+                            .await;
+                        }
+                    } else {
+                        let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
+                        if let Ok(guard) = state.0.lock() {
+                            let _ = db::mark_database_profile_needs_attention(
+                                &guard.db,
+                                &profile.id,
+                                &owner_account,
+                                next_regular.as_deref(),
+                                previous_retry_count,
+                                classification.code,
+                                &bounded_error,
+                            );
+                        }
                         notifications::send_backup_notification(
                             &api,
                             "backup_failure",
                             &profile.name,
                             &format!(
-                                "Scheduled database backup failed ({}). Automatic retry {} of {} is queued.",
+                                "Scheduled database backup needs attention ({}). Open SaveState Vault to test the connection.",
                                 classification.code,
-                                next_retry_number,
-                                scheduler::MAX_SCHEDULE_RETRIES,
                             ),
                         )
                         .await;
                     }
-                } else {
-                    let next_regular = profiles::compute_next_run(profile.schedule.as_deref());
-                    if let Ok(guard) = state.0.lock() {
-                        let _ = db::mark_database_profile_needs_attention(
-                            &guard.db,
-                            &profile.id,
-                            &owner_account,
-                            next_regular.as_deref(),
-                            previous_retry_count,
-                            classification.code,
-                            &bounded_error,
-                        );
-                    }
-                    notifications::send_backup_notification(
-                        &api,
-                        "backup_failure",
-                        &profile.name,
-                        &format!(
-                            "Scheduled database backup needs attention ({}). Open SaveState Vault to test the connection.",
-                            classification.code,
-                        ),
-                    )
-                    .await;
                 }
             }
+            profiles::report_schedule_snapshot_for_account_context(&state, &context);
         }
-        profiles::report_schedule_snapshot(&state);
     }
 }

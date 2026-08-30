@@ -1602,11 +1602,19 @@ pub async fn delete_snapshot(
     state: &AppStateWrapper,
     snapshot_id: &str,
 ) -> Result<()> {
-    let _operation_guard = begin_operation().await;
     let context = {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
         AccountContext::capture(&guard)?
     };
+    delete_snapshot_with_context(app, &context, snapshot_id).await
+}
+
+async fn delete_snapshot_with_context(
+    app: &tauri::AppHandle,
+    context: &AccountContext,
+    snapshot_id: &str,
+) -> Result<()> {
+    let _operation_guard = begin_operation().await;
     let api = context.api.clone();
     let mut engine_job = EngineJobReporter::start(
         api.clone(),
@@ -1694,6 +1702,29 @@ pub async fn prune_profile_snapshots(
     }
     if !expired.is_empty() {
         schedule_storage_cleanup(app.clone());
+    }
+    Ok(expired)
+}
+
+pub async fn prune_profile_snapshots_with_operation(
+    app: &tauri::AppHandle,
+    operation: &BackupOperation,
+    profile_id: &str,
+    profile_folder: &str,
+    keep_latest: usize,
+) -> Result<Vec<String>> {
+    if keep_latest == 0 {
+        return Ok(Vec::new());
+    }
+    let manifest = operation.api().get_kopia_manifest().await?;
+    let snapshots: Vec<KopiaSnapshot> =
+        serde_json::from_value(manifest).context("Invalid kopia snapshot manifest")?;
+    let expired = expired_profile_snapshot_ids(snapshots, profile_id, profile_folder, keep_latest);
+    for snapshot_id in &expired {
+        delete_snapshot_with_context(app, &operation.context, snapshot_id).await?;
+    }
+    if !expired.is_empty() {
+        schedule_storage_cleanup_with_context(app.clone(), operation.context.clone());
     }
     Ok(expired)
 }
@@ -2672,10 +2703,6 @@ pub async fn prepare_repository_for_backup(
 /// blocked. Calls are coalesced and rate-limited because safe Kopia cleanup can
 /// require multiple maintenance cycles before remote objects are reclaimable.
 pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
-    if CLEANUP_RUNNING.swap(true, Ordering::AcqRel) {
-        return "running";
-    }
-
     let context = {
         let state = app.state::<AppStateWrapper>();
         let guard = match state.0.lock() {
@@ -2693,6 +2720,17 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
             }
         }
     };
+
+    schedule_storage_cleanup_with_context(app, context)
+}
+
+fn schedule_storage_cleanup_with_context(
+    app: tauri::AppHandle,
+    context: AccountContext,
+) -> &'static str {
+    if CLEANUP_RUNNING.swap(true, Ordering::AcqRel) {
+        return "running";
+    }
 
     if cleanup_within_cooldown(&context.account_scope) {
         CLEANUP_RUNNING.store(false, Ordering::Release);

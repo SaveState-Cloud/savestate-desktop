@@ -189,7 +189,7 @@ pub(crate) async fn send_organization_installation_heartbeat(
             .0
             .lock()
             .map_err(|error| anyhow!("Lock error: {error}"))?;
-        let Some(account_email) = guard.account_scope() else {
+        let Some(account_email) = guard.account_email() else {
             return Ok(());
         };
         (guard.api.clone(), account_email)
@@ -222,7 +222,7 @@ pub async fn cmd_get_organization_installation_status(
         .0
         .lock()
         .map_err(|error| format!("Lock error: {error}"))?
-        .account_scope();
+        .account_email();
     Ok(status_for_account(
         load_installation().as_ref(),
         account_email.as_deref(),
@@ -239,7 +239,7 @@ pub async fn cmd_inspect_organization_installation(
             .0
             .lock()
             .map_err(|error| format!("Lock error: {error}"))?;
-        if guard.account_scope().is_none() {
+        if guard.account_email().is_none() {
             return Err(
                 "Sign in and unlock this vault before connecting an organization installation"
                     .into(),
@@ -261,7 +261,7 @@ pub async fn cmd_list_available_organization_installations(
             .0
             .lock()
             .map_err(|error| format!("Lock error: {error}"))?;
-        if guard.account_scope().is_none() {
+        if guard.account_email().is_none() {
             return Err("Sign in and unlock this vault to view organization storage".into());
         }
         guard.api.clone()
@@ -329,7 +329,7 @@ fn connection_context(state: &AppStateWrapper) -> Result<(SaveStateClient, u64, 
             .0
             .lock()
             .map_err(|error| anyhow!("Lock error: {error}"))?;
-        let account_email = guard.account_scope().ok_or_else(|| {
+        let account_email = guard.account_email().ok_or_else(|| {
             anyhow!("Sign in and unlock this vault before connecting an organization installation")
         })?;
         let master_key = guard.master_key.ok_or_else(|| {
@@ -357,7 +357,7 @@ fn finish_organization_installation_connection(
             .lock()
             .map_err(|error| anyhow!("Lock error: {error}"))?;
         if guard.session_generation != session_generation
-            || guard.account_scope().as_deref() != Some(account_email.as_str())
+            || guard.account_email().as_deref() != Some(account_email.as_str())
         {
             return Err(anyhow!(
                 "The signed-in account changed while the installation was connecting"
@@ -381,7 +381,7 @@ fn finish_organization_installation_connection(
             .lock()
             .map_err(|error| anyhow!("Lock error: {error}"))?;
         if guard.session_generation != session_generation
-            || guard.account_scope().as_deref() != Some(account_email.as_str())
+            || guard.account_email().as_deref() != Some(account_email.as_str())
         {
             return Err(anyhow!(
                 "The signed-in account changed while the installation was connecting"

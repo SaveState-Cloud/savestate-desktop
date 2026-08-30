@@ -61,6 +61,9 @@ let pendingProfileDeletion = null;
 let organizationEnrollmentPreview = null;
 let organizationAvailableInstallations = [];
 let selectedOrganizationInstallationId = null;
+let accountWorkspaces = [];
+let workspaceSwitchInProgress = false;
+let workspaceUiGeneration = 0;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -545,6 +548,25 @@ function setupEventListeners() {
     document.getElementById('btn-connect-account-organization').addEventListener('click', () => {
         void connectAccountOrganizationInstallation();
     });
+
+    const workspaceTrigger = document.getElementById('workspace-trigger');
+    const workspaceMenu = document.getElementById('workspace-menu');
+    workspaceTrigger.addEventListener('click', () => {
+        if (workspaceSwitchInProgress) return;
+        const open = workspaceTrigger.getAttribute('aria-expanded') === 'true';
+        setWorkspaceMenuOpen(!open);
+    });
+    workspaceMenu.addEventListener('click', (event) => {
+        const option = event.target.closest('[data-workspace-id]');
+        if (!option || option.disabled) return;
+        void switchWorkspace(option.dataset.workspaceId);
+    });
+    document.addEventListener('click', (event) => {
+        if (!event.target.closest('.workspace-switcher')) setWorkspaceMenuOpen(false);
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') setWorkspaceMenuOpen(false);
+    });
     document.getElementById('btn-paste-organization-token').addEventListener('click', () => {
         void pasteOrganizationSetupToken();
     });
@@ -950,6 +972,80 @@ function endAuthenticatedSession() {
     repositorySessionGeneration += 1;
     repositoryWarmupPromise = null;
     legacyProfileNoticeShown = false;
+    accountWorkspaces = [];
+    workspaceSwitchInProgress = false;
+    workspaceUiGeneration += 1;
+    setWorkspaceMenuOpen(false);
+}
+
+function setWorkspaceMenuOpen(open) {
+    const trigger = document.getElementById('workspace-trigger');
+    const menu = document.getElementById('workspace-menu');
+    if (!trigger || !menu) return;
+    trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menu.classList.toggle('hidden', !open);
+}
+
+function workspaceIcon(workspace) {
+    return workspace.kind === 'organization'
+        ? '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 21h18M5 21V7l7-4 7 4v14M9 10h1m4 0h1m-6 4h1m4 0h1m-6 4h6"/></svg>'
+        : '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/></svg>';
+}
+
+function renderWorkspaceSwitcher() {
+    const current = accountWorkspaces.find((workspace) => workspace.current) || accountWorkspaces[0];
+    document.getElementById('workspace-current-label').textContent = current?.label || 'Workspace';
+    document.getElementById('workspace-current-kind').textContent = current
+        ? (current.kind === 'organization' ? 'Organization' : current.plan || 'Personal')
+        : 'Unavailable';
+    const menu = document.getElementById('workspace-menu');
+    menu.innerHTML = accountWorkspaces.map((workspace) => `
+        <button type="button" class="workspace-option" role="option"
+                data-workspace-id="${escapeHtml(workspace.id)}"
+                aria-selected="${workspace.current ? 'true' : 'false'}"
+                ${workspace.available && !workspaceSwitchInProgress ? '' : 'disabled'}>
+            <span class="workspace-option-icon">${workspaceIcon(workspace)}</span>
+            <span class="workspace-option-copy">
+                <strong>${escapeHtml(workspace.label)}</strong>
+                <small>${escapeHtml(workspace.kind === 'organization' ? workspace.plan : `Private · ${workspace.plan}`)}</small>
+            </span>
+            <span class="workspace-option-check">${workspace.current ? '✓' : ''}</span>
+        </button>
+    `).join('');
+}
+
+async function switchWorkspace(workspaceId) {
+    const target = accountWorkspaces.find((workspace) => workspace.id === workspaceId);
+    if (!target || target.current || !target.available || workspaceSwitchInProgress) {
+        setWorkspaceMenuOpen(false);
+        return;
+    }
+    workspaceSwitchInProgress = true;
+    renderWorkspaceSwitcher();
+    try {
+        await invoke('cmd_switch_account_workspace', { workspaceId });
+        workspaceUiGeneration += 1;
+        repositorySessionGeneration += 1;
+        repositoryWarmupPromise = null;
+        currentAccount = null;
+        currentFolder = '/';
+        folderList = [];
+        setWorkspaceMenuOpen(false);
+        showToast(`Switched to ${target.label}.`, 'success');
+        await Promise.all([
+            loadDashboard(),
+            loadSettings(),
+            loadProfiles(),
+            loadDatabaseProfiles(),
+            loadBackups(),
+        ]);
+        warmRepositoryInBackground();
+    } catch (error) {
+        showToast('Could not switch workspace: ' + friendlyError(error), 'error');
+    } finally {
+        workspaceSwitchInProgress = false;
+        renderWorkspaceSwitcher();
+    }
 }
 
 function warmRepositoryInBackground() {
@@ -1170,11 +1266,18 @@ function showToast(message, type = 'success') {
 // Dashboard
 // ────────────────────────────────────────────────────────────────
 async function loadDashboard() {
+    const generation = workspaceUiGeneration;
     try {
-        const [account, backupState] = await Promise.all([
+        const [workspaceResponse, account, backupState] = await Promise.all([
+            invoke('cmd_list_account_workspaces'),
             invoke('cmd_get_account'),
             invoke('cmd_list_backups').catch(() => null),
         ]);
+        if (generation !== workspaceUiGeneration) return;
+        accountWorkspaces = Array.isArray(workspaceResponse?.workspaces)
+            ? workspaceResponse.workspaces
+            : [];
+        renderWorkspaceSwitcher();
         currentAccount = account;
         document.getElementById('sidebar-email').textContent = account.email || '';
         document.getElementById('stat-email').textContent = account.email || '';

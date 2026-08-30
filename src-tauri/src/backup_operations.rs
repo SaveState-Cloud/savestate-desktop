@@ -304,6 +304,30 @@ impl Drop for LogoutGuard {
 pub fn begin(state: &AppStateWrapper, name: impl Into<String>) -> Result<BackupOperation> {
     let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
     let context = AccountContext::capture(&guard)?;
+    drop(guard);
+    begin_with_context(state, context, name)
+}
+
+/// Start an operation for a specific account workspace without changing the
+/// workspace selected in the UI. The scheduler uses this to keep every
+/// workspace's profiles running while one shared login remains active.
+pub fn begin_with_context(
+    state: &AppStateWrapper,
+    context: AccountContext,
+    name: impl Into<String>,
+) -> Result<BackupOperation> {
+    let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
+    let account_email = guard.account_email();
+    if !context_matches_session(
+        &context,
+        account_email.as_deref(),
+        guard.session_generation,
+        guard.master_key.is_some(),
+    ) {
+        return Err(anyhow!(
+            "The signed-in account changed before the backup started"
+        ));
+    }
     let registry = registry();
     let control = registry.register(name.into())?;
     drop(guard);
@@ -312,6 +336,21 @@ pub fn begin(state: &AppStateWrapper, name: impl Into<String>) -> Result<BackupO
         control,
         registry,
     })
+}
+
+fn context_matches_session(
+    context: &AccountContext,
+    account_email: Option<&str>,
+    session_generation: u64,
+    vault_unlocked: bool,
+) -> bool {
+    let expected_prefix =
+        account_email.map(|email| format!("{}::", email.trim().to_ascii_lowercase()));
+    vault_unlocked
+        && session_generation == context.session_generation
+        && expected_prefix
+            .as_deref()
+            .is_some_and(|prefix| context.account_scope.starts_with(prefix))
 }
 
 pub fn session_change_blocked() -> bool {
@@ -395,8 +434,46 @@ pub fn is_cancelled(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancellation_failures, stop_for_logout_in, Registry};
+    use super::{
+        cancellation_failures, context_matches_session, stop_for_logout_in, AccountContext,
+        Registry,
+    };
+    use crate::api::SaveStateClient;
     use std::sync::Arc;
+
+    #[test]
+    fn inactive_workspace_contexts_are_valid_only_for_the_same_login_session() {
+        let context = AccountContext {
+            api: SaveStateClient::new("test-installation".into()),
+            account_scope: "owner@example.com::service:22".into(),
+            repository_password: "secret".into(),
+            session_generation: 7,
+        };
+        assert!(context_matches_session(
+            &context,
+            Some("owner@example.com"),
+            7,
+            true
+        ));
+        assert!(!context_matches_session(
+            &context,
+            Some("other@example.com"),
+            7,
+            true
+        ));
+        assert!(!context_matches_session(
+            &context,
+            Some("owner@example.com"),
+            8,
+            true
+        ));
+        assert!(!context_matches_session(
+            &context,
+            Some("owner@example.com"),
+            7,
+            false
+        ));
+    }
 
     #[tokio::test]
     async fn logout_cancels_all_registered_backups_and_blocks_new_work() {
