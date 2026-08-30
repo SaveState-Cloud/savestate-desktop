@@ -1015,7 +1015,7 @@ function friendlyError(error) {
         return 'This folder is not empty. Move its backups and remove nested folders first.';
     }
     if (lower.includes('source_quota_exceeded') || lower.includes('backup data allowance exceeded')) {
-        return 'Your encrypted repository is full. SaveState will reclaim expired data before retrying; remove an older backup or choose a larger plan if it remains full.';
+        return 'Your retained backups exceed this plan’s original-data allowance. Remove an older backup or choose a larger plan, then try again.';
     }
     if (lower.includes('optimized_storage_quota_exceeded')) {
         return raw.split(':').slice(1).join(':').trim() || 'Your optimized backup storage is full after cleanup. Remove an older backup or choose a larger plan, then try again.';
@@ -1167,41 +1167,34 @@ async function loadDashboard() {
         document.getElementById('stat-email').title = account.email || '';
         document.getElementById('stat-plan').textContent = account.plan || 'No plan';
 
-        const usage = storageUsageUi.customerVisibleUsage(account.usage?.bytes, backupState);
         const sourceStatistics = storageUsageUi.sourceStatistics(account.usage, backupState);
-        const sourceUsage = sourceStatistics.sourceBytes;
-        const savings = storageUsageUi.savingsStatistics(account.usage, sourceUsage, usage);
+        const usage = storageUsageUi.customerVisibleUsage(account.usage, backupState);
         const limitGB = account.storageLimitGb || account.storageLimitGB || account.storage_limit_gb || 0;
         const reportedLimitBytes = Number(account.usage?.limitBytes);
         const limitBytes = Number.isSafeInteger(reportedLimitBytes) && reportedLimitBytes >= 0
             ? reportedLimitBytes
             : limitGB * 1024 * 1024 * 1024;
-        const pct = limitBytes > 0 ? Math.min(100, (usage / limitBytes) * 100) : 0;
+        const pct = usage !== null && limitBytes > 0
+            ? Math.min(100, (usage / limitBytes) * 100)
+            : 0;
         const backupValue = document.getElementById('usage-backup');
-        backupValue.textContent = limitBytes > 0
-            ? `${formatBytes(usage)} of ${formatBytes(limitBytes)}`
-            : formatBytes(usage);
-        backupValue.title = `${usage.toLocaleString()} encrypted repository bytes${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
-        document.getElementById('usage-backup-meta').textContent =
-            `${usage.toLocaleString()} physical bytes after compression and deduplication`;
         const retained = sourceStatistics.snapshotCount === null
             ? 'retained backups'
             : `${sourceStatistics.snapshotCount.toLocaleString()} retained ${sourceStatistics.snapshotCount === 1 ? 'backup' : 'backups'}`;
         const files = sourceStatistics.fileCount === null
             ? ''
             : ` · ${sourceStatistics.fileCount.toLocaleString()} files`;
-        const sourceValue = document.getElementById('usage-source');
-        const sourceMeta = document.getElementById('usage-source-meta');
-        if (sourceUsage === null) {
-            sourceValue.textContent = 'Calculating…';
-            sourceMeta.textContent = `${retained}${files}`;
+        if (usage === null) {
+            backupValue.textContent = 'Calculating…';
+            backupValue.title = 'Original backup size is being measured';
+            document.getElementById('usage-backup-meta').textContent = `${retained}${files}`;
         } else {
-            sourceValue.textContent = formatBytes(sourceUsage);
-            sourceValue.title = `${sourceUsage.toLocaleString()} original bytes across restore points`;
-            const savingsText = savings.savedBytes === null
-                ? ''
-                : ` · ${formatBytes(savings.savedBytes)} saved${savings.savingsPercent === null ? '' : ` (${savings.savingsPercent.toFixed(2)}%)`}`;
-            sourceMeta.textContent = `${retained}${files}${savingsText}`;
+            backupValue.textContent = limitBytes > 0
+                ? `${formatBytes(usage)} of ${formatBytes(limitBytes)}`
+                : formatBytes(usage);
+            backupValue.title = `${usage.toLocaleString()} original bytes across restore points${limitBytes > 0 ? ` of ${limitBytes.toLocaleString()} bytes` : ''}`;
+            document.getElementById('usage-backup-meta').textContent =
+                `${usage.toLocaleString()} original bytes · ${retained}${files}`;
         }
         document.getElementById('backup-fill').style.width = `${pct}%`;
         document.getElementById('backup-pct').textContent = `${pct < 1 && pct > 0 ? pct.toFixed(2) : Math.round(pct)}%`;
