@@ -673,7 +673,10 @@ pub async fn cmd_run_profile_backup(
             .await;
         }
     }
-    result.map_err(|error| error.to_string())
+    // `anyhow::Error::to_string()` only returns the outermost context. Keep the
+    // complete chain at the Tauri command boundary so stable API error codes
+    // such as SOURCE_QUOTA_EXCEEDED reach the UI formatter.
+    result.map_err(|error| format!("{error:#}"))
 }
 
 /// Inner implementation for running a profile backup.

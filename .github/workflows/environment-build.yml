@@ -1,0 +1,62 @@
+name: Windows development and staging builds
+
+on:
+  push:
+    branches: [development, staging]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment build to create
+        required: true
+        type: choice
+        options: [development, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: savestate-desktop-${{ github.event.inputs.environment || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    environment: ${{ github.event.inputs.environment || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Rust stable
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm run test:js
+      - run: npm run test:ui
+      - name: Bundle Kopia
+        run: npm run bundle:kopia
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build isolated environment app
+        shell: pwsh
+        run: |
+          $target = "${{ github.event.inputs.environment || github.ref_name }}"
+          if ($target -notin @("development", "staging")) {
+            throw "Unsupported desktop environment: $target"
+          }
+          if ($env:GITHUB_REF_NAME -ne $target) {
+            throw "$target builds must run from the $target branch"
+          }
+          npm run "build:$target"
+      - name: Upload internal installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: savestate-vault-${{ github.event.inputs.environment || github.ref_name }}-${{ github.sha }}
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

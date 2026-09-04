@@ -6,6 +6,16 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+const PRODUCTION_API_BASE_URL: &str = "https://api.savestate.dk";
+
+fn compiled_api_base_url() -> &'static str {
+    option_env!("SAVESTATE_API_BASE_URL").unwrap_or(PRODUCTION_API_BASE_URL)
+}
+
+fn compiled_environment() -> &'static str {
+    option_env!("SAVESTATE_ENVIRONMENT").unwrap_or("production")
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Response types
 // ────────────────────────────────────────────────────────────────────
@@ -458,8 +468,12 @@ impl SaveStateClient {
             HeaderName::from_static("x-savestate-platform"),
             HeaderValue::from_static(std::env::consts::OS),
         );
+        default_headers.insert(
+            HeaderName::from_static("x-savestate-environment"),
+            HeaderValue::from_static(compiled_environment()),
+        );
         Self {
-            base_url: "https://api.savestate.dk".to_string(),
+            base_url: compiled_api_base_url().to_string(),
             token: None,
             installation_id,
             client: Client::builder()
