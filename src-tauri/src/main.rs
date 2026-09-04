@@ -14,6 +14,7 @@ mod profiles;
 mod restore;
 mod scheduler;
 mod state;
+mod subprocess;
 mod updates;
 mod workspaces;
 

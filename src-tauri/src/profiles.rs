@@ -295,6 +295,9 @@ pub async fn cmd_delete_profile(
     id: String,
     delete_backups: Option<bool>,
 ) -> std::result::Result<(), String> {
+    let engine = crate::kopia::begin_operation()
+        .await
+        .map_err(|error| error.to_string())?;
     let (owner_account, api, profile) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
@@ -305,7 +308,7 @@ pub async fn cmd_delete_profile(
         (owner_account, guard.api.clone(), profile)
     };
     if delete_backups.unwrap_or(false) {
-        crate::backup::delete_snapshots_in_folder(&app, state.inner(), &profile.folder)
+        crate::backup::delete_snapshots_in_folder(&app, &engine, state.inner(), &profile.folder)
             .await
             .map_err(|error| error.to_string())?;
         api.delete_folder(&profile.folder)
@@ -707,7 +710,7 @@ pub async fn run_profile_backup_with_context(
     // an update cannot slip into the gap between snapshot creation, retention,
     // and recording the next run time. Pressure maintenance above must run
     // before this shared lease because maintenance requires exclusive access.
-    let _operation_guard = crate::kopia::begin_operation().await;
+    let engine = crate::kopia::begin_operation().await?;
     let result: Result<String> = async {
         let mut profile = {
             let guard = state.0.lock().map_err(|e| anyhow!("Lock: {}", e))?;
@@ -739,6 +742,7 @@ pub async fn run_profile_backup_with_context(
         if profile.retention > 0 {
             crate::kopia::prune_profile_snapshots_with_operation(
                 &app,
+                &engine,
                 &operation,
                 &profile.id,
                 &profile.folder,
@@ -749,6 +753,7 @@ pub async fn run_profile_backup_with_context(
 
         let backup_id = crate::kopia::backup_paths_with_operation(
             &app,
+            &engine,
             &operation,
             vec![profile.source_path.clone()],
             trigger,
@@ -760,6 +765,7 @@ pub async fn run_profile_backup_with_context(
         if profile.retention > 0 {
             crate::kopia::prune_profile_snapshots_with_operation(
                 &app,
+                &engine,
                 &operation,
                 &profile.id,
                 &profile.folder,

@@ -15,6 +15,21 @@ pub struct AccountContext {
 }
 
 impl AccountContext {
+    pub fn ensure_current(&self, state: &AppStateWrapper) -> Result<()> {
+        let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+        if !context_matches_session(
+            self,
+            guard.account_email().as_deref(),
+            guard.session_generation,
+            guard.master_key.is_some(),
+        ) {
+            return Err(anyhow!(
+                "The signed-in account changed before the operation started"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn capture(state: &AppState) -> Result<Self> {
         let account_scope = state
             .account_scope()
@@ -48,6 +63,19 @@ pub struct BackupControl {
 }
 
 impl BackupControl {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Arc<Self> {
+        Arc::new(Self::new(
+            "disposable-fixture".into(),
+            "Local integration test".into(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cancel_fixture(&self) {
+        self.request_cancel().await;
+    }
+
     fn new(id: String, name: String) -> Self {
         Self {
             id,
@@ -144,6 +172,7 @@ impl BackupControl {
 struct RegistryState {
     active: HashMap<String, Arc<BackupControl>>,
     pending_logout: Option<String>,
+    session_transition: bool,
 }
 
 #[derive(Default)]
@@ -157,9 +186,9 @@ impl Registry {
             .state
             .lock()
             .map_err(|error| anyhow!("Backup registry lock: {}", error))?;
-        if state.pending_logout.is_some() {
+        if state.pending_logout.is_some() || state.session_transition {
             return Err(anyhow!(
-                "Sign-out is stopping active backups; wait before starting another backup"
+                "The account is changing or signing out; wait before starting another backup"
             ));
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -179,7 +208,7 @@ impl Registry {
             .state
             .lock()
             .map_err(|error| anyhow!("Backup registry lock: {}", error))?;
-        if state.pending_logout.is_some() {
+        if state.pending_logout.is_some() || state.session_transition {
             return Err(anyhow!("Sign-out is already in progress"));
         }
         let token = uuid::Uuid::new_v4().to_string();
@@ -353,12 +382,53 @@ fn context_matches_session(
             .is_some_and(|prefix| context.account_scope.starts_with(prefix))
 }
 
-pub fn session_change_blocked() -> bool {
-    registry()
-        .state
-        .lock()
-        .map(|state| state.pending_logout.is_some() || !state.active.is_empty())
-        .unwrap_or(true)
+/// Hold both admission barriers across the entire account/workspace change,
+/// including API awaits. Lock acquisition never waits while holding registry state.
+pub struct SessionChangeGuard<'a> {
+    registry: Arc<Registry>,
+    _engine: tokio::sync::RwLockWriteGuard<'a, ()>,
+}
+
+impl Drop for SessionChangeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.registry.state.lock() {
+            state.session_transition = false;
+        }
+    }
+}
+
+fn begin_session_change_in<'a>(
+    registry: Arc<Registry>,
+    acquire_engine: impl FnOnce() -> Result<tokio::sync::RwLockWriteGuard<'a, ()>>,
+) -> Result<SessionChangeGuard<'a>> {
+    {
+        let mut state = registry
+            .state
+            .lock()
+            .map_err(|error| anyhow!("Backup registry lock: {error}"))?;
+        if state.pending_logout.is_some() || state.session_transition || !state.active.is_empty() {
+            return Err(anyhow!(
+                "Wait for active operations or sign-out before changing accounts or workspaces"
+            ));
+        }
+        state.session_transition = true;
+    }
+    match acquire_engine() {
+        Ok(engine) => Ok(SessionChangeGuard {
+            registry,
+            _engine: engine,
+        }),
+        Err(error) => {
+            if let Ok(mut state) = registry.state.lock() {
+                state.session_transition = false;
+            }
+            Err(error)
+        }
+    }
+}
+
+pub fn begin_session_change() -> Result<SessionChangeGuard<'static>> {
+    begin_session_change_in(registry(), crate::kopia::try_begin_update)
 }
 
 pub fn prepare_logout() -> Result<PreparedLogout> {
@@ -434,12 +504,63 @@ pub fn is_cancelled(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::begin_session_change_in;
     use super::{
         cancellation_failures, context_matches_session, stop_for_logout_in, AccountContext,
         Registry,
     };
     use crate::api::SaveStateClient;
     use std::sync::Arc;
+
+    #[test]
+    fn delayed_operation_rejects_replaced_or_signed_out_sessions() {
+        use crate::state::{AppState, AppStateWrapper};
+        use base64::Engine;
+        let mut state = AppState::new(
+            SaveStateClient::new("offline-fixture".into()),
+            rusqlite::Connection::open_in_memory().unwrap(),
+        );
+        let claims =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"serviceId":12}"#);
+        state.api.set_token(format!("header.{claims}.signature"));
+        state.email = Some("fixture@example.invalid".into());
+        state.master_key = Some([0; 32]);
+        let context = AccountContext::capture(&state).unwrap();
+        let state = AppStateWrapper(std::sync::Mutex::new(state));
+        assert!(context.ensure_current(&state).is_ok());
+        state.0.lock().unwrap().session_generation += 1;
+        assert!(context.ensure_current(&state).is_err());
+        state.0.lock().unwrap().session_generation -= 1;
+        state.0.lock().unwrap().api.clear_token();
+        assert!(context.ensure_current(&state).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_transition_excludes_backup_restore_and_concurrent_session_changes() {
+        let registry = Arc::new(Registry::default());
+        let engine = tokio::sync::RwLock::new(());
+        let acquire = || {
+            engine
+                .try_write()
+                .map_err(|_| anyhow::anyhow!("engine busy"))
+        };
+        let restore = engine.read().await;
+        assert!(begin_session_change_in(Arc::clone(&registry), acquire).is_err());
+        // A failed transition must not poison admission.
+        let backup = registry.register("backup".into()).unwrap();
+        drop(restore);
+        assert!(begin_session_change_in(Arc::clone(&registry), acquire).is_err());
+        registry.unregister(&backup.id);
+        let transition = begin_session_change_in(Arc::clone(&registry), acquire).unwrap();
+        tokio::task::yield_now().await; // Represents an in-flight workspace API request.
+        assert!(registry.register("late backup".into()).is_err());
+        assert!(registry.prepare_logout().is_err());
+        assert!(engine.try_read().is_err());
+        assert!(begin_session_change_in(Arc::clone(&registry), acquire).is_err());
+        drop(transition);
+        assert!(engine.try_read().is_ok());
+        assert!(registry.register("new account backup".into()).is_ok());
+    }
 
     #[test]
     fn inactive_workspace_contexts_are_valid_only_for_the_same_login_session() {

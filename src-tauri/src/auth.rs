@@ -628,9 +628,7 @@ fn install_authenticated_state(
         .as_deref()
         .ok_or_else(|| anyhow!("The account session has no token"))?;
     let mut guard = state.0.lock().map_err(|e| anyhow!("Lock error: {e}"))?;
-    if crate::backup_operations::session_change_blocked() {
-        bail!("An active backup is still bound to the current account. Sign out and stop it before signing in to another account");
-    }
+    let _session_change = crate::backup_operations::begin_session_change()?;
     if remember_me {
         save_session(email, token, &master_key)?;
     } else {
@@ -652,9 +650,7 @@ fn install_pending_account_state(
     email: &str,
 ) -> Result<()> {
     let mut guard = state.0.lock().map_err(|e| anyhow!("Lock error: {e}"))?;
-    if crate::backup_operations::session_change_blocked() {
-        bail!("An active backup is still bound to the current account. Sign out and stop it before signing in to another account");
-    }
+    let _session_change = crate::backup_operations::begin_session_change()?;
     guard.api = api;
     guard.email = Some(email.to_string());
     guard.master_key = None;
@@ -992,6 +988,9 @@ pub async fn cmd_logout(
     let backup_guard = crate::backup_operations::stop_for_logout(&logout_token)
         .await
         .map_err(|error| error.to_string())?;
+    // Backups have reached a terminal state. Restores and maintenance are not
+    // cancellable through this logout flow, so leave the session intact if busy.
+    let _engine = crate::kopia::try_begin_update().map_err(|error| error.to_string())?;
     {
         let mut guard = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
         guard.api.clear_token();

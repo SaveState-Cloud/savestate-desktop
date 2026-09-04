@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "savestate-app"
-version = "2.0.32"
+version = "2.0.33"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3853,6 +3853,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "keyring",
+ "libc",
  "rand",
  "reqwest 0.12.28",
  "rusqlite",
@@ -3868,10 +3869,12 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

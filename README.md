@@ -39,8 +39,8 @@ The current Windows client provides:
   and latest-N snapshot retention;
 - optimized storage accounting based on the encrypted physical repository
   footprint, with separate source-data and optimization-savings statistics;
-- whole-snapshot and selective-file restore to an original or alternate
-  destination;
+- whole-snapshot restore into a new destination folder; selective-file restore
+  is not currently available;
 - Windows VSS in `when-available` mode, with normal traversal fallback and
   snapshot failure on file or directory read errors;
 - backup, restore, database, retry, maintenance, and quota status in the app
@@ -68,6 +68,9 @@ product sheet is available at
   logical consistency for every stateful application.
 - Native database integration currently covers MySQL and MariaDB. Other
   applications should use their vendor-supported dump or snapshot workflow.
+- Database restores apply SQL directly to the selected server. Cancellation
+  stops the import but does not roll back SQL already applied; restore into a
+  disposable database first and verify the recovered application.
 - A successful job confirms capture and storage. Customers should still test a
   representative restore and validate the recovered application.
 - Compression and deduplication savings depend on the workload.
@@ -128,6 +131,10 @@ npm run build
 
 `bundle:kopia` downloads the pinned Kopia release and verifies its SHA-256
 checksum before it is included in the application bundle.
+
+Run `npm run test:ui` and `npm run test:js` for frontend tests. Native process,
+concurrency, and database/Kopia integration coverage is described in
+[docs/NATIVE_DATABASE_TESTING.md](docs/NATIVE_DATABASE_TESTING.md).
 
 `npm run build` creates unsigned local installers. It does not promise that two
 independent builds will be bit-for-bit identical. Protected release automation

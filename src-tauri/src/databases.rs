@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 const DATABASE_CREDENTIAL_SERVICE: &str = "SaveState Vault Database";
 const SYSTEM_DATABASES: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
@@ -94,6 +94,15 @@ fn hidden_command(program: &Path) -> Command {
 }
 
 fn run_tool(program: &Path, args: &[OsString], password: Option<&str>) -> Result<Output> {
+    run_tool_cancellable(program, args, password, &|| false)
+}
+
+fn run_tool_cancellable(
+    program: &Path,
+    args: &[OsString],
+    password: Option<&str>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Output> {
     if !program.is_file() {
         return Err(anyhow!(
             "DATABASE_TOOL_NOT_FOUND: {} does not exist",
@@ -101,17 +110,11 @@ fn run_tool(program: &Path, args: &[OsString], password: Option<&str>) -> Result
         ));
     }
     let mut command = hidden_command(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args);
     if let Some(password) = password {
         command.env("MYSQL_PWD", password);
     }
-    command
-        .output()
-        .with_context(|| format!("Could not run database tool at {}", program.display()))
+    crate::subprocess::run(command, crate::subprocess::Limits::default(), cancelled)
 }
 
 fn command_error(output: &Output, fallback: &str) -> String {
@@ -153,6 +156,15 @@ fn test_connection(
     password: &str,
     client_executable: &Path,
 ) -> Result<DatabaseConnectionResult> {
+    test_connection_cancellable(connection_url, password, client_executable, &|| false)
+}
+
+fn test_connection_cancellable(
+    connection_url: &str,
+    password: &str,
+    client_executable: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DatabaseConnectionResult> {
     let target = parse_connection_url(connection_url)?;
     let mut args = client_connection_args(&target);
     args.extend([
@@ -161,7 +173,7 @@ fn test_connection(
         "--raw".into(),
         "--execute=SELECT VERSION(); SHOW DATABASES;".into(),
     ]);
-    let output = run_tool(client_executable, &args, Some(password))?;
+    let output = run_tool_cancellable(client_executable, &args, Some(password), cancelled)?;
     if !output.status.success() {
         let detail = command_error(&output, "The database did not accept the connection");
         let lower = detail.to_ascii_lowercase();
@@ -434,6 +446,21 @@ fn build_dump_command(
     password: &str,
     discovered_databases: &[String],
 ) -> Result<StreamSourceCommand> {
+    build_dump_command_cancellable(profile, password, discovered_databases, &|| false)
+}
+
+fn build_dump_command_cancellable(
+    profile: &DatabaseProfile,
+    password: &str,
+    discovered_databases: &[String],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<StreamSourceCommand> {
+    validate_selection(
+        &profile.selection_mode,
+        &profile.databases,
+        &profile.tables,
+        profile.include_new_databases,
+    )?;
     let target = parse_connection_url(&profile.connection_url)?;
     let dump_path = PathBuf::from(&profile.dump_executable);
     if !dump_path.is_file() {
@@ -442,10 +469,15 @@ fn build_dump_command(
             dump_path.display()
         ));
     }
-    if profile.include_users_and_grants && !dump_supports_user_grants(&dump_path) {
-        return Err(anyhow!(
-            "DATABASE_GRANTS_UNSUPPORTED: This dump tool cannot export users and grants. Choose a MariaDB tool bundle or turn that option off."
-        ));
+    if profile.include_users_and_grants {
+        let output = run_tool_cancellable(&dump_path, &["--help".into()], None, cancelled)?;
+        if !output.status.success()
+            || !String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("--system=name")
+        {
+            return Err(anyhow!("DATABASE_GRANTS_UNSUPPORTED: This dump tool cannot export users and grants. Choose a MariaDB tool bundle or turn that option off."));
+        }
     }
 
     let mut args = connection_args(&target);
@@ -461,6 +493,15 @@ fn build_dump_command(
     if profile.include_users_and_grants {
         args.push("--system=users".into());
     }
+    if !profile.include_create_statements && profile.selection_mode != "tables" {
+        args.push("--no-create-db".into());
+    }
+    // MySQL/MariaDB parse option-like database/table names as flags unless
+    // every positional identifier follows the end-of-options marker.
+    if profile.selection_mode != "tables" {
+        args.push("--databases".into());
+    }
+    args.push("--".into());
 
     match profile.selection_mode.as_str() {
         "all" => {
@@ -472,11 +513,9 @@ fn build_dump_command(
             if databases.is_empty() {
                 return Err(anyhow!("No user databases were found to back up"));
             }
-            args.push("--databases".into());
             args.extend(databases.iter().map(OsString::from));
         }
         "databases" => {
-            args.push("--databases".into());
             args.extend(profile.databases.iter().map(OsString::from));
         }
         "tables" => {
@@ -484,9 +523,6 @@ fn build_dump_command(
             args.extend(profile.tables.iter().map(OsString::from));
         }
         _ => return Err(anyhow!("Database selection mode is invalid")),
-    }
-    if !profile.include_create_statements && profile.selection_mode != "tables" {
-        args.push("--no-create-db".into());
     }
     Ok(StreamSourceCommand {
         program: dump_path,
@@ -938,6 +974,9 @@ pub async fn cmd_delete_database_profile(
     id: String,
     delete_backups: Option<bool>,
 ) -> std::result::Result<(), String> {
+    let engine = crate::kopia::begin_operation()
+        .await
+        .map_err(|error| error.to_string())?;
     let owner_account = current_owner(&state)?;
     let (profile, api) = {
         let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
@@ -946,7 +985,7 @@ pub async fn cmd_delete_database_profile(
         (profile, guard.api.clone())
     };
     if delete_backups.unwrap_or(false) {
-        crate::backup::delete_snapshots_in_folder(&app, state.inner(), &profile.folder)
+        crate::backup::delete_snapshots_in_folder(&app, &engine, state.inner(), &profile.folder)
             .await
             .map_err(|error| error.to_string())?;
         api.delete_folder(&profile.folder)
@@ -1014,6 +1053,10 @@ pub async fn cmd_restore_database_backup(
     profile_id: String,
     snapshot_id: String,
 ) -> std::result::Result<(), String> {
+    // Bind the destination profile and repository to the same unchanged session.
+    let engine = crate::kopia::begin_operation()
+        .await
+        .map_err(|error| error.to_string())?;
     let (profile, password) = {
         let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
         let owner_account = guard
@@ -1025,15 +1068,12 @@ pub async fn cmd_restore_database_backup(
             load_password(&owner_account, &profile_id).map_err(|error| error.to_string())?;
         (profile, password)
     };
-    test_connection(
-        &profile.connection_url,
-        &password,
-        Path::new(&profile.client_executable),
-    )
-    .map_err(|error| error.to_string())?;
+    // The import client performs authentication itself. Avoid an uncancellable
+    // metadata query on the async runtime before the cancellable SQL pipeline.
     let target = build_restore_command(&profile, &password).map_err(|error| error.to_string())?;
     crate::kopia::restore_database_snapshot_to_command(
         &app,
+        &engine,
         state.inner(),
         &snapshot_id,
         &profile_id,
@@ -1066,6 +1106,7 @@ pub async fn run_database_backup_with_context(
     let operation =
         crate::backup_operations::begin_with_context(state, context, "Database backup")?;
     crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
+    let engine = crate::kopia::begin_operation().await?;
     let result: Result<String> = async {
         let mut profile = {
             let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
@@ -1084,6 +1125,7 @@ pub async fn run_database_backup_with_context(
         if profile.retention > 0 {
             crate::kopia::prune_profile_snapshots_with_operation(
                 &app,
+                &engine,
                 &operation,
                 &profile.id,
                 &profile.folder,
@@ -1092,15 +1134,29 @@ pub async fn run_database_backup_with_context(
             .await?;
         }
         let password = load_password(operation.account_scope(), profile_id)?;
-        let connection = test_connection(
-            &profile.connection_url,
-            &password,
-            Path::new(&profile.client_executable),
-        )?;
-        let source = build_dump_command(&profile, &password, &connection.databases)?;
+        let preflight_profile = profile.clone();
+        let control = std::sync::Arc::clone(&operation.control);
+        let source = tokio::task::spawn_blocking(move || {
+            let cancelled = || control.is_cancel_requested();
+            let connection = test_connection_cancellable(
+                &preflight_profile.connection_url,
+                &password,
+                Path::new(&preflight_profile.client_executable),
+                &cancelled,
+            )?;
+            build_dump_command_cancellable(
+                &preflight_profile,
+                &password,
+                &connection.databases,
+                &cancelled,
+            )
+        })
+        .await
+        .context("Database preflight worker stopped unexpectedly")??;
         let filename = format!("savestate-database/{profile_id}/database.sql");
         let backup_id = crate::kopia::backup_stream_with_operation(
             &app,
+            &engine,
             &operation,
             source,
             filename,
@@ -1114,6 +1170,7 @@ pub async fn run_database_backup_with_context(
         if profile.retention > 0 {
             crate::kopia::prune_profile_snapshots_with_operation(
                 &app,
+                &engine,
                 &operation,
                 &profile.id,
                 &profile.folder,
@@ -1142,18 +1199,13 @@ pub fn database_profile_is_due(
     profile: &DatabaseProfile,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    if !profile.enabled {
-        return false;
-    }
-    let candidate = if profile.schedule_state == "retrying" {
-        profile.retry_at.as_deref()
-    } else {
-        profile.next_run.as_deref()
-    };
-    candidate
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&chrono::Utc) <= now)
-        .unwrap_or(false)
+    crate::scheduler::scheduled_deadline_is_due(
+        profile.enabled,
+        &profile.schedule_state,
+        profile.next_run.as_deref(),
+        profile.retry_at.as_deref(),
+        now,
+    )
 }
 
 #[cfg(test)]
@@ -1164,7 +1216,7 @@ mod tests {
     };
     use crate::db::DatabaseProfile;
 
-    fn profile(mode: &str) -> DatabaseProfile {
+    pub(super) fn profile(mode: &str) -> DatabaseProfile {
         DatabaseProfile {
             id: "db-profile".into(),
             owner_account: "account".into(),
@@ -1285,4 +1337,56 @@ mod tests {
         let args = client_connection_args(&target);
         assert!(args.iter().any(|arg| arg == "--connect-timeout=5"));
     }
+
+    #[test]
+    fn option_like_identifiers_are_always_after_the_option_boundary() {
+        for mode in ["all", "databases", "tables"] {
+            let mut selected = profile(mode);
+            selected.databases = vec!["--help".into()];
+            selected.include_create_statements = false;
+            if mode == "tables" {
+                selected.tables = vec!["--result-file=unexpected.sql".into(), "-V".into()];
+            }
+            let command = build_dump_command(&selected, "fixture", &[]).unwrap();
+            let boundary = command.args.iter().position(|arg| arg == "--").unwrap();
+            let expected: Vec<std::ffi::OsString> = selected
+                .databases
+                .iter()
+                .chain(&selected.tables)
+                .map(Into::into)
+                .collect();
+            assert_eq!(&command.args[boundary + 1..], expected.as_slice());
+            assert_eq!(
+                command.args[..boundary]
+                    .iter()
+                    .any(|arg| arg == "--no-create-db"),
+                mode != "tables"
+            );
+            assert_eq!(
+                command.args[..boundary]
+                    .iter()
+                    .any(|arg| arg == "--databases"),
+                mode != "tables"
+            );
+        }
+        let mut automatic = profile("all");
+        automatic.include_new_databases = true;
+        automatic.databases.clear();
+        let command = build_dump_command(&automatic, "", &["--help".into()]).unwrap();
+        assert_eq!(
+            &command.args[command.args.len() - 2..],
+            &[std::ffi::OsString::from("--"), "--help".into()]
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_table_selection_returns_error_instead_of_panicking() {
+        let mut selected = profile("tables");
+        selected.databases.clear();
+        assert!(build_dump_command(&selected, "", &[]).is_err());
+    }
 }
+
+#[cfg(test)]
+#[path = "database_integration_tests.rs"]
+mod integration_tests;
