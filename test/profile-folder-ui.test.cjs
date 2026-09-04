@@ -45,6 +45,14 @@ test('profile backups carry stable identity metadata and display version labels 
   assert.match(app, /new Date\(right\.lastModified\) - new Date\(left\.lastModified\)/);
 });
 
+test('backup filename content does not replace table-cell layout', () => {
+  assert.match(app, /nameContent\.className = 'backup-name-content'/);
+  assert.match(app, /tdName\.appendChild\(nameContent\)/);
+  assert.match(styles, /\.backup-name-cell\s*\{\s*vertical-align: middle;/);
+  assert.match(styles, /\.backup-name-content\s*\{\s*display: flex;/);
+  assert.doesNotMatch(styles, /\.backup-name-cell\s*\{[^}]*display:\s*flex;/);
+});
+
 test('quick backups keep root available and cannot target another managed profile folder', () => {
   assert.match(html, /id="quick-backup-folder"[\s\S]*?value="\/"/);
   assert.match(app, /const isManagedProfileFolder = typeof f !== 'string' && f\.managed/);

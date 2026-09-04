@@ -1617,9 +1617,11 @@ async function loadBackups() {
             const tr = document.createElement('tr');
             const tdName = document.createElement('td');
             tdName.className = 'backup-name-cell';
+            const nameContent = document.createElement('div');
+            nameContent.className = 'backup-name-content';
             const filename = document.createElement('span');
             filename.textContent = b.filename;
-            tdName.appendChild(filename);
+            nameContent.appendChild(filename);
             if (Number.isFinite(Number(b.versionNumber)) && Number(b.versionNumber) > 0) {
                 const profileVersions = allBackups
                     .filter((backup) => backup.profileId === b.profileId && Number(backup.versionNumber) > 0)
@@ -1637,8 +1639,9 @@ async function loadBackups() {
                 } else {
                     versionBadge.textContent = `Version ${version}`;
                 }
-                tdName.appendChild(versionBadge);
+                nameContent.appendChild(versionBadge);
             }
+            tdName.appendChild(nameContent);
             const tdSize = document.createElement('td');
             tdSize.textContent = b.sizeFormatted;
             const tdDate = document.createElement('td');
