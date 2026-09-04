@@ -25,8 +25,8 @@ test('database backups use the same detailed terminal failure contract', () => {
   assert.match(failureArm, /terminal_progress\.finish\(\)/);
 });
 
-test('source allowance rejection is translated into an actionable workspace message', () => {
+test('legacy source allowance rejection is identified as an outdated server check', () => {
   assert.match(app, /source_quota_exceeded/);
-  assert.match(app, /select a smaller source/);
-  assert.match(app, /ask the workspace owner for more storage/);
+  assert.match(app, /outdated source-data quota check/);
+  assert.match(app, /Update SaveState and try again/);
 });
