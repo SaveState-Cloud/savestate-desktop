@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "savestate-app"
-version = "2.0.31"
+version = "2.0.32"
 dependencies = [
  "aes-gcm",
  "anyhow",
