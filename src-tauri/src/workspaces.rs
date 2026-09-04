@@ -137,9 +137,7 @@ async fn switch_account_workspace(
     state: &AppStateWrapper,
     workspace_id: &str,
 ) -> Result<AccountWorkspace> {
-    if crate::backup_operations::session_change_blocked() {
-        bail!("Wait for the active backup, restore, deletion, or maintenance task before switching workspaces");
-    }
+    let _session_change = crate::backup_operations::begin_session_change()?;
     let (api, email, master_key, session_generation) = {
         let guard = state
             .0

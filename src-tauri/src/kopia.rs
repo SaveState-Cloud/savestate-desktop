@@ -112,8 +112,21 @@ fn mark_cleanup_complete(account_scope: &str) {
 /// Hold a shared lease for any backup-engine operation that must finish before
 /// an application update may install. Multiple normal operations can coexist,
 /// while the updater requires the exclusive side of the same gate.
-pub async fn begin_operation() -> RwLockReadGuard<'static, ()> {
-    operation_gate().read().await
+/// A capability for an already admitted engine workflow. Pass it to nested
+/// operations instead of reacquiring a writer-preferring lock.
+pub struct EngineLease<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
+}
+
+fn begin_operation_in(gate: &RwLock<()>) -> Result<EngineLease<'_>> {
+    gate.try_read().map(|guard| EngineLease { _guard: guard }).map_err(|_| {
+        anyhow!("The engine is busy with maintenance, an account change, or an update; try again when it finishes")
+    })
+}
+
+pub async fn begin_operation() -> Result<EngineLease<'static>> {
+    // New work cannot queue captured old account state behind a session change.
+    begin_operation_in(operation_gate())
 }
 
 /// Reserve the engine exclusively for an update. This deliberately does not
@@ -983,14 +996,17 @@ pub async fn backup_paths_with_trigger(
     };
     let operation = backup_operations::begin(state, display_name)?;
     prepare_repository_for_backup(app, &operation).await?;
+    let engine = begin_operation().await?;
     let result =
-        backup_paths_with_operation(app, &operation, paths, trigger, folder, None, None).await;
+        backup_paths_with_operation(app, &engine, &operation, paths, trigger, folder, None, None)
+            .await;
     operation.finish_tracking().await;
     result
 }
 
 pub async fn backup_paths_with_operation(
     app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
     operation: &BackupOperation,
     paths: Vec<String>,
     trigger: &'static str,
@@ -998,8 +1014,6 @@ pub async fn backup_paths_with_operation(
     profile: Option<(&str, &str)>,
     keep_latest: Option<usize>,
 ) -> Result<String> {
-    let _operation_guard = begin_operation().await;
-
     if paths.is_empty() {
         return Err(anyhow!("No backup paths provided"));
     }
@@ -1197,11 +1211,11 @@ where
     Ok(())
 }
 
-struct StreamPipelineOutput {
-    source_status: std::process::ExitStatus,
-    source_stderr: Vec<u8>,
-    kopia_output: Output,
-    source_bytes: u64,
+pub(crate) struct StreamPipelineOutput {
+    pub(crate) source_status: std::process::ExitStatus,
+    pub(crate) source_stderr: Vec<u8>,
+    pub(crate) kopia_output: Output,
+    pub(crate) source_bytes: u64,
 }
 
 fn run_stream_pipeline(
@@ -1210,6 +1224,17 @@ fn run_stream_pipeline(
     kopia_args: &[String],
     password: &str,
     session: &RepoSession,
+    control: &Arc<BackupControl>,
+) -> Result<StreamPipelineOutput> {
+    let kopia_command = build_kopia_command(app, kopia_args, Some(password), Some(session));
+    run_stream_pipeline_commands(source, kopia_command, control)
+}
+
+/// Command boundary shared with disposable local integration tests; no app,
+/// account credentials or global repository configuration are needed.
+pub(crate) fn run_stream_pipeline_commands(
+    source: StreamSourceCommand,
+    mut kopia_command: Command,
     control: &Arc<BackupControl>,
 ) -> Result<StreamPipelineOutput> {
     let mut source_command = Command::new(&source.program);
@@ -1233,7 +1258,6 @@ fn run_stream_pipeline(
         )
     })?;
 
-    let mut kopia_command = build_kopia_command(app, kopia_args, Some(password), Some(session));
     kopia_command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1372,6 +1396,7 @@ fn run_stream_pipeline(
 /// materialized as a local file.
 pub async fn backup_stream_with_operation(
     app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
     operation: &BackupOperation,
     source: StreamSourceCommand,
     stdin_filename: String,
@@ -1381,7 +1406,6 @@ pub async fn backup_stream_with_operation(
     folder: &str,
     keep_latest: Option<usize>,
 ) -> Result<String> {
-    let _operation_guard = begin_operation().await;
     let folder = normalize_snapshot_folder(folder)?;
     let op_id = uuid::Uuid::new_v4().to_string();
     let mut engine_job = EngineJobReporter::start_backup(
@@ -1617,8 +1641,9 @@ fn normalize_snapshot_folder(folder: &str) -> Result<String> {
 }
 
 /// Delete a snapshot from the repository.
-pub async fn delete_snapshot(
+pub(crate) async fn delete_snapshot_with_lease(
     app: &tauri::AppHandle,
+    engine: &EngineLease<'_>,
     state: &AppStateWrapper,
     snapshot_id: &str,
 ) -> Result<()> {
@@ -1626,15 +1651,16 @@ pub async fn delete_snapshot(
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
         AccountContext::capture(&guard)?
     };
-    delete_snapshot_with_context(app, &context, snapshot_id).await
+    delete_snapshot_with_context(app, engine, &context, snapshot_id).await
 }
 
 async fn delete_snapshot_with_context(
     app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
     context: &AccountContext,
     snapshot_id: &str,
 ) -> Result<()> {
-    let _operation_guard = begin_operation().await;
+    context.ensure_current(app.state::<AppStateWrapper>().inner())?;
     let api = context.api.clone();
     let mut engine_job = EngineJobReporter::start(
         api.clone(),
@@ -1708,6 +1734,7 @@ pub async fn prune_profile_snapshots(
     profile_folder: &str,
     keep_latest: usize,
 ) -> Result<Vec<String>> {
+    let engine = begin_operation().await?;
     if keep_latest == 0 {
         return Ok(Vec::new());
     }
@@ -1718,7 +1745,7 @@ pub async fn prune_profile_snapshots(
         keep_latest,
     );
     for snapshot_id in &expired {
-        delete_snapshot(app, state, snapshot_id).await?;
+        delete_snapshot_with_lease(app, &engine, state, snapshot_id).await?;
     }
     if !expired.is_empty() {
         schedule_storage_cleanup(app.clone());
@@ -1728,6 +1755,7 @@ pub async fn prune_profile_snapshots(
 
 pub async fn prune_profile_snapshots_with_operation(
     app: &tauri::AppHandle,
+    engine: &EngineLease<'_>,
     operation: &BackupOperation,
     profile_id: &str,
     profile_folder: &str,
@@ -1741,7 +1769,7 @@ pub async fn prune_profile_snapshots_with_operation(
         serde_json::from_value(manifest).context("Invalid kopia snapshot manifest")?;
     let expired = expired_profile_snapshot_ids(snapshots, profile_id, profile_folder, keep_latest);
     for snapshot_id in &expired {
-        delete_snapshot_with_context(app, &operation.context, snapshot_id).await?;
+        delete_snapshot_with_context(app, engine, &operation.context, snapshot_id).await?;
     }
     if !expired.is_empty() {
         schedule_storage_cleanup_with_context(app.clone(), operation.context.clone());
@@ -1956,7 +1984,7 @@ fn database_content_object(
     database_content_object_from_value(&directory)
 }
 
-fn database_content_object_from_value(directory: &serde_json::Value) -> Result<String> {
+pub(crate) fn database_content_object_from_value(directory: &serde_json::Value) -> Result<String> {
     directory
         .get("entries")
         .and_then(|entries| entries.as_array())
@@ -1988,7 +2016,15 @@ fn run_database_restore_pipeline(
         "show".to_string(),
         content_object_id.to_string(),
     ];
-    let mut kopia_command = build_kopia_command(app, &content_args, Some(password), Some(session));
+    let kopia_command = build_kopia_command(app, &content_args, Some(password), Some(session));
+    run_database_restore_pipeline_commands(kopia_command, target, snapshot_id)
+}
+
+pub(crate) fn run_database_restore_pipeline_commands(
+    mut kopia_command: Command,
+    target: StreamRestoreCommand,
+    snapshot_id: &str,
+) -> Result<u64> {
     kopia_command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2147,12 +2183,12 @@ fn run_database_restore_pipeline(
 /// No plaintext SQL file is created during restore.
 pub async fn restore_database_snapshot_to_command(
     app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
     state: &AppStateWrapper,
     snapshot_id: &str,
     profile_id: &str,
     target: StreamRestoreCommand,
 ) -> Result<()> {
-    let _operation_guard = begin_operation().await;
     let op_id = uuid::Uuid::new_v4().to_string();
     let context = {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
@@ -2303,7 +2339,17 @@ pub async fn restore_snapshot(
     snapshot_id: &str,
     target_path: &str,
 ) -> Result<()> {
-    let _operation_guard = begin_operation().await;
+    let engine = begin_operation().await?;
+    restore_snapshot_with_lease(app, &engine, state, snapshot_id, target_path).await
+}
+
+pub(crate) async fn restore_snapshot_with_lease(
+    app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
+    state: &AppStateWrapper,
+    snapshot_id: &str,
+    target_path: &str,
+) -> Result<()> {
     let op_id = uuid::Uuid::new_v4().to_string();
     let context = {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
@@ -2455,20 +2501,23 @@ pub async fn set_retention(
     state: &AppStateWrapper,
     keep_latest: u32,
 ) -> Result<()> {
+    let engine = begin_operation().await?;
     let context = {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
         AccountContext::capture(&guard)?
     };
-    set_retention_with_context(app, &context, keep_latest, None).await
+    set_retention_with_context(app, &engine, &context, keep_latest, None).await
 }
 
 pub async fn set_retention_with_operation(
     app: &tauri::AppHandle,
+    engine: &EngineLease<'_>,
     operation: &BackupOperation,
     keep_latest: u32,
 ) -> Result<()> {
     set_retention_with_context(
         app,
+        engine,
         &operation.context,
         keep_latest,
         Some(&operation.control),
@@ -2478,11 +2527,12 @@ pub async fn set_retention_with_operation(
 
 async fn set_retention_with_context(
     app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
     context: &AccountContext,
     keep_latest: u32,
     cancellation: Option<&Arc<BackupControl>>,
 ) -> Result<()> {
-    let _operation_guard = begin_operation().await;
+    context.ensure_current(app.state::<AppStateWrapper>().inner())?;
     if last_retention()
         .lock()
         .map(|retention| {
@@ -2567,6 +2617,9 @@ async fn run_maintenance_with_context(
     context: &AccountContext,
 ) -> Result<()> {
     let _operation_guard = operation_gate().write().await;
+    // Queued maintenance can outlive its account/workspace. Revalidate only
+    // after obtaining the lease, before any repository request or mutation.
+    context.ensure_current(app.state::<AppStateWrapper>().inner())?;
     let mut engine_job = EngineJobReporter::start(
         context.api.clone(),
         uuid::Uuid::new_v4().to_string(),
@@ -2807,7 +2860,7 @@ pub async fn cmd_warm_repository(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppStateWrapper>,
 ) -> Result<(), String> {
-    let _operation_guard = begin_operation().await;
+    let _operation_guard = begin_operation().await.map_err(|error| error.to_string())?;
     ensure_repo(&app, state.inner(), "backup", None)
         .await
         .map(|_| ())
@@ -2941,8 +2994,116 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn admitted_workflow_reuses_lease_when_maintenance_is_queued() {
+        let gate = tokio::sync::RwLock::new(());
+        let lease = super::begin_operation_in(&gate).unwrap();
+        let writer = gate.write();
+        tokio::pin!(writer);
+        // Polling once queues the writer deterministically, without a sleep.
+        assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        // This is the previous nested-begin_operation failure: Tokio reserves
+        // admission for the queued writer even while the outer read is held.
+        assert!(super::begin_operation_in(&gate).is_err());
+
+        async fn nested_step(_lease: &super::EngineLease<'_>, completed: &mut Vec<u8>, step: u8) {
+            tokio::task::yield_now().await;
+            completed.push(step);
+        }
+        let mut completed = Vec::new();
+        for step in 0..3 {
+            nested_step(&lease, &mut completed, step).await;
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+            assert!(super::begin_operation_in(&gate).is_err());
+        }
+        assert_eq!(completed, vec![0, 1, 2]);
+        drop(lease);
+        let maintenance = tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+            .await
+            .unwrap();
+        assert!(super::begin_operation_in(&gate).is_err());
+        drop(maintenance);
+        assert!(super::begin_operation_in(&gate).is_ok());
+    }
+
+    fn sleeping_stream() -> super::StreamSourceCommand {
+        super::StreamSourceCommand {
+            program: std::env::current_exe().unwrap(),
+            args: [
+                "--exact",
+                "subprocess::tests::helper_fixture",
+                "--nocapture",
+            ]
+            .iter()
+            .map(Into::into)
+            .collect(),
+            env: vec![("SAVESTATE_TEST_HELPER".into(), "sleep".into())],
+        }
+    }
+
+    fn sleeping_command() -> std::process::Command {
+        let source = sleeping_stream();
+        let mut command = std::process::Command::new(source.program);
+        command.args(source.args).envs(source.env);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn database_stream_backup_cancellation_stops_both_children() {
+        let control = crate::backup_operations::BackupControl::fixture();
+        let worker_control = Arc::clone(&control);
+        let task = tokio::task::spawn_blocking(move || {
+            super::run_stream_pipeline_commands(
+                sleeping_stream(),
+                sleeping_command(),
+                &worker_control,
+            )
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        control.cancel_fixture().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(crate::backup_operations::is_cancelled(
+            &result.err().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn database_restore_cancellation_stops_both_children() {
+        let key = "disposable-cancellation-restore";
+        clear_restore_cancellation(key);
+        let task = tokio::task::spawn_blocking(move || {
+            let source = sleeping_stream();
+            let target = super::StreamRestoreCommand {
+                program: source.program,
+                args: source.args,
+                env: source.env,
+            };
+            super::run_database_restore_pipeline_commands(sleeping_command(), target, key)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel_restore(key);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Restore cancelled"));
+        clear_restore_cancellation(key);
+    }
+
+    #[tokio::test]
     async fn updater_cannot_reserve_engine_during_an_operation() {
-        let operation = begin_operation().await;
+        let operation = begin_operation().await.unwrap();
         assert!(try_begin_update().is_err());
         drop(operation);
         assert!(try_begin_update().is_ok());

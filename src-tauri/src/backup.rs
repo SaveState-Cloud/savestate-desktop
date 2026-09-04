@@ -643,7 +643,10 @@ pub async fn cmd_delete_backup(
     state: tauri::State<'_, AppStateWrapper>,
     key: String,
 ) -> std::result::Result<(), String> {
-    crate::kopia::delete_snapshot(&app, state.inner(), &key)
+    let engine = crate::kopia::begin_operation()
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::kopia::delete_snapshot_with_lease(&app, &engine, state.inner(), &key)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -684,6 +687,7 @@ pub(crate) fn folder_contains(folder: &str, candidate: &str) -> bool {
 
 pub(crate) async fn delete_snapshots_in_folder(
     app: &tauri::AppHandle,
+    engine: &crate::kopia::EngineLease<'_>,
     state: &AppStateWrapper,
     folder: &str,
 ) -> anyhow::Result<Vec<String>> {
@@ -697,7 +701,7 @@ pub(crate) async fn delete_snapshots_in_folder(
         .map(|snapshot| snapshot.id)
         .collect();
     for snapshot_id in &snapshot_ids {
-        crate::kopia::delete_snapshot(app, state, snapshot_id).await?;
+        crate::kopia::delete_snapshot_with_lease(app, engine, state, snapshot_id).await?;
         if let Ok(guard) = state.0.lock() {
             let _ = guard.db.execute(
                 "DELETE FROM backup_history WHERE remote_key = ?1",
@@ -747,6 +751,9 @@ pub async fn cmd_delete_folder(
     state: tauri::State<'_, AppStateWrapper>,
     name: String,
 ) -> std::result::Result<serde_json::Value, String> {
+    let engine = crate::kopia::begin_operation()
+        .await
+        .map_err(|error| error.to_string())?;
     let (api, owner_account, file_profiles, database_profiles) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
@@ -763,7 +770,7 @@ pub async fn cmd_delete_folder(
             database_profiles,
         )
     };
-    let deleted_snapshots = delete_snapshots_in_folder(&app, state.inner(), &name)
+    let deleted_snapshots = delete_snapshots_in_folder(&app, &engine, state.inner(), &name)
         .await
         .map_err(|error| error.to_string())?;
     api.delete_folder(&name)

@@ -27,6 +27,12 @@ pub fn classify_schedule_failure(error: &str) -> FailureClassification {
             retryable: false,
         };
     }
+    if value.contains("database_tool_output_limit") {
+        return FailureClassification {
+            code: "database_tool_output_limit",
+            retryable: false,
+        };
+    }
     if value.contains("database_tool_not_found") {
         return FailureClassification {
             code: "database_tool_missing",
@@ -73,13 +79,30 @@ pub fn classify_schedule_failure(error: &str) -> FailureClassification {
 }
 
 pub fn profile_is_due(profile: &BackupProfile, now: DateTime<Utc>) -> bool {
-    if !profile.enabled {
+    scheduled_deadline_is_due(
+        profile.enabled,
+        &profile.schedule_state,
+        profile.next_run.as_deref(),
+        profile.retry_at.as_deref(),
+        now,
+    )
+}
+
+/// File and database profiles use the same retry-deadline semantics.
+pub(crate) fn scheduled_deadline_is_due(
+    enabled: bool,
+    schedule_state: &str,
+    next_run: Option<&str>,
+    retry_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> bool {
+    if !enabled {
         return false;
     }
-    let candidate = if profile.schedule_state == "retrying" {
-        profile.retry_at.as_deref()
+    let candidate = if schedule_state == "retrying" {
+        retry_at
     } else {
-        profile.next_run.as_deref()
+        next_run
     };
     candidate
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
@@ -147,6 +170,45 @@ mod tests {
         );
         assert!(!profile_is_due(&waiting, now));
         assert!(profile_is_due(&due, now));
+    }
+
+    #[test]
+    fn shared_deadline_check_preserves_disabled_missing_and_boundary_behavior() {
+        let now = DateTime::parse_from_rfc3339("2026-09-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let deadline = Some("2026-09-05T14:00:00+02:00");
+        assert!(scheduled_deadline_is_due(
+            true,
+            "scheduled",
+            deadline,
+            None,
+            now
+        ));
+        assert!(!scheduled_deadline_is_due(
+            false,
+            "scheduled",
+            deadline,
+            None,
+            now
+        ));
+        assert!(!scheduled_deadline_is_due(
+            true,
+            "scheduled",
+            None,
+            deadline,
+            now
+        ));
+        assert!(!scheduled_deadline_is_due(
+            true, "retrying", deadline, None, now
+        ));
+        assert!(!scheduled_deadline_is_due(
+            true,
+            "scheduled",
+            Some("invalid"),
+            None,
+            now
+        ));
     }
 
     #[test]
