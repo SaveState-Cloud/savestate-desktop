@@ -562,6 +562,84 @@ mod tests {
         assert!(registry.register("new account backup".into()).is_ok());
     }
 
+    #[tokio::test]
+    async fn enrollment_barrier_releases_after_request_failure_or_future_cancellation() {
+        // Exercise the same guard held by both enrollment commands across their API await.
+        // Each case uses isolated admission state; no real API or credential store is used.
+        for cancel_request in [false, true] {
+            let registry = Arc::new(Registry::default());
+            let engine = tokio::sync::RwLock::new(());
+            let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel::<()>();
+            let mut enrollment = Box::pin(async {
+                let _session_change = begin_session_change_in(Arc::clone(&registry), || {
+                    engine
+                        .try_write()
+                        .map_err(|_| anyhow::anyhow!("engine busy"))
+                })?;
+                started_tx.send(()).unwrap();
+                response_rx.await?;
+                Err::<(), _>(anyhow::anyhow!("synthetic enrollment API failure"))
+            });
+            tokio::select! {
+                result = &mut enrollment => panic!("Request completed too early: {result:?}"),
+                result = &mut started_rx => result.unwrap(),
+            }
+            assert!(registry
+                .register("scheduled backup during enrollment".into())
+                .is_err());
+            assert!(registry.prepare_logout().is_err());
+            assert!(engine.try_read().is_err());
+            assert!(engine.try_write().is_err());
+            if cancel_request {
+                drop(enrollment);
+            } else {
+                response_tx.send(()).unwrap();
+                assert!(enrollment
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("synthetic enrollment"));
+            }
+            assert!(engine.try_read().is_ok());
+            let backup = registry
+                .register("backup after failed enrollment".into())
+                .unwrap();
+            registry.unregister(&backup.id);
+            let retry = begin_session_change_in(Arc::clone(&registry), || {
+                engine
+                    .try_write()
+                    .map_err(|_| anyhow::anyhow!("engine busy"))
+            })
+            .unwrap();
+            drop(retry);
+            let logout = registry.prepare_logout().unwrap();
+            registry.finish_logout(&logout.token);
+        }
+    }
+
+    #[test]
+    fn maintenance_blocks_enrollment_without_leaving_admission_reserved() {
+        let registry = Arc::new(Registry::default());
+        let engine = tokio::sync::RwLock::new(());
+        let maintenance = engine.try_write().unwrap();
+        assert!(begin_session_change_in(Arc::clone(&registry), || {
+            engine
+                .try_write()
+                .map_err(|_| anyhow::anyhow!("engine busy"))
+        })
+        .is_err());
+        drop(maintenance);
+        let retry = begin_session_change_in(Arc::clone(&registry), || {
+            engine
+                .try_write()
+                .map_err(|_| anyhow::anyhow!("engine busy"))
+        })
+        .unwrap();
+        drop(retry);
+        assert!(registry.register("backup after maintenance".into()).is_ok());
+    }
+
     #[test]
     fn inactive_workspace_contexts_are_valid_only_for_the_same_login_session() {
         let context = AccountContext {
