@@ -295,6 +295,9 @@ async fn redeem_organization_installation(
     state: &AppStateWrapper,
     token: &str,
 ) -> Result<OrganizationInstallationConnection> {
+    // Reserve before the API call: a busy engine must not consume a one-use token.
+    // Keep the guard through credential persistence and the service-session switch.
+    let _session_change = crate::backup_operations::begin_session_change()?;
     let (api, session_generation, account_email, master_key) = connection_context(state)?;
     let response = api.redeem_organization_installation(token).await?;
     finish_organization_installation_connection(
@@ -310,6 +313,8 @@ async fn connect_organization_installation(
     state: &AppStateWrapper,
     installation_id: &str,
 ) -> Result<OrganizationInstallationConnection> {
+    // Account-first connection changes the repository just like token redemption.
+    let _session_change = crate::backup_operations::begin_session_change()?;
     let (api, session_generation, account_email, master_key) = connection_context(state)?;
     let response = api
         .connect_organization_installation(installation_id)
