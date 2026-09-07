@@ -43,6 +43,31 @@ The heartbeat response never includes the credential or its hash.
 Installed Windows + hosted enrollment/backup/restore acceptance remains open.
 The public updater version and rollout flags are unchanged by this work.
 
+### Hosted/native acceptance follow-up — 7 September 2026
+
+- The opt-in `native_database_kopia_roundtrip_and_failure_paths` test also
+  passed using disposable local MariaDB and Kopia data. All 100 Rust tests were
+  therefore exercised across the ordinary and opt-in runs. This proves a local
+  database backup/restore path, not a hosted B2 restore.
+- Built development MSI and NSIS installers from the hardened source. Launched
+  the actual development executable, registered a disposable account, signed in,
+  initialized its encrypted vault and verified its assigned 1 GiB organization
+  installation appeared in Settings. The membership was seeded in development;
+  invitation delivery/customer approval were not tested by this fixture.
+- Verified development data is written under `SaveState-Development`, separate
+  from the installed production app. No production profiles were copied.
+- Account-first connection reached the hosted development API but failed before
+  bucket creation: `b2_authorize_account failed: 401`. The client remained in its
+  personal workspace and showed the storage-preparation error. The development
+  B2 credential configuration needs repair before repeating the hosted test.
+- No hosted backup/restore success is claimed. Do not widen enrollment or treat
+  the public 2.0.33 updater as containing these unreleased source changes.
+
+The separate API opt-in hosted test passed registration, login, tenant isolation,
+setup-token redemption/replay, workspace health identity, warning/recovery event
+ordering and credential revocation. Its synthetic storage was deliberately not
+a real bucket; all of that script's fixtures were deleted and cleanup verified.
+
 ## ORG-ENROLL-004 progress — 5 September 2026
 
 The first hardening step is implemented, not a declaration that broad automatic
