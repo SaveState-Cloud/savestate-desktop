@@ -428,10 +428,7 @@ fn kopia_binary(app: &tauri::AppHandle) -> PathBuf {
 
 /// Per-app isolated Kopia config + cache directory.
 fn kopia_data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("SaveState")
-        .join("kopia")
+    crate::runtime_storage::data_dir().join("kopia")
 }
 
 fn repository_data_dir(session: &RepoSession) -> PathBuf {

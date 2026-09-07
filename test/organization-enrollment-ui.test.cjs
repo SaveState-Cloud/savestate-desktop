@@ -56,7 +56,7 @@ test('successful redemption switches the service session and warms the repositor
 });
 
 test('the device credential is stored in Windows Credential Manager and never exposed to the UI', () => {
-  assert.match(enrollment, /keyring::v1::Entry::new\("SaveState Vault", "organization-installation"\)/);
+  assert.match(enrollment, /keyring::v1::Entry::new\(\s*&crate::runtime_storage::credential_service\("SaveState Vault"\),\s*"organization-installation"/);
   assert.match(enrollment, /set_secret\(&data\)/);
   assert.match(enrollment, /delete_credential\(\)/);
   assert.match(enrollment, /invalid_device_credential/);

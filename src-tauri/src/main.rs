@@ -12,6 +12,7 @@ mod notifications;
 mod organization_enrollment;
 mod profiles;
 mod restore;
+mod runtime_storage;
 mod scheduler;
 mod state;
 mod subprocess;
@@ -92,9 +93,7 @@ fn main() {
             }
 
             // Determine data directory
-            let data_dir = dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("SaveState");
+            let data_dir = runtime_storage::data_dir();
 
             // Initialize database
             let conn = db::init_db(&data_dir).expect("Failed to initialize database");
@@ -106,8 +105,12 @@ fn main() {
             // Windows Settings or Task Manager, so a normal launch never
             // overrides that Windows-managed choice.
             #[cfg(target_os = "windows")]
-            if let Err(error) = initialize_windows_autostart(&conn, || app.autolaunch().enable()) {
-                eprintln!("Failed to initialize Windows autostart default: {error}");
+            if runtime_storage::is_production() {
+                if let Err(error) =
+                    initialize_windows_autostart(&conn, || app.autolaunch().enable())
+                {
+                    eprintln!("Failed to initialize Windows autostart default: {error}");
+                }
             }
 
             // Build shared state
