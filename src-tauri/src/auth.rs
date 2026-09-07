@@ -33,13 +33,15 @@ struct StoredSession {
 }
 
 fn legacy_creds_path() -> PathBuf {
-    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("SaveState").join("credentials.json")
+    crate::runtime_storage::data_dir().join("credentials.json")
 }
 
 fn credential_entry() -> Result<keyring::v1::Entry> {
-    keyring::v1::Entry::new("SaveState Vault", "remembered-session")
-        .context("Windows Credential Manager is unavailable")
+    keyring::v1::Entry::new(
+        &crate::runtime_storage::credential_service("SaveState Vault"),
+        "remembered-session",
+    )
+    .context("Windows Credential Manager is unavailable")
 }
 
 fn save_session(email: &str, token: &str, master_key: &[u8; 32]) -> Result<()> {

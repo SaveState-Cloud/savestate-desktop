@@ -266,6 +266,29 @@ pub struct OrganizationEnrollmentRedeemResponse {
     pub account_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OrganizationHeartbeatResponse {
+    pub health: OrganizationHeartbeatHealth,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationHeartbeatHealth {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+}
+
+impl OrganizationHeartbeatResponse {
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.health.workspace_id.as_deref().filter(|value| {
+            value
+                .strip_prefix("service:")
+                .and_then(|id| id.parse::<u64>().ok())
+                .is_some_and(|id| id > 0)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizationEnrollmentInstallation {
@@ -501,7 +524,11 @@ impl SaveStateClient {
     }
 
     pub fn workspace_id(&self) -> Option<String> {
-        let payload = self.token.as_deref()?.split('.').nth(1)?;
+        Self::workspace_id_from_token(self.token.as_deref()?)
+    }
+
+    pub(crate) fn workspace_id_from_token(token: &str) -> Option<String> {
+        let payload = token.split('.').nth(1)?;
         let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
         let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
         let service_id = claims.get("serviceId")?.as_u64()?;
@@ -595,7 +622,7 @@ impl SaveStateClient {
         &self,
         device_credential: &str,
         backup: Option<OrganizationBackupHeartbeat>,
-    ) -> Result<()> {
+    ) -> Result<OrganizationHeartbeatResponse> {
         let response = self
             .client
             .post(format!(
@@ -609,7 +636,10 @@ impl SaveStateClient {
             .await
             .context("Failed to report organization installation health")?;
         if response.status().is_success() {
-            return Ok(());
+            return response
+                .json()
+                .await
+                .context("Failed to parse organization installation health");
         }
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
