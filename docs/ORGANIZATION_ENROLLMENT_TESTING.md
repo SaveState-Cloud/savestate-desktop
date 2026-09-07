@@ -1,5 +1,48 @@
 # Organization enrollment verification
 
+## Hardening and isolation — 7 September 2026
+
+Implemented additional safeguards without changing the broad enrollment gate:
+
+- Backup outcomes match the complete account/workspace identity rather than
+  comparing `email::service:id` to a plain email. Personal and other service
+  backups cannot mark this organization installation protected or unhealthy.
+- New connections store the service workspace. Legacy saved connections learn
+  it from the authenticated API heartbeat response; deploy the matching Core
+  API change first. Older API responses remain readable but cannot migrate a
+  legacy connection's missing workspace.
+- Credential read/modify/write operations are serialized. A delayed heartbeat
+  acknowledgement cannot erase a newer queued outcome, and a revoked response
+  from a replaced credential cannot delete its replacement.
+- A secure-store failure leaves the active session unchanged and reports the
+  required operator recovery. The server may already have consumed the setup
+  token: replace the device credential and issue a new recovery token. This is
+  explicit recovery, not automatic rollback of server enrollment.
+- Metadata/remembered-session write failures now complete the accepted session
+  switch, invalidate the old repository cache and return a persistence warning.
+- Development/staging builds now isolate their profile database, installation
+  ID, Kopia cache, remembered account, organization credential and database
+  passwords. Production keeps its existing paths and keyring names unchanged.
+  Non-production builds do not automatically register Windows startup. Custom
+  environment/API combinations receive a stable hashed namespace.
+- Never migrate the old shared production data into a development build. Sign
+  in separately and create disposable development profiles instead.
+
+Local regression evidence: 99 Rust tests passed, one existing opt-in database/
+Kopia test ignored; 51 UI/source checks and 3 JavaScript tests passed. Fault
+tests use an injected secure-store backend and real disposable SQLite databases.
+They cover failed persistence, changed session generation, old acknowledgements,
+replacement credentials, legacy workspace learning and 100 concurrent queue/ack
+races. These are not evidence of a real hosted backup/restore round trip.
+
+Core API tests additionally replace a credential between verification and the
+database transaction for connected/succeeded/failed reports. All three reject
+the old credential without modifying replacement health or creating a webhook.
+The heartbeat response never includes the credential or its hash.
+
+Installed Windows + hosted enrollment/backup/restore acceptance remains open.
+The public updater version and rollout flags are unchanged by this work.
+
 ## ORG-ENROLL-004 progress — 5 September 2026
 
 The first hardening step is implemented, not a declaration that broad automatic

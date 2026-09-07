@@ -350,7 +350,7 @@ fn credential_username(owner_account: &str, profile_id: &str) -> String {
 
 fn credential_entry(owner_account: &str, profile_id: &str) -> Result<keyring::v1::Entry> {
     keyring::v1::Entry::new(
-        DATABASE_CREDENTIAL_SERVICE,
+        &crate::runtime_storage::credential_service(DATABASE_CREDENTIAL_SERVICE),
         &credential_username(owner_account, profile_id),
     )
     .context("Windows Credential Manager is unavailable")
