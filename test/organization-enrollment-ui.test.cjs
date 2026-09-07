@@ -10,7 +10,7 @@ const api = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'api.rs'), 'utf8
 const enrollment = fs.readFileSync(
   path.join(root, 'src-tauri', 'src', 'organization_enrollment.rs'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 test('Settings discovers account assignments first and keeps token enrollment as fallback', () => {
   for (const id of [
@@ -64,6 +64,21 @@ test('the device credential is stored in Windows Credential Manager and never ex
   assert.doesNotMatch(html, /device[_ -]?credential/i);
   assert.doesNotMatch(app, /deviceCredential/);
   assert.doesNotMatch(enrollment, /pub device_credential/);
+});
+
+test('both enrollment methods reserve session and engine admission before any API request', () => {
+  for (const name of ['redeem_organization_installation', 'connect_organization_installation']) {
+    const start = enrollment.indexOf(`async fn ${name}(`);
+    const end = enrollment.indexOf('\n}\n', start);
+    assert.ok(start >= 0 && end > start, `Missing ${name}`);
+    const body = enrollment.slice(start, end);
+    const reserve = body.indexOf('let _session_change = crate::backup_operations::begin_session_change()?;');
+    const capture = body.indexOf('connection_context(state)?');
+    const request = body.indexOf(`.${name}(`);
+    const finish = body.indexOf('finish_organization_installation_connection(');
+    assert.ok(reserve >= 0 && reserve < capture && capture < request && request < finish, name);
+    assert.doesNotMatch(body, /drop\(_session_change\)/, 'guard must survive finalization');
+  }
 });
 
 test('stable enrollment failures have short customer-facing messages', () => {
