@@ -31,3 +31,15 @@ test('internal app updaters cannot install from the production update endpoint',
   assert.match(staging.plugins.updater.endpoints[0], /^https:\/\/api-staging\.savestate\.dk\//);
   assert.match(production.plugins.updater.endpoints[0], /^https:\/\/api\.savestate\.dk\//);
 });
+
+test('environment builds isolate all local data and secure credentials', () => {
+  const source = name => readFileSync(join(__dirname, '..', 'src-tauri', 'src', name), 'utf8');
+  for (const name of ['main.rs', 'auth.rs', 'kopia.rs']) {
+    assert.match(source(name), /runtime_storage::data_dir\(\)/);
+    assert.doesNotMatch(source(name), /join\("SaveState"\)/);
+  }
+  for (const name of ['auth.rs', 'databases.rs', 'organization_enrollment.rs']) {
+    assert.match(source(name), /runtime_storage::credential_service\(/);
+  }
+  assert.match(source('main.rs'), /if runtime_storage::is_production\(\)\s*\{\s*if let Err\(error\) =\s*initialize_windows_autostart/);
+});
