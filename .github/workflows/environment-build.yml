@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     environment: ${{ github.event.inputs.environment || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
