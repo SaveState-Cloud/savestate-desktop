@@ -28,7 +28,7 @@ argon2 = "0.5"
 zstd = "0.13"
 tar = "0.4"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
