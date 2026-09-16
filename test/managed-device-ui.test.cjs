@@ -16,7 +16,7 @@ const api = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'api.rs'), 'utf8
 const enrollment = fs.readFileSync(
   path.join(root, 'src-tauri', 'src', 'organization_enrollment.rs'),
   'utf8',
-);
+).replace(/\r\n/g, '\n');
 
 test('both enrollment paths require explicit consent for every administrator control', () => {
   for (const id of [
