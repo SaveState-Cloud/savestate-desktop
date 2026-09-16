@@ -13,6 +13,8 @@ The application communicates with `api.savestate.dk` over HTTPS to:
 - obtain an account-scoped encrypted-repository session;
 - report backup, restore, deletion, maintenance, and scheduled-job status;
 - synchronize privacy-limited schedule timing metadata;
+- poll for and acknowledge explicitly authorized organization-managed backup
+  commands when this PC is enrolled;
 - manage folders, retention, notification settings, and subscription actions;
   and
 - check for application updates.
@@ -31,6 +33,56 @@ operation, that can include a snapshot identifier, source path, timestamp,
 size, file count, folder, schedule timing, and job status. This operational
 metadata is not part of the encrypted Kopia repository, and it does not contain
 backup file contents or the decrypted vault master key.
+
+## Organization-managed device control
+
+Organization control is off until the user explicitly connects an assigned
+installation or redeems a setup token and acknowledges the control disclosure.
+After enrollment, an authorized organization administrator can create, update,
+pause, resume, or remove managed folder schedules; start or cancel a managed
+backup; request a whole-snapshot restore; and request deletion of a listed
+snapshot. Administrators may select any accessible local folder path and see
+that path as operational metadata, but never receive its plaintext contents or
+the plaintext vault key. The local UI identifies each assigned policy as **Managed by
+_organization_** and presents its fields as read-only.
+
+The readable operational data used for this feature can include the managed
+source path, device-local schedule times, retention count, assignment and policy
+identifiers and revisions, job and snapshot identifiers, timestamps, outcome
+codes, logical byte counts, and file counts. Per-snapshot physical stored bytes
+are omitted when they cannot be attributed safely. Command and event payloads
+are bounded and typed; they do not carry file contents, filenames, repository
+passwords, plaintext encryption keys, or decrypted backup data. Restore
+destinations are neither accepted in organization commands nor included in
+device event telemetry. The app chooses the destination and shows its actual
+path only in local Settings.
+
+Policy scheduling, Kopia execution, encryption, restore, and deletion occur on
+the enrolled PC. Managed work is suspended while the owning SaveState account
+is signed out or its vault is locked. Managed backup sources are restricted to
+local fixed or removable Windows drives; UNC shares, mapped remote drives, and
+paths traversing junctions or other reparse points are rejected, and the agent
+does not use ambient Windows share credentials for organization commands.
+Restore commands carry only an exact snapshot identifier. The app generates a
+unique new folder under its protected, environment-isolated per-user
+`SaveState Restores` application-data root. It requires a local fixed/removable
+volume and reparse-free, pinned ancestry, applies a protected Windows ACL to
+the root and restored descendants, and rejects existing paths and overwrite.
+Administrators cannot choose Startup, plugin, network, or other arbitrary
+destination paths. Removing an
+assignment disables and removes only its local managed scheduling state and
+does not delete its existing snapshots. Snapshot deletion requires a separate
+exact snapshot identifier and is reported only after the repository deletion
+has actually succeeded.
+
+The user can disconnect the PC from Settings after a separate warning that
+managed schedules will stop and managed work will be cancelled while snapshots
+remain. The client first sends an account-authenticated, replay-safe disconnect
+request. After the service confirms the disconnect (including an idempotent
+already-disconnected response), it tombstones managed schedules, cancels their
+work without changing personal profiles, and removes the local device
+credential. A revoked credential observed later by the control poller or
+periodic heartbeat triggers the same local cleanup.
 
 The gateway authorizes the repository request and forwards encrypted objects;
 it does not receive the repository password, decrypted master key, or plaintext

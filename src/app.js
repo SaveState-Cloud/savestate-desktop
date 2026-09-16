@@ -545,8 +545,14 @@ function setupEventListeners() {
     document.getElementById('btn-remove-webhook').addEventListener('click', removeWebhook);
     document.getElementById('btn-toggle-webhook-visibility').addEventListener('click', toggleWebhookVisibility);
     document.getElementById('btn-open-organization-enrollment').addEventListener('click', openOrganizationEnrollment);
+    document.getElementById('btn-disconnect-organization-installation').addEventListener('click', () => {
+        void disconnectOrganizationInstallation();
+    });
     document.getElementById('btn-connect-account-organization').addEventListener('click', () => {
         void connectAccountOrganizationInstallation();
+    });
+    document.getElementById('organization-account-control-consent').addEventListener('change', (event) => {
+        document.getElementById('btn-connect-account-organization').disabled = !event.target.checked;
     });
 
     const workspaceTrigger = document.getElementById('workspace-trigger');
@@ -578,6 +584,9 @@ function setupEventListeners() {
     document.getElementById('btn-cancel-organization-enrollment').addEventListener('click', closeOrganizationEnrollment);
     document.getElementById('btn-confirm-organization-enrollment').addEventListener('click', () => {
         void confirmOrganizationEnrollment();
+    });
+    document.getElementById('organization-token-control-consent').addEventListener('change', (event) => {
+        document.getElementById('btn-confirm-organization-enrollment').disabled = !event.target.checked;
     });
 
     // ── Folder Management ─────────────────────────────────────────
@@ -2716,8 +2725,9 @@ function closeProfileDeleteModal() {
 async function loadProfiles() {
     const container = document.getElementById('profiles-list');
     try {
-        const [profiles, unownedCount, authStatus, profileLimitValue] = await Promise.all([
+        const [profiles, managedProfiles, unownedCount, authStatus, profileLimitValue] = await Promise.all([
             invoke('cmd_list_profiles'),
+            invoke('cmd_list_managed_profiles'),
             invoke('cmd_count_unowned_profiles'),
             invoke('cmd_get_auth_status'),
             invoke('cmd_get_profile_limit'),
@@ -2726,7 +2736,8 @@ async function loadProfiles() {
         const automatedCount = (profiles || []).filter((profile) => profile.enabled && String(profile.schedule || '').trim()).length;
         const profileLimitSummary = document.getElementById('profile-limit-summary');
         if (profileLimitSummary) {
-            profileLimitSummary.textContent = `${automatedCount} of ${profileLimit} automated backup profiles in use. Manual-only profiles do not count.`;
+            const managedCount = (managedProfiles || []).length;
+            profileLimitSummary.textContent = `${automatedCount} of ${profileLimit} personal automated backup profiles in use. Manual-only profiles do not count.${managedCount > 0 ? ` ${managedCount} organization-managed ${managedCount === 1 ? 'policy is' : 'policies are'} assigned separately.` : ''}`;
         }
         container.innerHTML = '';
 
@@ -2766,7 +2777,7 @@ async function loadProfiles() {
             container.appendChild(migrationCard);
         }
 
-        if (!profiles || profiles.length === 0) {
+        if ((!profiles || profiles.length === 0) && (!managedProfiles || managedProfiles.length === 0)) {
             const empty = document.createElement('div');
             empty.className = 'empty-state glass-card';
             empty.innerHTML = '<p class="text-muted">No backup profiles assigned to this account yet.</p>';
@@ -2774,7 +2785,83 @@ async function loadProfiles() {
             return;
         }
 
-        profiles.forEach(p => {
+        (managedProfiles || []).forEach(p => {
+            const card = document.createElement('div');
+            card.className = 'profile-card glass-card managed-profile-card';
+            card.setAttribute('data-managed-assignment-id', p.assignment_id);
+
+            let scheduleLabel = 'Set by your organization';
+            if (p.schedule) {
+                try {
+                    const sched = JSON.parse(p.schedule);
+                    const intervalDays = Number(sched.intervalDays || 0);
+                    if (intervalDays > 0 && Array.isArray(sched.times) && sched.times.length > 0) {
+                        const daysStr = intervalDays === 1 ? 'Daily' : `Every ${intervalDays} days`;
+                        scheduleLabel = `${sched.times.join(', ')} local - ${daysStr}`;
+                    }
+                } catch {
+                    scheduleLabel = 'Set by your organization';
+                }
+            }
+            const effectiveNextRun = p.schedule_state === 'retrying' && p.retry_at ? p.retry_at : p.next_run;
+            const nextRunLabel = p.desired_state !== 'active'
+                ? 'Paused by administrator'
+                : (effectiveNextRun ? formatLocalAndUtc(effectiveNextRun) : 'Awaiting next local schedule');
+            const statusLabel = p.desired_state === 'active' ? 'Active' : 'Paused';
+            const organizationName = p.organization_name || 'your organization';
+            const description = p.description
+                ? `<p class="managed-profile-description">${escapeHtml(p.description)}</p>`
+                : '';
+
+            card.innerHTML = `
+                <div class="managed-profile-owner">
+                    <svg class="managed-profile-lock" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-11 0h12v10H6V10Zm3 0h6V8a3 3 0 0 0-6 0v2Z" fill="currentColor"/></svg>
+                    <span>Managed by ${escapeHtml(organizationName)}</span>
+                </div>
+                <div class="profile-card-header">
+                    <h3 class="profile-name">${escapeHtml(p.name)}</h3>
+                    <span class="badge ${p.desired_state === 'active' ? 'badge-success' : 'badge-neutral'}">${statusLabel}</span>
+                </div>
+                ${description}
+                <div class="profile-meta">
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Source</span>
+                        <span class="meta-value" title="${escapeHtml(p.source_path)}">${escapeHtml(shortenPath(p.source_path))}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Schedule</span>
+                        <span class="meta-value" title="${escapeHtml(scheduleLabel)}">${escapeHtml(scheduleLabel)}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Retention</span>
+                        <span class="meta-value">${p.retention > 0 ? `Last ${p.retention}` : 'Unlimited'}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Folder</span>
+                        <span class="meta-value" title="${escapeHtml(p.folder || '/')}">${escapeHtml(p.folder || '/ (Root)')}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">Last Run</span>
+                        <span class="meta-value">${p.last_run ? new Date(p.last_run).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : 'Never'}</span>
+                    </div>
+                    <div class="profile-meta-item">
+                        <span class="meta-label">${p.schedule_state === 'retrying' ? 'Retry' : 'Next Run'}</span>
+                        <span class="meta-value" title="${escapeHtml(nextRunLabel)}">${escapeHtml(nextRunLabel)}</span>
+                    </div>
+                </div>
+                <p class="managed-profile-note">Schedule, source, and retention are read-only here. Contact ${escapeHtml(organizationName)} to change this policy.</p>
+                <div class="profile-actions"></div>
+            `;
+
+            const openBackupsBtn = document.createElement('button');
+            openBackupsBtn.className = 'btn btn-ghost btn-sm';
+            openBackupsBtn.textContent = 'Open Backups';
+            openBackupsBtn.addEventListener('click', () => openManagedProfileFolder(p.folder));
+            card.querySelector('.profile-actions').appendChild(openBackupsBtn);
+            container.appendChild(card);
+        });
+
+        (profiles || []).forEach(p => {
             const card = document.createElement('div');
             card.className = 'profile-card glass-card';
             card.setAttribute('data-profile-id', p.id);
@@ -3008,6 +3095,7 @@ function shortenPath(path) {
 // ────────────────────────────────────────────────────────────────
 async function loadSettings() {
     void loadOrganizationInstallationStatus();
+    void loadLocalManagedRestores();
     try {
         const settings = await invoke('cmd_get_settings');
         const webhookInput = document.getElementById('settings-webhook-url');
@@ -3043,15 +3131,43 @@ function renderOrganizationInstallationStatus(status) {
     const connected = status?.connected === true;
     const statusText = document.getElementById('organization-installation-status');
     const openButton = document.getElementById('btn-open-organization-enrollment');
+    const disconnectButton = document.getElementById('btn-disconnect-organization-installation');
     if (connected) {
-        statusText.textContent = `Connected to organization-managed storage for ${status.serverLabel || 'this server'}.`;
+        statusText.textContent = `Connected to organization-managed storage and backup controls for ${status.serverLabel || 'this server'}.`;
         openButton.classList.add('hidden');
+        disconnectButton.classList.remove('hidden');
         document.getElementById('organization-account-enrollments').classList.add('hidden');
         closeOrganizationEnrollment();
         return;
     }
     statusText.textContent = 'Checking this account for organization-managed storage…';
+    disconnectButton.classList.add('hidden');
     openButton.classList.remove('hidden');
+}
+
+async function loadLocalManagedRestores() {
+    const section = document.getElementById('local-managed-restores');
+    const list = document.getElementById('local-managed-restore-list');
+    try {
+        const restores = await invoke('cmd_list_local_managed_restores');
+        list.replaceChildren();
+        section.classList.toggle('hidden', !Array.isArray(restores) || restores.length === 0);
+        (Array.isArray(restores) ? restores : []).forEach(restore => {
+            const item = document.createElement('div');
+            item.className = 'local-managed-restore-item';
+            const status = document.createElement('strong');
+            const labels = { queued: 'Queued', running: 'Restoring', succeeded: 'Complete', failed: 'Failed', cancelled: 'Cancelled', interrupted: 'Interrupted' };
+            status.textContent = `${labels[restore.status] || 'Unknown status'} · ${new Date(restore.created_at).toLocaleString()}`;
+            const destination = document.createElement('span');
+            destination.className = 'local-managed-restore-path';
+            destination.textContent = restore.destination_path;
+            item.append(status, destination);
+            list.appendChild(item);
+        });
+    } catch {
+        section.classList.add('hidden');
+        list.replaceChildren();
+    }
 }
 
 async function loadOrganizationInstallationStatus() {
@@ -3073,6 +3189,8 @@ function renderAvailableOrganizationInstallations(installations) {
     const list = document.getElementById('organization-account-installation-list');
     const status = document.getElementById('organization-installation-status');
     const connectButton = document.getElementById('btn-connect-account-organization');
+    const consent = document.getElementById('organization-account-control-consent');
+    consent.checked = false;
     list.replaceChildren();
 
     if (organizationAvailableInstallations.length === 0) {
@@ -3086,7 +3204,7 @@ function renderAvailableOrganizationInstallations(installations) {
     status.textContent = organizationAvailableInstallations.length === 1
         ? 'Organization-managed storage is ready to connect.'
         : `${organizationAvailableInstallations.length} organization installations are ready to connect.`;
-    connectButton.disabled = false;
+    connectButton.disabled = true;
 
     organizationAvailableInstallations.forEach((installation, index) => {
         const label = document.createElement('label');
@@ -3135,6 +3253,10 @@ async function connectAccountOrganizationInstallation() {
         setOrganizationEnrollmentMessage('Choose an organization installation for this PC.');
         return;
     }
+    if (!document.getElementById('organization-account-control-consent').checked) {
+        setOrganizationEnrollmentMessage('Confirm the organization administrator controls before connecting this PC.');
+        return;
+    }
     const button = document.getElementById('btn-connect-account-organization');
     setOrganizationEnrollmentMessage('');
     button.disabled = true;
@@ -3149,15 +3271,62 @@ async function connectAccountOrganizationInstallation() {
         } else {
             showToast(`Organization installation connected for ${result.serverLabel}.`, 'success');
         }
+        refreshWorkspaceAfterOrganizationConnection();
         warmRepositoryInBackground();
     } catch (error) {
         setOrganizationEnrollmentMessage(friendlyError(error));
         await loadAvailableOrganizationInstallations();
     } finally {
-        button.disabled = false;
+        button.disabled = !document.getElementById('organization-account-control-consent').checked
+            || document.getElementById('organization-account-enrollments').classList.contains('hidden');
         button.textContent = 'Connect this PC';
     }
 }
+
+async function disconnectOrganizationInstallation() {
+    const confirmed = await confirmDialog(
+        'Disconnect this PC from organization management? Managed schedules will stop and queued or running managed work will be cancelled. Existing snapshots will remain available, and personal profiles will not be changed.',
+        { title: 'Disconnect organization management', kind: 'warning', okLabel: 'Disconnect this PC' },
+    );
+    if (!confirmed) return;
+
+    const button = document.getElementById('btn-disconnect-organization-installation');
+    button.disabled = true;
+    button.textContent = 'Disconnecting…';
+    setOrganizationEnrollmentMessage('');
+    try {
+        const result = await invoke('cmd_disconnect_organization_installation');
+        showToast(
+            result.cancelledJobs > 0
+                ? `Organization management disconnected. ${result.cancelledJobs} running managed ${result.cancelledJobs === 1 ? 'job was' : 'jobs were'} asked to stop; snapshots remain.`
+                : 'Organization management disconnected. Managed schedules stopped and snapshots remain.',
+            'success',
+        );
+        refreshWorkspaceAfterOrganizationDisconnect();
+        await loadOrganizationInstallationStatus();
+        void loadProfiles();
+    } catch (error) {
+        setOrganizationEnrollmentMessage(friendlyError(error));
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Disconnect this PC';
+    }
+}
+
+function refreshWorkspaceAfterOrganizationConnection() {
+    // Connecting an organization replaces the authenticated storage service
+    // without reloading the webview. Invalidate every cached workspace and
+    // repository value before refreshing the persistent sidebar selector.
+    workspaceUiGeneration += 1;
+    repositorySessionGeneration += 1;
+    repositoryWarmupPromise = null;
+    currentAccount = null;
+    currentFolder = '/';
+    folderList = [];
+    void loadDashboard();
+}
+
+const refreshWorkspaceAfterOrganizationDisconnect = refreshWorkspaceAfterOrganizationConnection;
 
 function openOrganizationEnrollment() {
     const form = document.getElementById('organization-enrollment-form');
@@ -3171,6 +3340,8 @@ function openOrganizationEnrollment() {
 function resetOrganizationEnrollmentPreview() {
     organizationEnrollmentPreview = null;
     document.getElementById('organization-enrollment-preview').classList.add('hidden');
+    document.getElementById('organization-token-control-consent').checked = false;
+    document.getElementById('btn-confirm-organization-enrollment').disabled = true;
     setOrganizationEnrollmentMessage('');
 }
 
@@ -3190,6 +3361,8 @@ function closeOrganizationEnrollment() {
     document.getElementById('organization-enrollment-form').classList.add('hidden');
     document.getElementById('organization-enrollment-preview').classList.add('hidden');
     document.getElementById('organization-setup-token').value = '';
+    document.getElementById('organization-token-control-consent').checked = false;
+    document.getElementById('btn-confirm-organization-enrollment').disabled = true;
     document.getElementById('btn-open-organization-enrollment').setAttribute('aria-expanded', 'false');
     setOrganizationEnrollmentMessage('');
 }
@@ -3218,6 +3391,8 @@ async function reviewOrganizationEnrollment() {
         document.getElementById('organization-preview-customer').textContent = result.enrollment.customer.displayName;
         document.getElementById('organization-preview-server').textContent = result.enrollment.installation.serverLabel;
         document.getElementById('organization-preview-expiry').textContent = enrollmentDate(result.enrollment.expiresAt);
+        document.getElementById('organization-token-control-consent').checked = false;
+        document.getElementById('btn-confirm-organization-enrollment').disabled = true;
         document.getElementById('organization-enrollment-preview').classList.remove('hidden');
     } catch (error) {
         organizationEnrollmentPreview = null;
@@ -3234,6 +3409,10 @@ async function confirmOrganizationEnrollment() {
         setOrganizationEnrollmentMessage('Review the setup token before connecting.');
         return;
     }
+    if (!document.getElementById('organization-token-control-consent').checked) {
+        setOrganizationEnrollmentMessage('Confirm the organization administrator controls before connecting this installation.');
+        return;
+    }
     const token = document.getElementById('organization-setup-token').value.trim();
     const button = document.getElementById('btn-confirm-organization-enrollment');
     setOrganizationEnrollmentMessage('');
@@ -3247,11 +3426,13 @@ async function confirmOrganizationEnrollment() {
         } else {
             showToast(`Organization installation connected for ${result.serverLabel}.`, 'success');
         }
+        refreshWorkspaceAfterOrganizationConnection();
         warmRepositoryInBackground();
     } catch (error) {
         setOrganizationEnrollmentMessage(friendlyError(error));
     } finally {
-        button.disabled = false;
+        button.disabled = !document.getElementById('organization-token-control-consent').checked
+            || document.getElementById('organization-enrollment-preview').classList.contains('hidden');
         button.textContent = 'Connect installation';
     }
 }

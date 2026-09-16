@@ -182,6 +182,10 @@ struct Registry {
 
 impl Registry {
     fn register(&self, name: String) -> Result<Arc<BackupControl>> {
+        self.register_with_id(uuid::Uuid::new_v4().to_string(), name)
+    }
+
+    fn register_with_id(&self, id: String, name: String) -> Result<Arc<BackupControl>> {
         let mut state = self
             .state
             .lock()
@@ -191,10 +195,20 @@ impl Registry {
                 "The account is changing or signing out; wait before starting another backup"
             ));
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        if state.active.contains_key(&id) {
+            return Err(anyhow!("This backup operation is already running"));
+        }
         let control = Arc::new(BackupControl::new(id.clone(), name));
         state.active.insert(id, Arc::clone(&control));
         Ok(control)
+    }
+
+    fn find(&self, id: &str) -> Result<Option<Arc<BackupControl>>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|error| anyhow!("Backup registry lock: {}", error))?;
+        Ok(state.active.get(id).cloned())
     }
 
     fn unregister(&self, id: &str) {
@@ -345,6 +359,18 @@ pub fn begin_with_context(
     context: AccountContext,
     name: impl Into<String>,
 ) -> Result<BackupOperation> {
+    begin_with_context_and_id(state, context, None, name)
+}
+
+/// Start a backup under a durable externally supplied job ID. Managed-device
+/// commands use this ID so a later typed cancel command can address exactly
+/// one running backup without exposing a process or shell primitive.
+pub fn begin_with_context_and_id(
+    state: &AppStateWrapper,
+    context: AccountContext,
+    operation_id: Option<&str>,
+    name: impl Into<String>,
+) -> Result<BackupOperation> {
     let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
     let account_email = guard.account_email();
     if !context_matches_session(
@@ -358,13 +384,30 @@ pub fn begin_with_context(
         ));
     }
     let registry = registry();
-    let control = registry.register(name.into())?;
+    let control = if let Some(operation_id) = operation_id {
+        if uuid::Uuid::parse_str(operation_id).is_err() {
+            return Err(anyhow!("Managed backup job ID is invalid"));
+        }
+        registry.register_with_id(operation_id.to_string(), name.into())?
+    } else {
+        registry.register(name.into())?
+    };
     drop(guard);
     Ok(BackupOperation {
         context,
         control,
         registry,
     })
+}
+
+/// Request cancellation of one active backup. Returning `false` is
+/// intentionally idempotent: the job may already be terminal or still queued
+/// in the managed-device database, where the durable cancel flag is handled.
+pub async fn cancel_operation(operation_id: &str) -> Result<bool> {
+    let Some(control) = registry().find(operation_id)? else {
+        return Ok(false);
+    };
+    Ok(control.request_cancel().await)
 }
 
 fn context_matches_session(

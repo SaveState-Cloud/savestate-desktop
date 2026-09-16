@@ -62,6 +62,25 @@ server and temporary directory. No API calls or hosted storage are used.
 
 ## Limits of this verification
 
+The managed folder agent also has an opt-in Windows acceptance test requiring
+only the pinned local Kopia executable, not MariaDB or any SaveState/cloud
+credentials:
+
+```powershell
+$env:SAVESTATE_TEST_KOPIA_BIN = (Resolve-Path src-tauri/bin/kopia.exe).Path
+cargo test --manifest-path src-tauri/Cargo.toml native_managed_folder_kopia_roundtrip_retention_restore_delete -- --ignored --nocapture --test-threads=1
+```
+
+It creates three real local filesystem snapshots, applies the production
+managed-profile retention selection and deletes the excess exact ID, restores
+the newest snapshot through the production protected staging/root and restore
+argument builders, checks binary bytes and SHA-256 plus the other files, then
+deletes the newest exact snapshot and verifies the remaining repository IDs.
+It prints a bounded `NATIVE_MANAGED_EVIDENCE` record. All config, cache, logs,
+source data, restored files, and repository bytes live in its disposable
+temporary directory; Credential Manager is disabled. This proves the local
+Kopia/filesystem boundary, not the hosted command/API lifecycle.
+
 The disposable test does not validate hosted API authorization, production
 storage, credentials, installer/updater release flows, or application-specific
 Windows VSS recovery. Oracle MySQL versions, newer MariaDB versions, and
