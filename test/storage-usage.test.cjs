@@ -9,9 +9,31 @@ const {
     sourceStatistics,
 } = require('../src/storage-usage.js');
 
-test('confirmed empty backup lists still show the optimized repository footprint', () => {
-    const backupState = { backups: [] };
-    assert.equal(customerVisibleUsage({ bytes: 242_984_291 }, backupState), 242_984_291);
+test('small repository metadata is hidden when no customer files exist', () => {
+    assert.equal(customerVisibleUsage({
+        bytes: 15_646,
+        sourceBytes: 0,
+        snapshotCount: 0,
+        fileCount: 0,
+    }, { backups: [] }), 0);
+});
+
+test('empty folders do not count as customer files', () => {
+    assert.equal(customerVisibleUsage({ bytes: 35_000, fileCount: 0 }, {
+        backups: [],
+        folders: [{ id: 'empty-folder' }],
+    }), 0);
+});
+
+test('an empty displayed backup list is enough for older APIs without file counts', () => {
+    assert.equal(customerVisibleUsage({ bytes: 80_000 }, { backups: [] }), 0);
+    assert.equal(customerVisibleUsage({ bytes: 80_000 }, null), 80_000);
+});
+
+test('real files and repositories at the five MiB boundary show actual optimized usage', () => {
+    assert.equal(customerVisibleUsage({ bytes: 80_000, fileCount: 1 }, { backups: [] }), 80_000);
+    assert.equal(customerVisibleUsage({ bytes: 5 * 1024 * 1024, fileCount: 0 }, { backups: [] }), 5 * 1024 * 1024);
+    assert.equal(customerVisibleUsage({ bytes: 242_984_291, fileCount: 0 }, { backups: [] }), 242_984_291);
 });
 
 test('customer quota usage uses optimized storage while source bytes remain separate', () => {
