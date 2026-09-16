@@ -41,6 +41,8 @@ The current Windows client provides:
   footprint, with separate source-data and optimization-savings statistics;
 - whole-snapshot restore into a new destination folder; selective-file restore
   is not currently available;
+- explicitly enrolled organization-managed folder policies that remain
+  read-only in the local UI and run on the device's local wall clock;
 - Windows VSS in `when-available` mode, with normal traversal fallback and
   snapshot failure on file or directory read errors;
 - backup, restore, database, retry, maintenance, and quota status in the app
@@ -74,6 +76,49 @@ product sheet is available at
 - A successful job confirms capture and storage. Customers should still test a
   representative restore and validate the recovered application.
 - Compression and deduplication savings depend on the workload.
+
+### Organization-managed installations
+
+Connecting an organization installation requires an explicit acknowledgement
+in the Windows app. The disclosure names the controls an authorized
+organization administrator receives: create, pause, resume, or remove managed
+local-folder schedules; select any accessible local folder path and see that
+source-path metadata; start or cancel a managed backup; request a whole-snapshot
+restore inside SaveState Restores; and delete a listed snapshot. Managed policies are labelled **Managed
+by _organization_** and their source, schedule, and retention fields cannot be
+edited locally.
+
+Commands are fixed, versioned operations delivered through the authenticated
+device credential; the agent does not expose a shell or accept arbitrary
+commands. Policies and command receipts use separate local tables from personal
+profiles, so organization scheduling does not consume or mutate the personal
+profile allowance. Saved schedules continue to be evaluated using the enrolled
+PC's local wall clock during temporary network outages. Managed work is dormant
+while the owning account is signed out or its vault is locked, and a captured
+account/workspace context is rechecked before repository access.
+
+All backup, restore, and snapshot deletion work runs locally through the same
+Kopia engine and encrypted repository used by the desktop app. A managed
+backup source must be a folder on a local fixed or removable Windows drive;
+UNC/network shares, mapped remote drives, and paths traversing junctions or
+other reparse points are rejected before execution, so managed commands never
+use ambient Windows share credentials. A managed restore command contains only
+the exact snapshot identifier: administrators cannot choose a destination path.
+The app generates a unique new folder under its per-user, environment-isolated
+`SaveState Restores` application-data root. The root and restored descendants
+have a protected Windows ACL; local fixed/removable volumes and pinned,
+reparse-free ancestry are required. Actual destinations are listed only in local
+Settings. Existing paths and in-place overwrite are rejected. Removing an assignment stops its managed
+schedule and pending work but does not delete snapshots. Snapshot deletion is a
+separate, exact-ID command and is reported as deleted only after the local
+repository operation succeeds.
+
+Settings also provides **Disconnect this PC** with a separate destructive
+confirmation. The account-authenticated server disconnect must succeed before
+the device credential is removed locally. The request uses a durable idempotency
+identifier so an uncertain response can be retried safely. Disconnecting
+tombstones managed schedules and cancels their queued or running jobs while
+preserving snapshots and every personal profile.
 
 ## Security model
 

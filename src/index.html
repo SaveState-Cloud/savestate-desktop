@@ -634,7 +634,10 @@
                                 <h3>Organization installation</h3>
                                 <p id="organization-installation-status" class="text-muted" role="status" aria-live="polite">Checking connection…</p>
                             </div>
-                            <button class="btn btn-ghost btn-sm hidden" type="button" id="btn-open-organization-enrollment" aria-expanded="false" aria-controls="organization-enrollment-form">Use setup token</button>
+                            <div class="organization-installation-heading-actions">
+                                <button class="btn btn-ghost btn-sm hidden" type="button" id="btn-open-organization-enrollment" aria-expanded="false" aria-controls="organization-enrollment-form">Use setup token</button>
+                                <button class="btn btn-danger btn-sm hidden" type="button" id="btn-disconnect-organization-installation">Disconnect this PC</button>
+                            </div>
                         </div>
 
                         <div id="organization-account-enrollments" class="organization-account-enrollments hidden" aria-live="polite">
@@ -643,8 +646,12 @@
                                 <p class="text-muted text-sm">Choose the installation for this PC. SaveState will connect it without sharing your password, recovery keys, or decrypted backups with the organization.</p>
                             </div>
                             <div id="organization-account-installation-list" class="organization-account-installation-list"></div>
+                            <label class="organization-control-consent" for="organization-account-control-consent">
+                                <input type="checkbox" id="organization-account-control-consent" />
+                                <span>I understand that authorized organization administrators can select any accessible local folder path on this PC and see that source path metadata; create, pause, and remove its managed backup schedules; start and cancel backups; restore an entire snapshot into a new folder inside SaveState Restores; and delete listed snapshots on this PC. Network shares and mapped drives cannot be used. They never receive my plaintext encryption keys or decrypted backup contents.</span>
+                            </label>
                             <div class="organization-enrollment-actions">
-                                <button class="btn btn-primary btn-sm" type="button" id="btn-connect-account-organization">Connect this PC</button>
+                                <button class="btn btn-primary btn-sm" type="button" id="btn-connect-account-organization" disabled>Connect this PC</button>
                             </div>
                         </div>
 
@@ -676,12 +683,21 @@
                                     <div><dt>Server</dt><dd id="organization-preview-server"></dd></div>
                                     <div><dt>Token expires</dt><dd id="organization-preview-expiry"></dd></div>
                                 </dl>
+                                <label class="organization-control-consent" for="organization-token-control-consent">
+                                    <input type="checkbox" id="organization-token-control-consent" />
+                                    <span>I understand that authorized organization administrators can select any accessible local folder path on this PC and see that source path metadata; create, pause, and remove its managed backup schedules; start and cancel backups; restore an entire snapshot into a new folder inside SaveState Restores; and delete listed snapshots on this PC. Network shares and mapped drives cannot be used. They never receive my plaintext encryption keys or decrypted backup contents.</span>
+                                </label>
                                 <div class="organization-enrollment-actions">
                                     <button class="btn btn-ghost btn-sm" type="button" id="btn-cancel-organization-enrollment">Cancel</button>
-                                    <button class="btn btn-primary btn-sm" type="button" id="btn-confirm-organization-enrollment">Connect installation</button>
+                                    <button class="btn btn-primary btn-sm" type="button" id="btn-confirm-organization-enrollment" disabled>Connect installation</button>
                                 </div>
                             </div>
                         </form>
+                        <details id="local-managed-restores" class="local-managed-restores hidden">
+                            <summary>Organization-requested restores on this PC</summary>
+                            <p class="text-muted text-sm">SaveState chooses a new protected folder inside its per-user SaveState Restores root. These actual destination paths are shown only on this PC, not sent to the organization.</p>
+                            <div id="local-managed-restore-list" class="local-managed-restore-list"></div>
+                        </details>
                     </div>
 
                     <!-- Encryption Info -->

@@ -8,6 +8,7 @@ mod databases;
 mod db;
 mod incremental;
 mod kopia;
+mod managed_device;
 mod notifications;
 mod organization_enrollment;
 mod profiles;
@@ -99,6 +100,9 @@ fn main() {
             let conn = db::init_db(&data_dir).expect("Failed to initialize database");
             profiles::migrate_schedule_times_to_local(&conn)
                 .expect("Failed to migrate scheduled backup times to machine-local time");
+            managed_device::init_db(&conn).expect("Failed to initialize managed-device storage");
+            managed_device::reconcile_startup(&conn)
+                .expect("Failed to reconcile managed-device jobs after startup");
 
             // Register SaveState as a Windows Startup App once. The durable
             // marker is retained if the user later disables SaveState in
@@ -134,6 +138,35 @@ fn main() {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         run_scheduler_tick(&sched_handle).await;
+                    }
+                });
+            });
+
+            // Managed commands use a separate bounded poller and durable local
+            // inbox/outbox. Network outages only delay delivery; already saved
+            // device-local schedules remain independently runnable.
+            let managed_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        managed_device::CONTROL_INITIAL_DELAY_SECONDS,
+                    ))
+                    .await;
+                    let mut failures = 0_u32;
+                    loop {
+                        let state = managed_handle.state::<AppStateWrapper>();
+                        match managed_device::control_tick(managed_handle.clone(), state.inner())
+                            .await
+                        {
+                            Ok(()) => failures = 0,
+                            Err(error) => {
+                                failures = failures.saturating_add(1);
+                                eprintln!("Organization managed-device poll deferred: {error}");
+                            }
+                        }
+                        let delay = managed_device::control_poll_delay_seconds(failures);
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     }
                 });
             });
@@ -282,8 +315,11 @@ fn main() {
             organization_enrollment::cmd_get_organization_installation_status,
             organization_enrollment::cmd_list_available_organization_installations,
             organization_enrollment::cmd_connect_organization_installation,
+            organization_enrollment::cmd_disconnect_organization_installation,
             organization_enrollment::cmd_inspect_organization_installation,
             organization_enrollment::cmd_redeem_organization_installation,
+            managed_device::cmd_list_managed_profiles,
+            managed_device::cmd_list_local_managed_restores,
             workspaces::cmd_list_account_workspaces,
             workspaces::cmd_switch_account_workspace,
             // Updates
@@ -384,6 +420,10 @@ mod windows_autostart_tests {
 /// This runs on a background thread and accesses state via the app handle.
 async fn run_scheduler_tick(app_handle: &tauri::AppHandle) {
     let state: tauri::State<'_, AppStateWrapper> = app_handle.state();
+
+    if let Err(error) = managed_device::schedule_tick(app_handle.clone(), state.inner()).await {
+        eprintln!("Managed backup schedule tick deferred: {error}");
+    }
 
     // Remembered sessions restore both the token and encryption key. Leave
     // schedules pending until both are available.

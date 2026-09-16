@@ -47,6 +47,15 @@ test('Settings discovers account assignments first and keeps token enrollment as
 
 test('successful redemption switches the service session and warms the repository', () => {
   assert.match(app, /renderOrganizationInstallationStatus\(result\)/);
+  assert.equal((app.match(/refreshWorkspaceAfterOrganizationConnection\(\)/g) || []).length, 3);
+  const refresh = app.slice(
+    app.indexOf('function refreshWorkspaceAfterOrganizationConnection()'),
+    app.indexOf('function openOrganizationEnrollment()'),
+  );
+  assert.match(refresh, /workspaceUiGeneration \+= 1/);
+  assert.match(refresh, /repositorySessionGeneration \+= 1/);
+  assert.match(refresh, /repositoryWarmupPromise = null/);
+  assert.match(refresh, /void loadDashboard\(\)/);
   assert.match(app, /warmRepositoryInBackground\(\)/);
   assert.match(api, /serviceId/);
   assert.match(api, /pub account_token: String/);

@@ -1,7 +1,9 @@
 use crate::api::{
     OrganizationAvailableInstallationsResponse, OrganizationBackupHeartbeat,
     OrganizationEnrollmentPreviewResponse, OrganizationEnrollmentRedeemResponse, SaveStateClient,
+    ORGANIZATION_CONTROL_SCHEMA_VERSION,
 };
+use crate::backup_operations::AccountContext;
 use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,21 @@ pub struct OrganizationInstallationConnection {
     pub connected_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationInstallationDisconnectResult {
+    pub disconnected: bool,
+    pub snapshots_preserved: bool,
+    pub cancelled_jobs: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedDeviceContext {
+    pub(crate) installation_id: String,
+    pub(crate) device_credential: String,
+    pub(crate) account: AccountContext,
 }
 
 fn credential_entry() -> Result<keyring::v1::Entry> {
@@ -200,7 +217,7 @@ impl StoredOrganizationInstallation {
     }
 }
 
-fn device_credential_was_revoked(error: &anyhow::Error) -> bool {
+pub(crate) fn device_credential_was_revoked(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("invalid_device_credential"))
@@ -213,6 +230,144 @@ fn installation_for_account(account_email: &str) -> Option<StoredOrganizationIns
         .trim()
         .eq_ignore_ascii_case(account_email.trim())
         .then_some(stored)
+}
+
+pub(crate) fn managed_device_binding(state: &AppStateWrapper) -> Result<Option<(String, String)>> {
+    let account_email = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|error| anyhow!("Lock error: {error}"))?;
+        let Some(account_email) = guard.account_email() else {
+            return Ok(None);
+        };
+        account_email
+    };
+    let Some(stored) = installation_for_account(&account_email) else {
+        return Ok(None);
+    };
+    let Some(workspace_id) = stored.workspace_id else {
+        return Ok(None);
+    };
+    Ok(Some((
+        stored.installation_id,
+        format!("{}::{workspace_id}", account_email.trim()),
+    )))
+}
+
+/// Build an organization-workspace context without changing the workspace
+/// selected in the visible UI. Managed work is deliberately dormant while the
+/// user is signed out or the vault key is unavailable; remembered sessions
+/// resume it automatically after startup.
+pub(crate) async fn managed_device_context(
+    state: &AppStateWrapper,
+) -> Result<Option<ManagedDeviceContext>> {
+    let (active_api, account_email, master_key, session_generation) = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|error| anyhow!("Lock error: {error}"))?;
+        let Some(account_email) = guard.account_email() else {
+            return Ok(None);
+        };
+        let Some(master_key) = guard.master_key else {
+            return Ok(None);
+        };
+        (
+            guard.api.clone(),
+            account_email,
+            master_key,
+            guard.session_generation,
+        )
+    };
+    let Some(stored) = installation_for_account(&account_email) else {
+        return Ok(None);
+    };
+    let Some(workspace_id) = stored.workspace_id.as_deref() else {
+        // A legacy enrollment first learns its authenticated workspace from
+        // heartbeat. Never guess a workspace for managed commands.
+        return Ok(None);
+    };
+
+    let mut scoped_api = active_api.clone();
+    if active_api.workspace_id().as_deref() != Some(workspace_id) {
+        let switched = active_api.switch_account_workspace(workspace_id).await?;
+        scoped_api.set_token(switched.token);
+    }
+
+    {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|error| anyhow!("Lock error: {error}"))?;
+        if guard.session_generation != session_generation
+            || guard.account_email().as_deref() != Some(account_email.as_str())
+            || guard.master_key.is_none()
+        {
+            return Err(anyhow!(
+                "The signed-in account changed while managed-device access was loading"
+            ));
+        }
+    }
+    if !INSTALLATIONS
+        .load()?
+        .as_ref()
+        .is_some_and(|current| current.same_binding(&stored))
+    {
+        return Err(anyhow!(
+            "The organization installation changed while managed-device access was loading"
+        ));
+    }
+
+    Ok(Some(ManagedDeviceContext {
+        installation_id: stored.installation_id,
+        device_credential: stored.device_credential,
+        account: AccountContext {
+            api: scoped_api,
+            account_scope: format!("{}::{workspace_id}", account_email.trim()),
+            repository_password: hex::encode(master_key),
+            session_generation,
+        },
+    }))
+}
+
+async fn cleanup_revoked_installation(
+    state: &AppStateWrapper,
+    stored: &StoredOrganizationInstallation,
+) -> Result<usize> {
+    let cancelled_jobs = if let Some(workspace_id) = stored.workspace_id.as_deref() {
+        let owner_account = format!("{}::{workspace_id}", stored.account_email.trim());
+        crate::managed_device::disconnect_local_managed_state(
+            state,
+            &stored.installation_id,
+            &owner_account,
+        )
+        .await?
+    } else {
+        0
+    };
+    INSTALLATIONS.remove_if_current(stored)?;
+    Ok(cancelled_jobs)
+}
+
+pub(crate) async fn cleanup_revoked_managed_context(
+    state: &AppStateWrapper,
+    context: &ManagedDeviceContext,
+) -> Result<()> {
+    crate::managed_device::disconnect_local_managed_state(
+        state,
+        &context.installation_id,
+        &context.account.account_scope,
+    )
+    .await?;
+    if let Some(stored) = INSTALLATIONS.load()? {
+        if stored.installation_id == context.installation_id
+            && stored.matches_scope(&context.account.account_scope)
+        {
+            INSTALLATIONS.remove_if_current(&stored)?;
+        }
+    }
+    Ok(())
 }
 
 fn status_for_account(
@@ -287,11 +442,12 @@ pub(crate) fn queue_organization_installation_backup_heartbeat(
                 }
                 Err(error) => {
                     if device_credential_was_revoked(&error) {
-                        if let Err(remove_error) = INSTALLATIONS.remove_if_current(&stored) {
-                            eprintln!(
-                                "Failed to remove revoked organization credential: {remove_error}"
-                            );
-                        }
+                        // Keep the credential until a state-aware poll or the
+                        // periodic heartbeat can cancel local managed work and
+                        // tombstone schedules before removing it.
+                        eprintln!(
+                            "Organization credential was revoked; local managed cleanup is pending"
+                        );
                         return;
                     }
                     eprintln!("Organization installation health report failed: {error}");
@@ -325,7 +481,7 @@ pub(crate) async fn send_organization_installation_heartbeat(
         Ok(response) => response,
         Err(error) => {
             if device_credential_was_revoked(&error) {
-                INSTALLATIONS.remove_if_current(&stored)?;
+                cleanup_revoked_installation(state, &stored).await?;
                 return Ok(());
             }
             return Err(error);
@@ -407,6 +563,70 @@ pub async fn cmd_connect_organization_installation(
     connect_organization_installation(state.inner(), installation_id.trim())
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_disconnect_organization_installation(
+    state: tauri::State<'_, AppStateWrapper>,
+) -> std::result::Result<OrganizationInstallationDisconnectResult, String> {
+    disconnect_organization_installation(state.inner())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn disconnect_organization_installation(
+    state: &AppStateWrapper,
+) -> Result<OrganizationInstallationDisconnectResult> {
+    let context = managed_device_context(state)
+        .await?
+        .ok_or_else(|| anyhow!("No organization installation is connected to this account"))?;
+    let stored = INSTALLATIONS
+        .load()?
+        .filter(|stored| {
+            stored.installation_id == context.installation_id
+                && stored.matches_scope(&context.account.account_scope)
+        })
+        .ok_or_else(|| anyhow!("The organization installation connection changed"))?;
+    let request_id = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|error| anyhow!("Lock error: {error}"))?;
+        crate::managed_device::disconnect_request_id(
+            &guard.db,
+            &context.installation_id,
+            &context.account.account_scope,
+        )?
+    };
+    let response = context
+        .account
+        .api
+        .disconnect_organization_installation(&context.installation_id, &request_id)
+        .await?;
+    if response.schema_version != ORGANIZATION_CONTROL_SCHEMA_VERSION
+        || response.installation.id != context.installation_id
+        || response.installation.status != "disabled"
+        || response.installation.connection_state != "disconnected"
+        || chrono::DateTime::parse_from_rfc3339(&response.installation.disconnected_at).is_err()
+        || response.managed_state.local_action != "remove_schedules_and_cancel_jobs"
+        || !response.managed_state.snapshots_preserved
+    {
+        return Err(anyhow!(
+            "The organization disconnect response was invalid; local access was left unchanged"
+        ));
+    }
+    let cancelled_jobs = crate::managed_device::disconnect_local_managed_state(
+        state,
+        &context.installation_id,
+        &context.account.account_scope,
+    )
+    .await?;
+    INSTALLATIONS.remove_if_current(&stored)?;
+    Ok(OrganizationInstallationDisconnectResult {
+        disconnected: true,
+        snapshots_preserved: true,
+        cancelled_jobs,
+    })
 }
 
 #[tauri::command]

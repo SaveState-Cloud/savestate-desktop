@@ -311,7 +311,7 @@ code {
 }
 
 .btn-danger:hover {
-  background: var(--danger);
+  background: var(--danger-hover);
   color: #fff;
 }
 
@@ -792,6 +792,50 @@ code {
 .profile-card:hover {
   border-color: var(--accent);
   transform: translateY(-2px);
+}
+
+.managed-profile-card {
+  border-color: var(--border-focus);
+}
+
+.managed-profile-owner {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: fit-content;
+  margin-bottom: 0.8rem;
+  padding: 0.35rem 0.55rem;
+  border-radius: 7px;
+  background: var(--accent-ghost);
+  color: var(--accent);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.managed-profile-lock {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex: 0 0 0.9rem;
+}
+
+.local-managed-restores { margin-top: 1rem; }
+.local-managed-restores summary { cursor: pointer; font-weight: 600; }
+.local-managed-restore-list { display: grid; gap: 0.75rem; margin-top: 0.75rem; }
+.local-managed-restore-item { display: grid; gap: 0.25rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: 0.5rem; }
+.local-managed-restore-path { overflow-wrap: anywhere; user-select: text; color: var(--text-muted); font-size: 0.875rem; }
+
+.managed-profile-description {
+  margin: -0.35rem 0 1rem;
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.managed-profile-note {
+  margin: 0 0 1rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 .profile-card-header {
@@ -1614,6 +1658,14 @@ code {
   margin-bottom: 0.45rem;
 }
 
+.organization-installation-heading-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.65rem;
+}
+
 .organization-enrollment-form {
   margin-top: 1.4rem;
   padding-top: 1.25rem;
@@ -1777,6 +1829,29 @@ code {
   justify-content: flex-end;
   gap: 0.65rem;
   margin-top: 1.1rem;
+}
+
+.organization-control-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  margin-top: 1rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.organization-control-consent input {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 1rem;
+  margin-top: 0.15rem;
+  accent-color: var(--accent);
 }
 
 @media (max-width: 720px) {

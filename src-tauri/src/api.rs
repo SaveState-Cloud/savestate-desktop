@@ -317,6 +317,31 @@ pub struct OrganizationAvailableInstallation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OrganizationInstallationDisconnectResponse {
+    pub schema_version: u32,
+    pub installation: OrganizationDisconnectedInstallation,
+    pub managed_state: OrganizationDisconnectedManagedState,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationDisconnectedInstallation {
+    pub id: String,
+    pub status: String,
+    pub connection_state: String,
+    pub disconnected_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationDisconnectedManagedState {
+    pub local_action: String,
+    pub snapshots_preserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizationBackupHeartbeat {
     pub event_id: String,
     pub status: String,
@@ -325,6 +350,51 @@ pub struct OrganizationBackupHeartbeat {
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<String>,
+}
+
+pub const ORGANIZATION_CONTROL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationControlOrganization {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationControlCommand {
+    pub id: String,
+    pub kind: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub lease_id: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationControlPollResponse {
+    pub schema_version: u32,
+    pub poll_id: String,
+    pub lease_expires_at: String,
+    pub organization: OrganizationControlOrganization,
+    pub commands: Vec<OrganizationControlCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationControlAcknowledgement {
+    pub command_id: String,
+    pub lease_id: String,
+    pub status: String,
+    pub completed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 /// Privacy-safe schedule metadata sent to Engine. Profile names and source
@@ -396,6 +466,46 @@ async fn parse_organization_enrollment_json<T: serde::de::DeserializeOwned>(
         return Err(anyhow!("{} failed ({})", operation, status));
     }
     serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", operation))
+}
+
+const ORGANIZATION_CONTROL_BODY_LIMIT: usize = 64 * 1024;
+
+fn ensure_control_body_size(body: &serde_json::Value) -> Result<()> {
+    if serde_json::to_vec(body)?.len() > ORGANIZATION_CONTROL_BODY_LIMIT {
+        return Err(anyhow!(
+            "Organization managed-device request exceeds the 64 KiB limit"
+        ));
+    }
+    Ok(())
+}
+
+async fn parse_organization_control_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("{operation} failed ({status}): {text}"));
+    }
+    if text.len() > ORGANIZATION_CONTROL_BODY_LIMIT {
+        return Err(anyhow!(
+            "{operation} returned more than the 64 KiB protocol limit"
+        ));
+    }
+    serde_json::from_str(&text).with_context(|| format!("Failed to parse {operation} response"))
+}
+
+async fn parse_organization_control_empty(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(anyhow!("{operation} failed ({status}): {text}"))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -597,6 +707,30 @@ impl SaveStateClient {
         parse_organization_enrollment_json(response, "Organization installation connection").await
     }
 
+    pub async fn disconnect_organization_installation(
+        &self,
+        installation_id: &str,
+        request_id: &str,
+    ) -> Result<OrganizationInstallationDisconnectResponse> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/disconnect",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header()?)
+            .timeout(std::time::Duration::from_secs(20))
+            .json(&serde_json::json!({
+                "schemaVersion": ORGANIZATION_CONTROL_SCHEMA_VERSION,
+                "installationId": installation_id,
+                "requestId": request_id,
+            }))
+            .send()
+            .await
+            .context("Failed to disconnect the organization installation")?;
+        parse_organization_enrollment_json(response, "Organization installation disconnect").await
+    }
+
     pub async fn redeem_organization_installation(
         &self,
         setup_token: &str,
@@ -646,6 +780,94 @@ impl SaveStateClient {
         Err(anyhow!(
             "Organization installation heartbeat failed ({status}): {text}"
         ))
+    }
+
+    pub async fn organization_control_poll(
+        &self,
+        device_credential: &str,
+        poll_id: &str,
+        limit: u8,
+    ) -> Result<OrganizationControlPollResponse> {
+        let limit = limit.clamp(1, 10);
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/control/poll",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {device_credential}"))
+            .timeout(std::time::Duration::from_secs(20))
+            .json(&serde_json::json!({
+                "schemaVersion": ORGANIZATION_CONTROL_SCHEMA_VERSION,
+                "pollId": poll_id,
+                "limit": limit,
+            }))
+            .send()
+            .await
+            .context("Failed to poll organization managed-device commands")?;
+        parse_organization_control_json(response, "Organization managed-device poll").await
+    }
+
+    pub async fn organization_control_acknowledge(
+        &self,
+        device_credential: &str,
+        acknowledgements: &[OrganizationControlAcknowledgement],
+    ) -> Result<()> {
+        if acknowledgements.is_empty() {
+            return Ok(());
+        }
+        if acknowledgements.len() > 10 {
+            return Err(anyhow!("Too many organization command acknowledgements"));
+        }
+        let body = serde_json::json!({
+            "schemaVersion": ORGANIZATION_CONTROL_SCHEMA_VERSION,
+            "acknowledgements": acknowledgements,
+        });
+        ensure_control_body_size(&body)?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/control/ack",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {device_credential}"))
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to acknowledge organization managed-device commands")?;
+        parse_organization_control_empty(response, "Organization command acknowledgement").await
+    }
+
+    pub async fn organization_control_events(
+        &self,
+        device_credential: &str,
+        events: &[serde_json::Value],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() > 50 {
+            return Err(anyhow!("Too many organization managed-device events"));
+        }
+        let body = serde_json::json!({
+            "schemaVersion": ORGANIZATION_CONTROL_SCHEMA_VERSION,
+            "events": events,
+        });
+        ensure_control_body_size(&body)?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/organization/installations/control/events",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {device_credential}"))
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to report organization managed-device events")?;
+        parse_organization_control_empty(response, "Organization managed-device events").await
     }
 
     /// Best-effort metadata-only job lifecycle reporting. This is intentionally

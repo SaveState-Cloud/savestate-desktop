@@ -1651,11 +1651,21 @@ pub(crate) async fn delete_snapshot_with_lease(
     delete_snapshot_with_context(app, engine, &context, snapshot_id).await
 }
 
-async fn delete_snapshot_with_context(
+pub(crate) async fn delete_snapshot_with_context(
+    app: &tauri::AppHandle,
+    engine: &EngineLease<'_>,
+    context: &AccountContext,
+    snapshot_id: &str,
+) -> Result<()> {
+    delete_snapshot_with_context_and_control(app, engine, context, snapshot_id, None).await
+}
+
+pub(crate) async fn delete_snapshot_with_context_and_control(
     app: &tauri::AppHandle,
     _engine: &EngineLease<'_>,
     context: &AccountContext,
     snapshot_id: &str,
+    cancellation: Option<&Arc<BackupControl>>,
 ) -> Result<()> {
     context.ensure_current(app.state::<AppStateWrapper>().inner())?;
     let api = context.api.clone();
@@ -1666,9 +1676,11 @@ async fn delete_snapshot_with_context(
         "manual",
     );
     engine_job.progress("repository_connect");
-    let (session, password) = ensure_repo_with_context(app, &context, "backup", None, None).await?;
+    let (session, password) =
+        ensure_repo_with_context(app, &context, "backup", None, cancellation).await?;
     let app_c = app.clone();
     let session_c = session.clone();
+    let cancellation = cancellation.cloned();
 
     let snapshot_id_c = snapshot_id.to_string();
     engine_job.progress("snapshot_delete");
@@ -1679,7 +1691,13 @@ async fn delete_snapshot_with_context(
             snapshot_id_c,
             "--delete".to_string(),
         ];
-        let out = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
+        let out = run_kopia_for_backup(
+            &app_c,
+            &args,
+            Some(&password),
+            Some(&session_c),
+            cancellation.as_ref(),
+        )?;
         if out.status.success() {
             return Ok(());
         }
@@ -1774,7 +1792,7 @@ pub async fn prune_profile_snapshots_with_operation(
     Ok(expired)
 }
 
-fn expired_profile_snapshot_ids(
+pub(crate) fn expired_profile_snapshot_ids(
     snapshots: Vec<KopiaSnapshot>,
     profile_id: &str,
     profile_folder: &str,
@@ -1803,13 +1821,23 @@ fn expired_profile_snapshot_ids(
         .collect()
 }
 
-async fn list_snapshots_from_repository(
+pub(crate) async fn list_snapshots_from_repository(
     app: &tauri::AppHandle,
     context: &AccountContext,
 ) -> Result<Vec<KopiaSnapshot>> {
-    let (session, password) = ensure_repo_with_context(app, context, "backup", None, None).await?;
+    list_snapshots_from_repository_with_control(app, context, None).await
+}
+
+pub(crate) async fn list_snapshots_from_repository_with_control(
+    app: &tauri::AppHandle,
+    context: &AccountContext,
+    cancellation: Option<&Arc<BackupControl>>,
+) -> Result<Vec<KopiaSnapshot>> {
+    let (session, password) =
+        ensure_repo_with_context(app, context, "backup", None, cancellation).await?;
     let app_c = app.clone();
     let session_c = session.clone();
+    let cancellation = cancellation.cloned();
     tokio::task::spawn_blocking(move || -> Result<Vec<KopiaSnapshot>> {
         let args = vec![
             "snapshot".to_string(),
@@ -1817,7 +1845,13 @@ async fn list_snapshots_from_repository(
             "--all".to_string(),
             "--json".to_string(),
         ];
-        let out = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
+        let out = run_kopia_for_backup(
+            &app_c,
+            &args,
+            Some(&password),
+            Some(&session_c),
+            cancellation.as_ref(),
+        )?;
         ensure_success(&out, "snapshot list")?;
 
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2347,15 +2381,54 @@ pub(crate) async fn restore_snapshot_with_lease(
     snapshot_id: &str,
     target_path: &str,
 ) -> Result<()> {
-    let op_id = uuid::Uuid::new_v4().to_string();
     let context = {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
         AccountContext::capture(&guard)?
     };
+    restore_snapshot_with_context(app, _engine, &context, snapshot_id, target_path, "manual").await
+}
+
+/// Restore under a pre-authorized workspace context without switching the
+/// workspace displayed in the desktop UI. This is used only by the typed
+/// managed-device restore command; the destination is validated by its caller.
+pub(crate) async fn restore_snapshot_with_context(
+    app: &tauri::AppHandle,
+    engine: &EngineLease<'_>,
+    context: &AccountContext,
+    snapshot_id: &str,
+    target_path: &str,
+    trigger: &'static str,
+) -> Result<()> {
+    restore_snapshot_with_context_and_control(
+        app,
+        engine,
+        context,
+        snapshot_id,
+        target_path,
+        trigger,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn restore_snapshot_with_context_and_control(
+    app: &tauri::AppHandle,
+    _engine: &EngineLease<'_>,
+    context: &AccountContext,
+    snapshot_id: &str,
+    target_path: &str,
+    trigger: &'static str,
+    cancellation: Option<&Arc<BackupControl>>,
+) -> Result<()> {
+    context.ensure_current(app.state::<AppStateWrapper>().inner())?;
+    let op_id = uuid::Uuid::new_v4().to_string();
     let api = context.api.clone();
-    let mut engine_job = EngineJobReporter::start(api.clone(), op_id.clone(), "restore", "manual");
+    let mut engine_job = EngineJobReporter::start(api.clone(), op_id.clone(), "restore", trigger);
     let mut terminal_progress = TerminalProgressGuard::restore(app, &op_id);
     clear_restore_cancellation(snapshot_id);
+    if cancellation.is_some_and(|control| control.is_cancel_requested()) {
+        cancel_restore(snapshot_id);
+    }
     emit_restore_progress(app, &op_id, "preparing", 0.1, "Preparing restore…");
 
     // Determine the snapshot size for replay-safe operational transfer telemetry.
@@ -2403,7 +2476,7 @@ pub(crate) async fn restore_snapshot_with_lease(
     engine_job.progress("repository_connect");
     let (session, password) = ensure_repo_with_context(
         app,
-        &context,
+        context,
         "restore",
         authorization.grant_id.as_deref(),
         None,
@@ -2428,14 +2501,34 @@ pub(crate) async fn restore_snapshot_with_lease(
     let cancellation_id = snapshot_id.to_string();
     let target = target_path.to_string();
 
+    let managed_restore = trigger == "managed_restore";
     engine_job.progress("snapshot_restore");
     let restore_result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let args = vec![
-            "restore".to_string(),
-            snapshot,
-            target,
-            "--no-progress".to_string(),
-        ];
+        let restore_source = if managed_restore {
+            // Resolve only the exact manifest in the reachable repository.
+            // Use its validated directory content object as the Kopia source,
+            // never an administrator-supplied object/path selector or prefix.
+            let list_args = vec![
+                "snapshot".into(),
+                "list".into(),
+                "--all".into(),
+                "--json".into(),
+            ];
+            let listed = run_kopia_cancellable(
+                &app_c,
+                &list_args,
+                Some(&password),
+                Some(&session_c),
+                &cancellation_id,
+            )?;
+            ensure_success(&listed, "managed restore snapshot lookup")?;
+            let listed: serde_json::Value =
+                serde_json::from_slice(&listed.stdout).context("Invalid local snapshot list")?;
+            managed_snapshot_restore_root(&listed, &snapshot)?
+        } else {
+            snapshot.clone()
+        };
+        let args = snapshot_restore_args(&restore_source, &target, managed_restore);
         let out = run_kopia_cancellable(
             &app_c,
             &args,
@@ -2489,6 +2582,59 @@ pub(crate) async fn restore_snapshot_with_lease(
         None,
     );
     Ok(())
+}
+
+pub(crate) fn snapshot_restore_args(
+    restore_source: &str,
+    target_path: &str,
+    managed: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = if managed {
+        // The caller resolves a managed manifest to its exact folder root.
+        vec!["snapshot".into(), "restore".into()]
+    } else {
+        vec!["restore".into()]
+    };
+    args.extend([
+        restore_source.into(),
+        target_path.into(),
+        "--no-progress".into(),
+    ]);
+    if managed {
+        // Snapshot metadata must not replace the protected, process-user ACL
+        // or owner applied by the managed restore confinement boundary.
+        args.extend(["--skip-owners".into(), "--skip-permissions".into()]);
+    }
+    args
+}
+
+pub(crate) fn managed_snapshot_restore_root(
+    listed: &serde_json::Value,
+    snapshot_id: &str,
+) -> Result<String> {
+    let snapshot = listed
+        .as_array()
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot["id"].as_str() == Some(snapshot_id))
+        })
+        .ok_or_else(|| {
+            anyhow!("SNAPSHOT_NOT_FOUND: Exact managed snapshot is not present in this repository")
+        })?;
+    let root = &snapshot["rootEntry"];
+    let object = root["obj"]
+        .as_str()
+        .filter(|object| {
+            !object.is_empty()
+                && object.len() <= 256
+                && object.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .filter(|_| root["type"].as_str() == Some("d"))
+        .ok_or_else(|| {
+            anyhow!("SNAPSHOT_ROOT_INVALID: Managed snapshot has no safe folder root")
+        })?;
+    Ok(object.to_string())
 }
 
 /// Apply a FIFO retention policy: keep only the latest `keep_latest` snapshots.
@@ -2799,7 +2945,7 @@ pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
     schedule_storage_cleanup_with_context(app, context)
 }
 
-fn schedule_storage_cleanup_with_context(
+pub(crate) fn schedule_storage_cleanup_with_context(
     app: tauri::AppHandle,
     context: AccountContext,
 ) -> &'static str {
@@ -2982,6 +3128,26 @@ pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_restore_resolves_only_exact_local_folder_roots() {
+        let listed = serde_json::json!([
+            {"id":"snapshot-one","rootEntry":{"type":"d","obj":"k1234abcdef"}},
+            {"id":"snapshot-one-extra","rootEntry":{"type":"d","obj":"k5678abcdef"}},
+            {"id":"file-snapshot","rootEntry":{"type":"f","obj":"abcdef"}},
+            {"id":"unsafe-root","rootEntry":{"type":"d","obj":"k123/path"}}
+        ]);
+        assert_eq!(
+            super::managed_snapshot_restore_root(&listed, "snapshot-one").unwrap(),
+            "k1234abcdef"
+        );
+        for id in ["snapshot", "missing", "file-snapshot", "unsafe-root"] {
+            assert!(super::managed_snapshot_restore_root(&listed, id).is_err());
+        }
+        let args = super::snapshot_restore_args("k1234abcdef", r"C:\Safe\New", true);
+        assert_eq!(&args[..3], &["snapshot", "restore", "k1234abcdef"]);
+        assert!(args.iter().any(|arg| arg == "--skip-owners"));
+        assert!(args.iter().any(|arg| arg == "--skip-permissions"));
+    }
     use super::{
         backup_reliability_policy_args, begin_operation, cancel_restore, classify_kopia_error,
         clear_restore_cancellation, database_content_object_from_value,
