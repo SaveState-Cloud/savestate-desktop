@@ -227,6 +227,22 @@ fn safe_output(output: &std::process::Output, action: &str) -> Result<()> {
     } else {
         // S3 endpoints can echo request details, so never return raw stderr to
         // the UI, logs, or engine telemetry.
+        let message = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if message.contains("invalid repository password")
+            || message.contains("unable to decrypt content")
+            || message.contains("message authentication failed")
+        {
+            bail!("REPOSITORY_KEY_MISMATCH: This bucket cannot be unlocked with the current account key. No backup data was changed.");
+        }
+        if message.contains("invalidaccesskeyid")
+            || message.contains("signaturedoesnotmatch")
+            || message.contains("accessdenied")
+        {
+            bail!("BYOS_CREDENTIALS_INVALID: Check the bucket access key and permissions");
+        }
+        if message.contains("nosuchbucket") || message.contains("bucket does not exist") {
+            bail!("BYOS_BUCKET_NOT_FOUND: Create the bucket or check its name and region");
+        }
         bail!("BYOS_{action}_FAILED: Check the destination and credentials, then retry")
     }
 }
@@ -832,5 +848,11 @@ mod tests {
         )
         .is_err());
         assert!(validate(input("https://storage.example.com/path"), "owner".into()).is_err());
+    }
+
+    #[test]
+    fn wrong_repository_key_is_never_mistaken_for_an_empty_bucket() {
+        let message = "unable to create format manager: invalid repository password";
+        assert!(!kopia::repository_is_missing(message));
     }
 }
