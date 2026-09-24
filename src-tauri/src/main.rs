@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod backup;
 mod backup_operations;
+mod byos;
 mod databases;
 mod db;
 mod incremental;
@@ -264,6 +265,12 @@ fn main() {
             profiles::cmd_count_unowned_profiles,
             profiles::cmd_claim_unowned_profiles,
             profiles::cmd_run_profile_backup,
+            byos::cmd_byos_entitlements,
+            byos::cmd_byos_list_vaults,
+            byos::cmd_byos_add_vault,
+            byos::cmd_byos_remove_vault,
+            byos::cmd_byos_list_snapshots,
+            byos::cmd_byos_restore,
             // Database backups
             databases::cmd_discover_database_tools,
             databases::cmd_test_database_connection,

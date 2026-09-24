@@ -517,7 +517,7 @@ fn build_kopia_command(
     cmd
 }
 
-fn run_kopia(
+pub(crate) fn run_kopia(
     app: &tauri::AppHandle,
     args: &[String],
     repo_password: Option<&str>,
@@ -530,7 +530,7 @@ fn run_kopia(
         .with_context(|| format!("Failed to execute kopia at {:?}", bin))
 }
 
-fn run_kopia_for_backup(
+pub(crate) fn run_kopia_for_backup(
     app: &tauri::AppHandle,
     args: &[String],
     repo_password: Option<&str>,
@@ -682,7 +682,7 @@ fn ensure_success(output: &Output, action: &str) -> Result<()> {
     Err(classify_kopia_error(action, &stderr))
 }
 
-fn repository_is_missing(stderr: &str) -> bool {
+pub(crate) fn repository_is_missing(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("repository not initialized")
         || lower.contains("repository is not initialized")
@@ -728,7 +728,7 @@ fn api_from_state(state: &AppStateWrapper) -> Result<SaveStateClient> {
 }
 
 /// Build the shared `s3` connection arguments for connect/create.
-fn s3_connect_args(session: &RepoSession) -> Vec<String> {
+pub(crate) fn s3_connect_args(session: &RepoSession) -> Vec<String> {
     let endpoint = session.endpoint_host.clone().unwrap_or_else(|| {
         session
             .endpoint
@@ -736,16 +736,20 @@ fn s3_connect_args(session: &RepoSession) -> Vec<String> {
             .replace("http://", "")
     });
 
-    vec![
+    let mut args = vec![
         "s3".to_string(),
         format!("--bucket={}", session.bucket),
         format!("--endpoint={}", endpoint),
         format!("--prefix={}", session.prefix),
         format!("--region={}", session.region),
-    ]
+    ];
+    if session.endpoint.starts_with("http://") {
+        args.push("--disable-tls".to_string());
+    }
+    args
 }
 
-fn backup_reliability_policy_args(
+pub(crate) fn backup_reliability_policy_args(
     new_repository: bool,
     enable_volume_shadow_copy: bool,
 ) -> Option<Vec<String>> {
@@ -1836,7 +1840,7 @@ async fn list_snapshots_from_repository(
     .context("kopia list task panicked")?
 }
 
-fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
+pub(crate) fn parse_snapshot(item: &serde_json::Value) -> KopiaSnapshot {
     let id = item
         .get("id")
         .and_then(|v| v.as_str())

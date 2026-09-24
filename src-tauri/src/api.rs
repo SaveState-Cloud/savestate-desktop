@@ -65,6 +65,10 @@ pub struct AccountResponse {
 pub struct EntitlementResponse {
     #[serde(default, alias = "profileLimit", alias = "profile_limit")]
     pub profile_limit: Option<u32>,
+    #[serde(default, alias = "byosEnabled")]
+    pub byos_enabled: bool,
+    #[serde(default, alias = "maxByosVaults")]
+    pub max_byos_vaults: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
