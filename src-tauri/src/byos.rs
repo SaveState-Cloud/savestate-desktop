@@ -527,17 +527,19 @@ pub async fn cmd_byos_entitlements(
 pub async fn cmd_byos_list_vaults(
     state: tauri::State<'_, AppStateWrapper>,
 ) -> Result<Vec<Vault>, String> {
-    let guard = state.0.lock().map_err(|e| e.to_string())?;
-    let owner = guard.byos_scope().ok_or("Sign in first")?;
-    let mut stmt = guard.db.prepare(
-        "SELECT id, owner_account, label, provider, endpoint, region, bucket, prefix, created_at
-         FROM byos_vaults WHERE owner_account = ?1 ORDER BY created_at DESC"
-    ).map_err(|e| e.to_string())?;
-    let mut vaults = stmt
-        .query_map(params![owner], vault_from_row)
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
+    let mut vaults = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let owner = guard.byos_scope().ok_or("Sign in first")?;
+        let mut stmt = guard.db.prepare(
+            "SELECT id, owner_account, label, provider, endpoint, region, bucket, prefix, created_at
+             FROM byos_vaults WHERE owner_account = ?1 ORDER BY created_at DESC",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![owner], vault_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?
+    };
     for vault in &mut vaults {
         if vault.provider == "filesystem" {
             let credentials = VaultCredentials {
