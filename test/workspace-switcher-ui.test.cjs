@@ -9,13 +9,28 @@ const app = fs.readFileSync(path.join(root, 'src', 'app.js'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'src', 'styles.css'), 'utf8');
 const state = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'state.rs'), 'utf8');
 
-test('sidebar exposes an accessible personal and organization workspace switcher', () => {
-  assert.match(html, /id="workspace-trigger"[^>]+aria-haspopup="listbox"/);
-  assert.match(html, /id="workspace-menu"[^>]+role="listbox"/);
+test('lower-left switcher selects vaults and still reaches organization accounts', () => {
+  assert.match(html, /id="workspace-trigger"[^>]+aria-haspopup="menu"/);
+  assert.match(html, /id="workspace-menu"[^>]+role="menu"/);
+  assert.match(app, /data-vault-id="\$\{escapeHtml\(vault\.id\)\}"/);
+  assert.match(app, /role="menuitemradio"/);
+  assert.match(app, /function selectVault\(vaultId\)/);
+  assert.match(app, /data-vault-action="add"/);
   assert.match(app, /cmd_list_account_workspaces/);
   assert.match(app, /cmd_switch_account_workspace/);
   assert.match(app, /workspace\.kind === 'organization'/);
   assert.match(styles, /\.workspace-menu/);
+});
+
+test('customer-owned vault hides managed-only pages instead of mixing storage', () => {
+  assert.match(html, /data-view="databases" data-vault-scope="managed"/);
+  assert.match(html, /data-view="backup" data-vault-scope="managed"/);
+  assert.match(html, /data-view="backups" data-vault-scope="managed"/);
+  assert.match(html, /id="custom-vault-dashboard"/);
+  assert.match(app, /function syncVaultContextUi\(\)/);
+  assert.match(app, /function selectVault\(vaultId\)[\s\S]*?getElementById\('byos-snapshots'\)\.replaceChildren\(\)/);
+  assert.match(app, /if \(selectedVaultId && selectedVaultId !== vaultModel\.MANAGED_VAULT_ID[\s\S]*?\['databases', 'backup', 'backups'\]\.includes\(pageId\)\) pageId = 'profiles'/);
+  assert.match(app, /vaultManagerOpen = false/);
 });
 
 test('local profile ownership includes the active service workspace', () => {

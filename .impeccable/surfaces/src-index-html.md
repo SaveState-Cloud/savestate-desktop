@@ -15,10 +15,10 @@ STORY
 Cloud - Personal is always present and cannot be disconnected. Every connected B2, R2, S3-compatible, or MinIO destination becomes another vault. Existing profiles remain attached to their existing destination.
 
 FIRST VIEWPORT
-The Vaults page immediately shows Cloud - Personal and each custom vault with its owner, connector, and count of scheduled sources. Add Vault is adjacent to the heading. Choosing a vault reveals its sources and schedules; restore access stays within that vault.
+The lower-left selector names the active vault, starting with Personal and its plan. The selector lists every custom connector as another vault, plus Add vault and Manage vaults actions. The Backup sources page shows only the selected vault's sources and schedules; restore access stays within that vault.
 
 FORM
-One overview and one detail state within the existing app shell, optimized for the narrow Windows window. Connect form is inline. Source/schedule editing retains the familiar modal but its vault is fixed by the selected detail.
+The active vault is a persistent app context, not a card inside Personal. The manage view is secondary and contains the inline connect form. Source/schedule editing retains the familiar modal but its vault is fixed by the active context. Managed-only pages disappear while a custom vault is selected.
 
 FINISH
 Preserve encryption, local credentials, entitlement, quota, restore, and deletion behavior. Verify empty, loading, expired-account, failed-connection, keyboard, and working backup states at the actual window size.

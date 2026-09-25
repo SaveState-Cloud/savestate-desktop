@@ -69,6 +69,7 @@ let workspaceSwitchInProgress = false;
 let workspaceUiGeneration = 0;
 let byosVaults = [];
 let selectedVaultId = null;
+let vaultManagerOpen = false;
 let vaultLoadGeneration = 0;
 let visibleSnapshotVaultId = null;
 let snapshotLoadGeneration = 0;
@@ -106,11 +107,7 @@ function setupEventListeners() {
     // this a no-op while the existing 15-minute repository session is valid.
     window.addEventListener('focus', () => {
         warmRepositoryInBackground();
-        if (authenticatedSessionActive && pages.profiles?.classList.contains('active') && !selectedVaultId) {
-            void loadProfiles();
-        } else {
-            refreshVisibleProfiles();
-        }
+        refreshVisibleProfiles();
     });
 
     // Nav links
@@ -125,6 +122,11 @@ function setupEventListeners() {
     document.getElementById('btn-goto-profiles').addEventListener('click', () => navigateTo('profiles'));
     document.getElementById('btn-goto-backup').addEventListener('click', () => navigateTo('backup'));
     document.getElementById('btn-goto-backups').addEventListener('click', () => navigateTo('backups'));
+    document.getElementById('btn-custom-vault-sources').addEventListener('click', () => navigateTo('profiles'));
+    document.getElementById('btn-custom-vault-restore').addEventListener('click', () => {
+        navigateTo('profiles');
+        void showByosSnapshots(selectedVaultId);
+    });
 
     // Resume subscription
     document.getElementById('btn-resume-sub').addEventListener('click', async () => {
@@ -439,13 +441,8 @@ function setupEventListeners() {
         if (selectedVaultId) void openProfileModal(null, selectedVaultId);
     });
     document.getElementById('btn-vault-back').addEventListener('click', () => {
-        const previousId = selectedVaultId;
-        selectedVaultId = null;
-        visibleSnapshotVaultId = null;
-        showVaultPane();
-        const row = [...document.querySelectorAll('.vault-row-main')]
-            .find(button => button.dataset.vaultId === previousId);
-        (row || document.getElementById('btn-byos-open')).focus();
+        openVaultManager();
+        document.getElementById('btn-byos-open').focus();
     });
     document.getElementById('btn-vault-browse').addEventListener('click', () => {
         if (!selectedVaultId) return;
@@ -564,6 +561,8 @@ function setupEventListeners() {
     });
 
     document.getElementById('btn-byos-open').addEventListener('click', () => {
+        vaultManagerOpen = true;
+        showVaultPane();
         document.getElementById('byos-form').classList.remove('hidden');
         document.getElementById('byos-form').scrollIntoView({ block: 'nearest' });
         document.getElementById('byos-label').focus();
@@ -595,9 +594,9 @@ function setupEventListeners() {
             } });
             document.getElementById('byos-form').reset();
             document.getElementById('byos-form').classList.add('hidden');
-            selectedVaultId = connected.id;
-            showVaultPane();
-            document.getElementById('btn-vault-back').focus();
+            byosVaults = [...byosVaults.filter(vault => vault.id !== connected.id), connected];
+            selectVault(connected.id);
+            document.getElementById('vault-detail-title').focus();
             showToast('Vault connected and tested', 'success');
             await loadProfiles();
         } catch (error) {
@@ -661,15 +660,32 @@ function setupEventListeners() {
         setWorkspaceMenuOpen(!open);
     });
     workspaceMenu.addEventListener('click', (event) => {
-        const option = event.target.closest('[data-workspace-id]');
+        const option = event.target.closest('[data-vault-id], [data-workspace-id], [data-vault-action]');
         if (!option || option.disabled) return;
-        void switchWorkspace(option.dataset.workspaceId);
+        if (option.dataset.vaultId) selectVault(option.dataset.vaultId);
+        else if (option.dataset.workspaceId) void switchWorkspace(option.dataset.workspaceId);
+        else if (option.dataset.vaultAction === 'add') openVaultManager({ add: true });
+        else openVaultManager();
+    });
+    workspaceMenu.addEventListener('keydown', (event) => {
+        if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const options = [...workspaceMenu.querySelectorAll('button:not(:disabled)')];
+        if (!options.length) return;
+        const index = options.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
+            : event.key === 'ArrowDown' ? (index + 1) % options.length
+                : (index - 1 + options.length) % options.length;
+        options[next].focus();
     });
     document.addEventListener('click', (event) => {
         if (!event.target.closest('.workspace-switcher')) setWorkspaceMenuOpen(false);
     });
     document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') setWorkspaceMenuOpen(false);
+        if (event.key === 'Escape' && workspaceTrigger.getAttribute('aria-expanded') === 'true') {
+            setWorkspaceMenuOpen(false);
+            workspaceTrigger.focus();
+        }
     });
     document.getElementById('btn-paste-organization-token').addEventListener('click', () => {
         void pasteOrganizationSetupToken();
@@ -1046,10 +1062,13 @@ async function checkAuthStatus() {
             if (!authenticatedSessionActive) repositorySessionGeneration += 1;
             authenticatedSessionActive = true;
             serviceWorkspaceReady = Boolean(result.service_workspace_ready);
+            if (!selectedVaultId) selectedVaultId = vaultModel.MANAGED_VAULT_ID;
             showView('app');
+            syncVaultContextUi();
             if (serviceWorkspaceReady) {
                 warmRepositoryInBackground();
                 loadDashboard();
+                void loadProfiles();
             } else {
                 navigateTo('profiles');
                 showToast('Your SaveState plan is no longer active. You can still restore from your own vaults.', 'info');
@@ -1086,6 +1105,7 @@ function endAuthenticatedSession() {
     accountWorkspaces = [];
     byosVaults = [];
     selectedVaultId = null;
+    vaultManagerOpen = false;
     visibleSnapshotVaultId = null;
     snapshotLoadGeneration += 1;
     vaultLoadGeneration += 1;
@@ -1094,6 +1114,7 @@ function endAuthenticatedSession() {
     document.getElementById('profile-form')?.reset();
     document.getElementById('profile-modal')?.classList.add('hidden');
     clearVaultUi();
+    syncVaultContextUi();
     workspaceSwitchInProgress = false;
     workspaceUiGeneration += 1;
     setWorkspaceMenuOpen(false);
@@ -1105,34 +1126,150 @@ function setWorkspaceMenuOpen(open) {
     if (!trigger || !menu) return;
     trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
     menu.classList.toggle('hidden', !open);
+    if (open) menu.querySelector('[aria-checked="true"]')?.focus();
 }
 
 function workspaceIcon(workspace) {
+    if (workspace.kind === 'storage') {
+        return '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>';
+    }
     return workspace.kind === 'organization'
         ? '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 21h18M5 21V7l7-4 7 4v14M9 10h1m4 0h1m-6 4h1m4 0h1m-6 4h6"/></svg>'
         : '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/></svg>';
 }
 
+function managedVaultLabel() {
+    const current = accountWorkspaces.find(workspace => workspace.current);
+    return current?.kind === 'organization' ? current.label : 'Cloud - Personal';
+}
+
+function availableVaults(profiles = [], databases = []) {
+    const vaults = vaultModel.vaultsWithCounts(byosVaults, profiles, databases);
+    vaults[0].label = managedVaultLabel();
+    return vaults;
+}
+
 function renderWorkspaceSwitcher() {
     const current = accountWorkspaces.find((workspace) => workspace.current) || accountWorkspaces[0];
-    document.getElementById('workspace-current-label').textContent = current?.label || 'Workspace';
-    document.getElementById('workspace-current-kind').textContent = current
-        ? (current.kind === 'organization' ? 'Organization' : current.plan || 'Personal')
-        : 'Unavailable';
+    const vaults = availableVaults();
+    const active = vaults.find(vault => vault.id === selectedVaultId) || vaults[0];
+    const managed = active.managed;
+    document.getElementById('workspace-current-label').textContent = managed
+        ? (current?.label || 'Personal') : active.label;
+    document.getElementById('workspace-current-kind').textContent = managed
+        ? (current?.plan || 'SaveState Cloud')
+        : `${active.provider.toUpperCase()} · ${active.bucket}`;
     const menu = document.getElementById('workspace-menu');
-    menu.innerHTML = accountWorkspaces.map((workspace) => `
-        <button type="button" class="workspace-option" role="option"
+    const focusedOption = menu.contains(document.activeElement) ? {
+        vaultId: document.activeElement.dataset.vaultId,
+        workspaceId: document.activeElement.dataset.workspaceId,
+        action: document.activeElement.dataset.vaultAction,
+    } : null;
+    const vaultOptions = vaults.map(vault => `
+        <button type="button" class="workspace-option" role="menuitemradio"
+                data-vault-id="${escapeHtml(vault.id)}"
+                aria-checked="${active.id === vault.id ? 'true' : 'false'}">
+            <span class="workspace-option-icon">${workspaceIcon({ kind: vault.managed ? current?.kind : 'storage' })}</span>
+            <span class="workspace-option-copy">
+                <strong>${escapeHtml(vault.label)}</strong>
+                <small>${escapeHtml(vault.managed ? (current?.plan || 'SaveState Cloud') : `${vault.provider.toUpperCase()} · ${vault.bucket}`)}</small>
+            </span>
+            <span class="workspace-option-check">${active.id === vault.id ? '✓' : ''}</span>
+        </button>
+    `).join('');
+    const otherWorkspaces = accountWorkspaces.filter(workspace => !workspace.current);
+    const workspaceOptions = otherWorkspaces.map(workspace => `
+        <button type="button" class="workspace-option" role="menuitem"
                 data-workspace-id="${escapeHtml(workspace.id)}"
-                aria-selected="${workspace.current ? 'true' : 'false'}"
                 ${workspace.available && !workspaceSwitchInProgress ? '' : 'disabled'}>
             <span class="workspace-option-icon">${workspaceIcon(workspace)}</span>
             <span class="workspace-option-copy">
                 <strong>${escapeHtml(workspace.label)}</strong>
                 <small>${escapeHtml(workspace.kind === 'organization' ? workspace.plan : `Private · ${workspace.plan}`)}</small>
             </span>
-            <span class="workspace-option-check">${workspace.current ? '✓' : ''}</span>
         </button>
     `).join('');
+    menu.innerHTML = `<div class="workspace-menu-label" role="presentation">Vaults</div>${vaultOptions}
+        <div class="workspace-menu-divider" role="separator"></div>
+        <button type="button" class="workspace-option workspace-option-action" role="menuitem" data-vault-action="add">Add vault</button>
+        <button type="button" class="workspace-option workspace-option-action" role="menuitem" data-vault-action="manage">Manage vaults</button>
+        ${otherWorkspaces.length ? `<div class="workspace-menu-divider" role="separator"></div><div class="workspace-menu-label" role="presentation">Switch account</div>${workspaceOptions}` : ''}`;
+    if (focusedOption) {
+        [...menu.querySelectorAll('button')].find(option =>
+            option.dataset.vaultId === focusedOption.vaultId
+            && option.dataset.workspaceId === focusedOption.workspaceId
+            && option.dataset.vaultAction === focusedOption.action)?.focus();
+    }
+}
+
+function selectVault(vaultId) {
+    if (vaultId !== vaultModel.MANAGED_VAULT_ID && !byosVaults.some(vault => vault.id === vaultId)) return;
+    selectedVaultId = vaultId;
+    vaultManagerOpen = false;
+    visibleSnapshotVaultId = null;
+    snapshotLoadGeneration += 1;
+    document.getElementById('byos-snapshots').classList.add('hidden');
+    document.getElementById('byos-snapshots').replaceChildren();
+    document.getElementById('vault-connection-details').classList.add('hidden');
+    document.getElementById('vault-database-section').classList.add('hidden');
+    document.getElementById('btn-vault-browse').textContent = vaultId === vaultModel.MANAGED_VAULT_ID
+        ? 'Browse backups' : 'Restore points';
+    document.getElementById('btn-create-profile').disabled = true;
+    document.getElementById('vault-source-count').textContent = 'Loading…';
+    document.getElementById('custom-vault-dashboard-count').textContent = 'Loading backup sources…';
+    document.getElementById('byos-form').classList.add('hidden');
+    document.getElementById('vault-detail-title').textContent = availableVaults().find(vault => vault.id === vaultId)?.label || 'Vault';
+    document.getElementById('vault-detail-subtitle').textContent = 'Loading backup sources…';
+    document.getElementById('profiles-list').textContent = 'Loading backup sources…';
+    setWorkspaceMenuOpen(false);
+    renderWorkspaceSwitcher();
+    syncVaultContextUi();
+    showVaultPane();
+    navigateTo('profiles');
+}
+
+function openVaultManager({ add = false } = {}) {
+    vaultManagerOpen = true;
+    setWorkspaceMenuOpen(false);
+    showVaultPane();
+    navigateTo('profiles');
+    if (add) {
+        document.getElementById('btn-byos-open').click();
+    } else {
+        document.getElementById('byos-form').classList.add('hidden');
+        document.getElementById('btn-byos-open').focus();
+    }
+}
+
+function syncVaultContextUi() {
+    const custom = selectedVaultId && selectedVaultId !== vaultModel.MANAGED_VAULT_ID;
+    const vault = custom ? byosVaults.find(item => item.id === selectedVaultId) : null;
+    document.querySelectorAll('[data-vault-scope="managed"]').forEach(element => {
+        element.closest('li')?.classList.toggle('hidden', Boolean(custom));
+    });
+    document.querySelector('#page-dashboard .dashboard-overview')?.classList.toggle('hidden', Boolean(custom));
+    document.querySelector('#page-dashboard .quick-actions')?.classList.toggle('hidden', Boolean(custom));
+    document.getElementById('custom-vault-dashboard')?.classList.toggle('hidden', !custom);
+    document.getElementById('dashboard-title').textContent = custom
+        ? (vault?.label || 'Vault')
+        : 'Dashboard';
+    if (custom) {
+        document.getElementById('custom-vault-dashboard-location').textContent = vault
+            ? `${vault.provider.toUpperCase()} · ${vault.bucket} · ${vault.region} · Storage you control`
+            : 'Connecting to your storage…';
+    }
+}
+
+function renderCustomVaultDashboard(profiles, loadError = null) {
+    if (!selectedVaultId || selectedVaultId === vaultModel.MANAGED_VAULT_ID) return;
+    const status = document.getElementById('custom-vault-dashboard-count');
+    if (loadError) {
+        status.textContent = `Could not load backup sources: ${friendlyError(loadError)}`;
+        return;
+    }
+    const sources = vaultModel.profilesInVault(profiles, selectedVaultId);
+    const scheduled = sources.filter(profile => profile.enabled && String(profile.schedule || '').trim()).length;
+    status.textContent = `${sources.length} backup source${sources.length === 1 ? '' : 's'} · ${scheduled} scheduled`;
 }
 
 async function switchWorkspace(workspaceId) {
@@ -1152,7 +1289,8 @@ async function switchWorkspace(workspaceId) {
         currentAccount = null;
         currentFolder = '/';
         folderList = [];
-        selectedVaultId = null;
+        selectedVaultId = vaultModel.MANAGED_VAULT_ID;
+        vaultManagerOpen = false;
         visibleSnapshotVaultId = null;
         snapshotLoadGeneration += 1;
         byosVaults = [];
@@ -1162,6 +1300,8 @@ async function switchWorkspace(workspaceId) {
         document.getElementById('profile-form').reset();
         document.getElementById('profile-modal').classList.add('hidden');
         clearVaultUi();
+        renderWorkspaceSwitcher();
+        syncVaultContextUi();
         setWorkspaceMenuOpen(false);
         showToast(`Switched to ${target.label}.`, 'success');
         await Promise.all([
@@ -1211,6 +1351,8 @@ function showView(viewId) {
 
 function navigateTo(pageId) {
     if (!serviceWorkspaceReady && pageId !== 'settings' && pageId !== 'profiles') pageId = 'profiles';
+    if (selectedVaultId && selectedVaultId !== vaultModel.MANAGED_VAULT_ID
+        && ['databases', 'backup', 'backups'].includes(pageId)) pageId = 'profiles';
     Object.values(pages).forEach(p => { if (p) p.classList.remove('active'); });
     const target = pages[pageId];
     if (target) target.classList.add('active');
@@ -1413,13 +1555,15 @@ async function loadDashboard() {
         const [workspaceResponse, account, backupState] = await Promise.all([
             invoke('cmd_list_account_workspaces'),
             invoke('cmd_get_account'),
-            invoke('cmd_list_backups').catch(() => null),
+            selectedVaultId === vaultModel.MANAGED_VAULT_ID
+                ? invoke('cmd_list_backups').catch(() => null) : Promise.resolve(null),
         ]);
         if (generation !== workspaceUiGeneration) return;
         accountWorkspaces = Array.isArray(workspaceResponse?.workspaces)
             ? workspaceResponse.workspaces
             : [];
         renderWorkspaceSwitcher();
+        syncVaultContextUi();
         currentAccount = account;
         document.getElementById('sidebar-email').textContent = account.email || '';
         document.getElementById('stat-email').textContent = account.email || '';
@@ -2869,7 +3013,7 @@ function closeProfileDeleteModal() {
 }
 
 function showVaultPane() {
-    const inDetail = Boolean(selectedVaultId);
+    const inDetail = Boolean(selectedVaultId) && !vaultManagerOpen;
     document.getElementById('vault-overview').classList.toggle('hidden', inDetail);
     document.getElementById('vault-detail').classList.toggle('hidden', !inDetail);
     if (!inDetail) {
@@ -2906,7 +3050,7 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
             : entitlement.enabled
                 ? 'Cloud - Personal is included with SaveState. Custom vaults use storage you control; their bytes do not count toward your managed storage allowance.'
                 : 'An eligible plan is required for new custom-vault backups. You can reconnect an existing custom vault to restore files.';
-    const vaults = vaultModel.vaultsWithCounts(byosVaults, profiles, databases);
+    const vaults = availableVaults(profiles, databases);
     const countLabel = vault => countsPending
         ? 'Loading backup sources…'
         : `${vault.sourceCount} backup source${vault.sourceCount === 1 ? '' : 's'}`
@@ -2949,16 +3093,8 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
         count.textContent = countLabel(vault);
         openVault.append(heading, location, count);
         openVault.addEventListener('click', () => {
-            selectedVaultId = vault.id;
-            visibleSnapshotVaultId = null;
-            snapshotLoadGeneration += 1;
-            document.getElementById('vault-detail-title').textContent = vault.label;
-            document.getElementById('vault-detail-subtitle').textContent = 'Loading vault…';
-            document.getElementById('profiles-list').textContent = 'Loading backup sources…';
-            document.getElementById('byos-snapshots').classList.add('hidden');
-            showVaultPane();
-            document.getElementById('btn-vault-back').focus();
-            void loadProfiles();
+            selectVault(vault.id);
+            document.getElementById('vault-detail-title').focus();
         });
         row.appendChild(openVault);
         if (!vault.managed) {
@@ -2972,6 +3108,10 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
                 if (!accepted) return;
                 try {
                     await invoke('cmd_byos_remove_vault', { vaultId: vault.id });
+                    byosVaults = byosVaults.filter(item => item.id !== vault.id);
+                    if (selectedVaultId === vault.id) selectedVaultId = vaultModel.MANAGED_VAULT_ID;
+                    renderWorkspaceSwitcher();
+                    syncVaultContextUi();
                     showToast('Vault disconnected. Remote backups were not deleted.', 'success');
                     void loadProfiles();
                 } catch (error) { showToast(friendlyError(error), 'error'); }
@@ -3004,6 +3144,12 @@ async function loadProfiles({ remoteResults = null } = {}) {
         const vaultError = vaultsResult.status === 'rejected' ? vaultsResult.reason : null;
         const currentVaultIds = [...document.querySelectorAll('.vault-row-main')].map(button => button.dataset.vaultId);
         const nextVaultIds = [vaultModel.MANAGED_VAULT_ID, ...byosVaults.map(vault => vault.id)];
+        if (selectedVaultId && !nextVaultIds.includes(selectedVaultId) && !vaultError) {
+            selectedVaultId = vaultModel.MANAGED_VAULT_ID;
+            vaultManagerOpen = false;
+        }
+        renderWorkspaceSwitcher();
+        syncVaultContextUi();
         if (JSON.stringify(currentVaultIds) !== JSON.stringify(nextVaultIds)) {
             renderVaultOverview([], [], null, vaultError, true, true);
             showVaultPane();
@@ -3012,6 +3158,7 @@ async function loadProfiles({ remoteResults = null } = {}) {
         if (generation !== vaultLoadGeneration) return;
         const profiles = profilesResult.status === 'fulfilled' ? profilesResult.value || [] : [];
         const databases = databasesResult.status === 'fulfilled' ? databasesResult.value || [] : [];
+        renderCustomVaultDashboard(profiles, profilesResult.status === 'rejected' ? profilesResult.reason : null);
         const unownedCount = unownedResult.status === 'fulfilled' ? unownedResult.value : 0;
         const authStatus = authResult.status === 'fulfilled' ? authResult.value : null;
         let resolvedRemote = remoteResults;
@@ -3031,9 +3178,11 @@ async function loadProfiles({ remoteResults = null } = {}) {
         const profileLimit = limitResult?.status === 'fulfilled' ? Number(limitResult.value) : null;
         const entitlement = entitlementResult?.status === 'fulfilled' ? entitlementResult.value : null;
         renderVaultOverview(profiles, databases, entitlement, vaultError, !resolvedRemote);
-        const selectedVault = vaultModel.vaultsWithCounts(byosVaults, profiles, databases)
+        const selectedVault = availableVaults(profiles, databases)
             .find(vault => vault.id === selectedVaultId);
-        if (selectedVaultId && !selectedVault) selectedVaultId = null;
+        if (selectedVaultId && !selectedVault && !vaultError) selectedVaultId = vaultModel.MANAGED_VAULT_ID;
+        renderWorkspaceSwitcher();
+        syncVaultContextUi();
         showVaultPane();
         let canBackupSelectedVault = false;
         if (selectedVaultId && selectedVault) {

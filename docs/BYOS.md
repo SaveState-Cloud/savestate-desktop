@@ -6,22 +6,25 @@ available in an installed release until a new installer is published.
 
 ## Customer flow
 
-1. Open **Vaults**. **Cloud - Personal** is the permanent SaveState-managed
-   vault. On an eligible active plan, select **Add Vault** to connect another
-   storage destination.
+1. The lower-left selector is the active vault. **Personal** is the permanent
+   SaveState-managed vault and shows its plan there. Open the selector and
+   choose **Add vault** to connect another storage destination. **Manage
+   vaults** shows the full connector list and disconnect controls.
 2. Create a bucket with an S3-compatible provider and enter its endpoint,
    region, bucket name, access key ID and secret. A dedicated bucket or prefix
    is recommended. SaveState generates an account-scoped prefix if left blank.
 3. **Connect and test** opens or creates a Kopia repository and runs Kopia's
    storage-provider validation before the vault is saved.
-4. Open any vault and add one or more file/folder backup sources. Each source
+4. Select a vault in the lower-left corner and add one or more file/folder backup sources. Each source
    can have its own local-time schedule and retention or be manual-only. Its
    destination is fixed after creation; add another source to back up the same
    folder to a different vault without moving its existing restore points.
 5. Run a source in its vault. Use **Restore points** inside a custom vault to
    browse snapshots directly from its bucket and restore into a new local
    folder. **Browse backups** inside Cloud - Personal opens the managed backup
-   browser. Disconnecting a custom vault never deletes remote objects.
+   browser. Custom vaults have their own dashboard and source list; managed-only
+   database and quick-backup pages are not shown while one is selected.
+   Disconnecting a custom vault never deletes remote objects.
 
 ## Boundaries and recovery
 
@@ -57,18 +60,19 @@ available in an installed release until a new installer is published.
 ## Verification and release notes
 
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
-  the desktop checks passed: 61 UI tests, 3 logout-flow tests, and 106 Rust
+  the desktop checks passed: 62 UI tests, 3 logout-flow tests, and 106 Rust
   tests (one optional database integration test ignored). The API checks passed
   288 unit tests and 6 disposable-D1 runtime tests.
-- The vault-first development build was opened at the Windows app's 802×632
-  window size. Cloud - Personal and two existing customer-owned vaults rendered;
-  the B2 vault showed its existing source, its edit form kept the destination
-  fixed, and its restore points loaded from the private test bucket. Add Vault
-  and Add Backup Source forms were inspected and cancelled without writing
-  backup or provider data. The source dialog focused its name field, wrapped
-  Shift+Tab to its final action, and Escape returned focus to Add backup source;
-  cancelling Add Vault restored keyboard focus to its button. Connector setup
-  was absent from Settings.
+- The development build was opened at the Windows app's 802×632 window size.
+  The lower-left selector displayed Personal and two customer-owned vaults.
+  Selecting B2 changed the active vault and its source list, hid managed-only
+  navigation, showed a B2-specific dashboard, and loaded restore points from
+  the private test bucket. Selecting Personal again restored managed navigation
+  and its own empty source list. Manage vaults and its connect form opened and
+  the form was cancelled without writing backup or provider data. The source
+  dialog focused its name field, wrapped Shift+Tab to its final action, and
+  Escape returned focus to Add backup source; cancelling Add Vault restored
+  keyboard focus to its button. Connector setup was absent from Settings.
 - A disposable local S3 round trip passed in the Windows development app:
   connect/validate, create profile, back up a 111-byte file, list the restore
   point, and restore to a separate directory. Original and restored SHA-256
