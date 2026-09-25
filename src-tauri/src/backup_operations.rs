@@ -35,6 +35,7 @@ impl AccountContext {
         if !context_matches_session(
             self,
             guard.account_email().as_deref(),
+            guard.byos_scope().as_deref(),
             guard.session_generation,
             guard.master_key.is_some(),
         ) {
@@ -365,6 +366,7 @@ pub fn begin_with_context(
     if !context_matches_session(
         &context,
         account_email.as_deref(),
+        guard.byos_scope().as_deref(),
         guard.session_generation,
         guard.master_key.is_some(),
     ) {
@@ -385,6 +387,7 @@ pub fn begin_with_context(
 fn context_matches_session(
     context: &AccountContext,
     account_email: Option<&str>,
+    byos_scope: Option<&str>,
     session_generation: u64,
     vault_unlocked: bool,
 ) -> bool {
@@ -392,9 +395,10 @@ fn context_matches_session(
         account_email.map(|email| format!("{}::", email.trim().to_ascii_lowercase()));
     vault_unlocked
         && session_generation == context.session_generation
-        && expected_prefix
+        && (expected_prefix
             .as_deref()
             .is_some_and(|prefix| context.account_scope.starts_with(prefix))
+            || byos_scope.is_some_and(|scope| context.account_scope == scope))
 }
 
 /// Hold both admission barriers across the entire account/workspace change,
@@ -666,27 +670,60 @@ mod tests {
         assert!(context_matches_session(
             &context,
             Some("owner@example.com"),
+            None,
             7,
             true
         ));
         assert!(!context_matches_session(
             &context,
             Some("other@example.com"),
+            None,
             7,
             true
         ));
         assert!(!context_matches_session(
             &context,
             Some("owner@example.com"),
+            None,
             8,
             true
         ));
         assert!(!context_matches_session(
             &context,
             Some("owner@example.com"),
+            None,
             7,
             false
         ));
+    }
+
+    #[test]
+    fn byos_context_tracks_user_identity_without_a_service_workspace() {
+        use crate::state::{AppState, AppStateWrapper};
+        use base64::Engine;
+
+        let mut state = AppState::new(
+            SaveStateClient::new("offline-fixture".into()),
+            rusqlite::Connection::open_in_memory().unwrap(),
+        );
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":7,"serviceId":null}"#);
+        state.api.set_token(format!("header.{claims}.signature"));
+        state.email = Some("owner@example.com".into());
+        state.master_key = Some([7; 32]);
+        let context = AccountContext::capture_byos(&state).unwrap();
+        let state = AppStateWrapper(std::sync::Mutex::new(state));
+        assert!(context.ensure_current(&state).is_ok());
+
+        let other_claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":8,"serviceId":null}"#);
+        state
+            .0
+            .lock()
+            .unwrap()
+            .api
+            .set_token(format!("header.{other_claims}.signature"));
+        assert!(context.ensure_current(&state).is_err());
     }
 
     #[tokio::test]
