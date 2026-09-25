@@ -7,6 +7,7 @@ const { listen } = window.__TAURI__.event;
 const { open, confirm: confirmDialog } = window.__TAURI__.dialog;
 const vaultRecoveryUi = window.SaveStateVaultRecovery;
 const storageUsageUi = window.SaveStateStorageUsage;
+const vaultModel = window.SaveStateVaultModel;
 
 // ── Auto-updater state ───────────────────────────────────────────
 let availableUpdateVersion = null;
@@ -67,6 +68,12 @@ let accountWorkspaces = [];
 let workspaceSwitchInProgress = false;
 let workspaceUiGeneration = 0;
 let byosVaults = [];
+let selectedVaultId = null;
+let vaultLoadGeneration = 0;
+let visibleSnapshotVaultId = null;
+let snapshotLoadGeneration = 0;
+let profileModalReturnFocus = null;
+let lastVaultRowsSignature = null;
 
 // ────────────────────────────────────────────────────────────────
 // Initialization
@@ -99,7 +106,11 @@ function setupEventListeners() {
     // this a no-op while the existing 15-minute repository session is valid.
     window.addEventListener('focus', () => {
         warmRepositoryInBackground();
-        refreshVisibleProfiles();
+        if (authenticatedSessionActive && pages.profiles?.classList.contains('active') && !selectedVaultId) {
+            void loadProfiles();
+        } else {
+            refreshVisibleProfiles();
+        }
     });
 
     // Nav links
@@ -425,11 +436,47 @@ function setupEventListeners() {
 
     // ── Profiles ──────────────────────────────────────────────
     document.getElementById('btn-create-profile').addEventListener('click', () => {
-        openProfileModal();
+        if (selectedVaultId) void openProfileModal(null, selectedVaultId);
     });
+    document.getElementById('btn-vault-back').addEventListener('click', () => {
+        const previousId = selectedVaultId;
+        selectedVaultId = null;
+        visibleSnapshotVaultId = null;
+        showVaultPane();
+        const row = [...document.querySelectorAll('.vault-row-main')]
+            .find(button => button.dataset.vaultId === previousId);
+        (row || document.getElementById('btn-byos-open')).focus();
+    });
+    document.getElementById('btn-vault-browse').addEventListener('click', () => {
+        if (!selectedVaultId) return;
+        if (selectedVaultId === vaultModel.MANAGED_VAULT_ID) {
+            openManagedProfileFolder('/');
+        } else {
+            void showByosSnapshots(selectedVaultId);
+        }
+    });
+    document.getElementById('btn-vault-databases').addEventListener('click', () => navigateTo('databases'));
 
-    document.getElementById('btn-cancel-profile').addEventListener('click', () => {
-        document.getElementById('profile-modal').classList.add('hidden');
+    document.getElementById('btn-cancel-profile').addEventListener('click', closeProfileModal);
+    document.getElementById('profile-modal').addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeProfileModal();
+            return;
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = [...document.querySelectorAll('#profile-modal input:not([type="hidden"]), #profile-modal button')]
+            .filter(element => !element.disabled && element.getClientRects().length > 0);
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
     });
 
     document.getElementById('btn-pick-profile-source').addEventListener('click', async () => {
@@ -472,13 +519,14 @@ function setupEventListeners() {
                 await invoke('cmd_update_profile', {
                     id: editId, name, sourcePath, schedule, retention, enabled: true, folder: '/', vaultId,
                 });
-                showToast('Profile updated', 'success');
+                showToast('Backup source updated', 'success');
             } else {
                 await invoke('cmd_create_profile', { name, sourcePath, schedule, retention, folder: '/', vaultId });
-                showToast('Profile created', 'success');
+                showToast('Backup source added', 'success');
             }
-            document.getElementById('profile-modal').classList.add('hidden');
-            loadProfiles();
+            closeProfileModal({ returnFocus: false });
+            document.getElementById('btn-create-profile').focus();
+            await loadProfiles();
         } catch (err) {
             showToast(String(err), 'error');
         }
@@ -491,7 +539,7 @@ function setupEventListeners() {
         const deleteBackups = document.getElementById('profile-delete-backups').checked;
         const button = document.getElementById('btn-confirm-profile-delete');
         button.disabled = true;
-        button.textContent = deleteBackups ? 'Deleting backups…' : 'Deleting profile…';
+        button.textContent = deleteBackups ? 'Deleting backups…' : 'Deleting source…';
         try {
             if (target.kind === 'database') {
                 await invoke('cmd_delete_database_profile', { id: target.id, deleteBackups });
@@ -500,8 +548,8 @@ function setupEventListeners() {
             }
             closeProfileDeleteModal();
             showToast(deleteBackups
-                ? (target.vaultId ? 'Profile restore points were deleted from your bucket.' : 'Profile folder and its remaining backups were deleted.')
-                : (target.vaultId ? 'Profile deleted. Backups in your bucket were preserved.' : 'Profile deleted. Its backup folder was preserved.'), 'success');
+                ? (target.vaultId ? 'Source restore points were deleted from your bucket.' : 'Source folder and its remaining backups were deleted.')
+                : (target.vaultId ? 'Source deleted. Backups in your bucket were preserved.' : 'Source deleted. Its backup folder was preserved.'), 'success');
             if (target.kind === 'database') {
                 void loadDatabaseProfiles();
             } else {
@@ -511,17 +559,19 @@ function setupEventListeners() {
             showToast(friendlyError(error), 'error');
         } finally {
             button.disabled = false;
-            button.textContent = 'Delete Profile';
+            button.textContent = 'Delete source';
         }
     });
 
     document.getElementById('btn-byos-open').addEventListener('click', () => {
         document.getElementById('byos-form').classList.remove('hidden');
+        document.getElementById('byos-form').scrollIntoView({ block: 'nearest' });
         document.getElementById('byos-label').focus();
     });
     document.getElementById('btn-byos-cancel').addEventListener('click', () => {
         document.getElementById('byos-form').reset();
         document.getElementById('byos-form').classList.add('hidden');
+        document.getElementById('btn-byos-open').focus();
     });
     document.getElementById('byos-provider').addEventListener('change', () => {
         const defaults = { b2: 'eu-central-003', r2: 'auto', s3: '', minio: 'us-east-1' };
@@ -533,7 +583,7 @@ function setupEventListeners() {
         button.disabled = true;
         button.textContent = 'Connecting…';
         try {
-            await invoke('cmd_byos_add_vault', { input: {
+            const connected = await invoke('cmd_byos_add_vault', { input: {
                 label: document.getElementById('byos-label').value.trim(),
                 provider: document.getElementById('byos-provider').value,
                 endpoint: document.getElementById('byos-endpoint').value.trim(),
@@ -545,8 +595,11 @@ function setupEventListeners() {
             } });
             document.getElementById('byos-form').reset();
             document.getElementById('byos-form').classList.add('hidden');
-            showToast('Storage destination connected and tested', 'success');
-            await loadByos();
+            selectedVaultId = connected.id;
+            showVaultPane();
+            document.getElementById('btn-vault-back').focus();
+            showToast('Vault connected and tested', 'success');
+            await loadProfiles();
         } catch (error) {
             showToast(friendlyError(error), 'error');
         } finally {
@@ -998,8 +1051,8 @@ async function checkAuthStatus() {
                 warmRepositoryInBackground();
                 loadDashboard();
             } else {
-                navigateTo('settings');
-                showToast('Your SaveState plan is no longer active. You can still restore from customer-owned storage here.', 'info');
+                navigateTo('profiles');
+                showToast('Your SaveState plan is no longer active. You can still restore from your own vaults.', 'info');
             }
             if (serviceWorkspaceReady) loadSettings();
             if (!legacyProfileNoticeShown) {
@@ -1007,7 +1060,7 @@ async function checkAuthStatus() {
                 invoke('cmd_count_unowned_profiles')
                     .then((count) => {
                         if (Number(count) > 0) {
-                            showToast('Existing profiles are paused until you assign them to an account from the Profiles page.', 'info');
+                            showToast('Existing backup sources are paused until you assign them to an account from Vaults.', 'info');
                         }
                     })
                     .catch(() => {});
@@ -1031,6 +1084,16 @@ function endAuthenticatedSession() {
     repositoryWarmupPromise = null;
     legacyProfileNoticeShown = false;
     accountWorkspaces = [];
+    byosVaults = [];
+    selectedVaultId = null;
+    visibleSnapshotVaultId = null;
+    snapshotLoadGeneration += 1;
+    vaultLoadGeneration += 1;
+    document.getElementById('byos-form')?.reset();
+    document.getElementById('byos-form')?.classList.add('hidden');
+    document.getElementById('profile-form')?.reset();
+    document.getElementById('profile-modal')?.classList.add('hidden');
+    clearVaultUi();
     workspaceSwitchInProgress = false;
     workspaceUiGeneration += 1;
     setWorkspaceMenuOpen(false);
@@ -1089,6 +1152,16 @@ async function switchWorkspace(workspaceId) {
         currentAccount = null;
         currentFolder = '/';
         folderList = [];
+        selectedVaultId = null;
+        visibleSnapshotVaultId = null;
+        snapshotLoadGeneration += 1;
+        byosVaults = [];
+        vaultLoadGeneration += 1;
+        document.getElementById('byos-form').reset();
+        document.getElementById('byos-form').classList.add('hidden');
+        document.getElementById('profile-form').reset();
+        document.getElementById('profile-modal').classList.add('hidden');
+        clearVaultUi();
         setWorkspaceMenuOpen(false);
         showToast(`Switched to ${target.label}.`, 'success');
         await Promise.all([
@@ -1137,7 +1210,7 @@ function showView(viewId) {
 }
 
 function navigateTo(pageId) {
-    if (!serviceWorkspaceReady && pageId !== 'settings') pageId = 'settings';
+    if (!serviceWorkspaceReady && pageId !== 'settings' && pageId !== 'profiles') pageId = 'profiles';
     Object.values(pages).forEach(p => { if (p) p.classList.remove('active'); });
     const target = pages[pageId];
     if (target) target.classList.add('active');
@@ -1156,6 +1229,7 @@ function navigateTo(pageId) {
 function refreshVisibleProfiles() {
     if (authenticatedSessionActive && serviceWorkspaceReady
         && pages.profiles?.classList.contains('active')
+        && selectedVaultId
         && document.getElementById('profile-modal')?.classList.contains('hidden')) {
         void loadProfiles();
     }
@@ -1454,8 +1528,8 @@ async function loadDashboard() {
             showView('login');
         } else if (String(e).includes('404') || String(e).includes('No service found')) {
             serviceWorkspaceReady = false;
-            navigateTo('settings');
-            showToast('No active SaveState plan. Customer-owned restore points remain available in Settings.', 'info');
+            navigateTo('profiles');
+            showToast('No active SaveState plan. Customer-owned restore points remain available in Vaults.', 'info');
         } else {
             showToast('Failed to load account: ' + String(e), 'error');
         }
@@ -2779,11 +2853,11 @@ function openProfileDeleteModal(profile, kind) {
     document.getElementById('profile-delete-copy').textContent = kind === 'database'
         ? `The database connection and saved password will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every restore point.`
         : profile.vault_id
-            ? 'The profile and schedule will be removed. Leave the option unchecked to keep every restore point in your own bucket.'
-            : `The schedule and profile settings will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every backup.`;
+            ? 'The source and schedule will be removed. Leave the option unchecked to keep every restore point in your own bucket.'
+            : `The source and schedule will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every backup.`;
     document.querySelector('#profile-delete-backups + span small').textContent = profile.vault_id
-        ? 'Deletes restore points tagged to this profile from your own bucket. Other bucket contents remain untouched.'
-        : 'Only versions still inside this profile folder are deleted. Backups moved elsewhere are preserved.';
+        ? 'Deletes restore points tagged to this source from your own bucket. Other bucket contents remain untouched.'
+        : 'Only versions still inside this source folder are deleted. Backups moved elsewhere are preserved.';
     document.getElementById('profile-delete-backups').checked = false;
     document.getElementById('profile-delete-modal').classList.remove('hidden');
 }
@@ -2794,24 +2868,208 @@ function closeProfileDeleteModal() {
     document.getElementById('profile-delete-backups').checked = false;
 }
 
-async function loadProfiles() {
+function showVaultPane() {
+    const inDetail = Boolean(selectedVaultId);
+    document.getElementById('vault-overview').classList.toggle('hidden', inDetail);
+    document.getElementById('vault-detail').classList.toggle('hidden', !inDetail);
+    if (!inDetail) {
+        visibleSnapshotVaultId = null;
+        snapshotLoadGeneration += 1;
+        document.getElementById('byos-snapshots').classList.add('hidden');
+    }
+}
+
+function clearVaultUi() {
+    document.getElementById('byos-vault-list')?.replaceChildren();
+    lastVaultRowsSignature = null;
+    document.getElementById('profiles-list')?.replaceChildren();
+    document.getElementById('byos-snapshots')?.replaceChildren();
+    document.getElementById('vault-unowned')?.replaceChildren();
+    const status = document.getElementById('byos-status');
+    if (status) status.textContent = 'Loading vaults…';
+    showVaultPane();
+}
+
+function renderVaultOverview(profiles, databases, entitlement, vaultError, planPending = false, countsPending = false) {
+    const list = document.getElementById('byos-vault-list');
+    const status = document.getElementById('byos-status');
+    const openButton = document.getElementById('btn-byos-open');
+    openButton.classList.remove('hidden');
+    openButton.disabled = planPending;
+    openButton.textContent = planPending ? 'Checking plan…' : entitlement === null ? 'Reconnect Vault' : entitlement.enabled ? 'Add Vault' : 'Reconnect Vault';
+    status.textContent = vaultError
+        ? `Could not refresh custom vaults: ${friendlyError(vaultError)}. Your managed vault is still shown.`
+        : planPending
+            ? 'Checking your plan. Your existing vaults and restore points are available now.'
+        : entitlement === null
+            ? 'Plan check is unavailable. Existing vaults and restore points remain accessible.'
+            : entitlement.enabled
+                ? 'Cloud - Personal is included with SaveState. Custom vaults use storage you control; their bytes do not count toward your managed storage allowance.'
+                : 'An eligible plan is required for new custom-vault backups. You can reconnect an existing custom vault to restore files.';
+    const vaults = vaultModel.vaultsWithCounts(byosVaults, profiles, databases);
+    const countLabel = vault => countsPending
+        ? 'Loading backup sources…'
+        : `${vault.sourceCount} backup source${vault.sourceCount === 1 ? '' : 's'}`
+            + (vault.managed ? ` · ${vault.databaseCount} database backup${vault.databaseCount === 1 ? '' : 's'}` : '')
+            + ` · ${vault.scheduledCount} scheduled`;
+    const signature = JSON.stringify(vaults.map(vault => [
+        vault.id, vault.label, vault.provider, vault.bucket, vault.region, vault.managed,
+    ]));
+    if (signature === lastVaultRowsSignature) {
+        [...list.querySelectorAll('.vault-row-main')].forEach(button => {
+            const vault = vaults.find(item => item.id === button.dataset.vaultId);
+            if (vault) button.querySelector('.vault-row-count').textContent = countLabel(vault);
+        });
+        return;
+    }
+    lastVaultRowsSignature = signature;
+    list.replaceChildren();
+    vaults.forEach(vault => {
+        const row = document.createElement('div');
+        row.className = 'vault-row';
+        const openVault = document.createElement('button');
+        openVault.type = 'button';
+        openVault.className = 'vault-row-main';
+        openVault.dataset.vaultId = vault.id;
+        const heading = document.createElement('span');
+        heading.className = 'vault-row-heading';
+        const name = document.createElement('strong');
+        name.textContent = vault.label;
+        const kind = document.createElement('span');
+        kind.className = 'vault-kind';
+        kind.textContent = vault.managed ? 'Included' : `${vault.provider.toUpperCase()} connector`;
+        heading.append(name, kind);
+        const location = document.createElement('span');
+        location.className = 'vault-row-location';
+        location.textContent = vault.managed
+            ? 'SaveState-managed encrypted storage'
+            : `${vault.bucket} · ${vault.region} · Customer-owned storage`;
+        const count = document.createElement('span');
+        count.className = 'vault-row-count';
+        count.textContent = countLabel(vault);
+        openVault.append(heading, location, count);
+        openVault.addEventListener('click', () => {
+            selectedVaultId = vault.id;
+            visibleSnapshotVaultId = null;
+            snapshotLoadGeneration += 1;
+            document.getElementById('vault-detail-title').textContent = vault.label;
+            document.getElementById('vault-detail-subtitle').textContent = 'Loading vault…';
+            document.getElementById('profiles-list').textContent = 'Loading backup sources…';
+            document.getElementById('byos-snapshots').classList.add('hidden');
+            showVaultPane();
+            document.getElementById('btn-vault-back').focus();
+            void loadProfiles();
+        });
+        row.appendChild(openVault);
+        if (!vault.managed) {
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'btn btn-ghost btn-sm vault-disconnect';
+            remove.textContent = 'Disconnect';
+            remove.setAttribute('aria-label', `Disconnect ${vault.label}`);
+            remove.addEventListener('click', async () => {
+                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its bucket and every backup stay with your provider. Remove its backup sources first.`, { title: 'Disconnect vault' });
+                if (!accepted) return;
+                try {
+                    await invoke('cmd_byos_remove_vault', { vaultId: vault.id });
+                    showToast('Vault disconnected. Remote backups were not deleted.', 'success');
+                    void loadProfiles();
+                } catch (error) { showToast(friendlyError(error), 'error'); }
+            });
+            row.appendChild(remove);
+        }
+        list.appendChild(row);
+    });
+}
+
+async function loadProfiles({ remoteResults = null } = {}) {
+    const generation = ++vaultLoadGeneration;
     const container = document.getElementById('profiles-list');
     try {
-        const [profiles, unownedCount, authStatus, profileLimitValue, connectedVaults] = await Promise.all([
+        const remotePromise = remoteResults
+            ? Promise.resolve(remoteResults)
+            : Promise.allSettled([invoke('cmd_get_profile_limit'), invoke('cmd_byos_entitlements')]);
+        const localProfilesPromise = Promise.allSettled([
             invoke('cmd_list_profiles'),
+            invoke('cmd_list_database_profiles'),
             invoke('cmd_count_unowned_profiles'),
             invoke('cmd_get_auth_status'),
-            invoke('cmd_get_profile_limit'),
-            invoke('cmd_byos_list_vaults'),
         ]);
-        byosVaults = connectedVaults || [];
-        const profileLimit = Number(profileLimitValue ?? 2);
-        const automatedCount = (profiles || []).filter((profile) => profile.enabled && String(profile.schedule || '').trim()).length;
-        const profileLimitSummary = document.getElementById('profile-limit-summary');
-        if (profileLimitSummary) {
-            profileLimitSummary.textContent = `${automatedCount} of ${profileLimit} automated backup profiles in use. Manual-only profiles do not count.`;
+        const vaultsResult = await invoke('cmd_byos_list_vaults').then(
+            value => ({ status: 'fulfilled', value }),
+            reason => ({ status: 'rejected', reason }),
+        );
+        if (generation !== vaultLoadGeneration) return;
+        if (vaultsResult.status === 'fulfilled') byosVaults = vaultsResult.value || [];
+        const vaultError = vaultsResult.status === 'rejected' ? vaultsResult.reason : null;
+        const currentVaultIds = [...document.querySelectorAll('.vault-row-main')].map(button => button.dataset.vaultId);
+        const nextVaultIds = [vaultModel.MANAGED_VAULT_ID, ...byosVaults.map(vault => vault.id)];
+        if (JSON.stringify(currentVaultIds) !== JSON.stringify(nextVaultIds)) {
+            renderVaultOverview([], [], null, vaultError, true, true);
+            showVaultPane();
         }
-        container.innerHTML = '';
+        const [profilesResult, databasesResult, unownedResult, authResult] = await localProfilesPromise;
+        if (generation !== vaultLoadGeneration) return;
+        const profiles = profilesResult.status === 'fulfilled' ? profilesResult.value || [] : [];
+        const databases = databasesResult.status === 'fulfilled' ? databasesResult.value || [] : [];
+        const unownedCount = unownedResult.status === 'fulfilled' ? unownedResult.value : 0;
+        const authStatus = authResult.status === 'fulfilled' ? authResult.value : null;
+        let resolvedRemote = remoteResults;
+        if (!resolvedRemote) {
+            resolvedRemote = await Promise.race([
+                remotePromise,
+                new Promise(resolve => setTimeout(() => resolve(null), 700)),
+            ]);
+            if (!resolvedRemote) {
+                void remotePromise.then(results => {
+                    if (generation === vaultLoadGeneration) void loadProfiles({ remoteResults: results });
+                });
+            }
+        }
+        if (generation !== vaultLoadGeneration) return;
+        const [limitResult, entitlementResult] = resolvedRemote || [];
+        const profileLimit = limitResult?.status === 'fulfilled' ? Number(limitResult.value) : null;
+        const entitlement = entitlementResult?.status === 'fulfilled' ? entitlementResult.value : null;
+        renderVaultOverview(profiles, databases, entitlement, vaultError, !resolvedRemote);
+        const selectedVault = vaultModel.vaultsWithCounts(byosVaults, profiles, databases)
+            .find(vault => vault.id === selectedVaultId);
+        if (selectedVaultId && !selectedVault) selectedVaultId = null;
+        showVaultPane();
+        let canBackupSelectedVault = false;
+        if (selectedVaultId && selectedVault) {
+            document.getElementById('vault-detail-title').textContent = selectedVault.label;
+            document.getElementById('vault-detail-subtitle').textContent = selectedVault.managed
+                ? 'SaveState-managed encrypted storage · Included with your plan'
+                : `${selectedVault.provider.toUpperCase()} · ${selectedVault.bucket} · ${selectedVault.region} · Stored with your provider`;
+            document.getElementById('vault-connection-details').classList.toggle('hidden', selectedVault.managed);
+            if (!selectedVault.managed) {
+                document.getElementById('vault-detail-endpoint').textContent = selectedVault.endpoint;
+                document.getElementById('vault-detail-bucket').textContent = selectedVault.bucket;
+                document.getElementById('vault-detail-region').textContent = selectedVault.region;
+                document.getElementById('vault-detail-prefix').textContent = selectedVault.prefix;
+            }
+            document.getElementById('btn-vault-browse').textContent = selectedVault.managed ? 'Browse backups' : 'Restore points';
+            document.getElementById('btn-vault-browse').disabled = selectedVault.managed && !serviceWorkspaceReady;
+            canBackupSelectedVault = serviceWorkspaceReady && (selectedVault.managed || Boolean(entitlement?.enabled))
+                && !(Boolean(vaultError) && !selectedVault.managed);
+            document.getElementById('btn-create-profile').disabled = !canBackupSelectedVault;
+            document.getElementById('btn-vault-databases').disabled = !serviceWorkspaceReady;
+            document.getElementById('profile-limit-summary').textContent = !resolvedRemote
+                ? 'Checking your automated-schedule allowance…'
+                : profileLimit === null
+                ? 'Schedule allowance could not be checked right now. Existing sources are shown below.'
+                : `${[...profiles, ...databases].filter(profile => profile.enabled && String(profile.schedule || '').trim()).length} of ${profileLimit} automated schedules in use across file sources and databases. Manual-only sources do not count.`;
+            const selectedProfiles = vaultModel.profilesInVault(profiles, selectedVaultId);
+            document.getElementById('vault-source-count').textContent = `${selectedProfiles.length} source${selectedProfiles.length === 1 ? '' : 's'}`;
+            document.getElementById('vault-database-section').classList.toggle('hidden', !selectedVault.managed);
+            document.getElementById('vault-database-summary').textContent = `${databases.length} database backup${databases.length === 1 ? '' : 's'} in Cloud - Personal · ${databases.filter(profile => profile.enabled && String(profile.schedule || '').trim()).length} scheduled`;
+            if (visibleSnapshotVaultId !== selectedVaultId) document.getElementById('byos-snapshots').classList.add('hidden');
+        }
+        container.replaceChildren();
+
+        const migrationContainer = document.getElementById('vault-unowned');
+        migrationContainer.replaceChildren();
+        migrationContainer.classList.toggle('hidden', Number(unownedCount) === 0);
 
         if (Number(unownedCount) > 0) {
             const migrationCard = document.createElement('div');
@@ -2846,21 +3104,35 @@ async function loadProfiles() {
                 }
             });
             migrationCard.querySelector('.profile-actions').appendChild(claimButton);
-            container.appendChild(migrationCard);
+            migrationContainer.appendChild(migrationCard);
         }
 
-        if (!profiles || profiles.length === 0) {
+        if (!selectedVaultId) return;
+
+        if (profilesResult.status === 'rejected') {
+            const error = document.createElement('p');
+            error.className = 'text-muted';
+            error.textContent = `Could not load backup sources: ${friendlyError(profilesResult.reason)}`;
+            container.appendChild(error);
+            return;
+        }
+
+        const selectedProfiles = vaultModel.profilesInVault(profiles, selectedVaultId);
+        if (selectedProfiles.length === 0) {
             const empty = document.createElement('div');
-            empty.className = 'empty-state glass-card';
-            empty.innerHTML = '<p class="text-muted">No backup profiles assigned to this account yet.</p>';
+            empty.className = 'vault-empty';
+            empty.textContent = !resolvedRemote
+                ? 'Checking your plan. Existing sources and restore points remain available.'
+                : canBackupSelectedVault
+                ? 'No backup sources in this vault yet. Add a folder and give it a schedule, or leave it manual-only.'
+                : selectedVault?.managed
+                    ? 'Cloud - Personal backups require an active SaveState plan.'
+                    : 'No backup sources in this vault. Existing customer-owned restore points can still be opened above.';
             container.appendChild(empty);
             return;
         }
 
-        profiles.forEach(p => {
-            const destination = p.vault_id
-                ? (byosVaults.find(vault => vault.id === p.vault_id)?.label || 'Customer-owned bucket')
-                : 'SaveState-managed';
+        selectedProfiles.forEach(p => {
             const card = document.createElement('div');
             card.className = 'profile-card glass-card';
             card.setAttribute('data-profile-id', p.id);
@@ -2903,10 +3175,6 @@ async function loadProfiles() {
                         <span class="meta-value">${p.retention > 0 ? `Last ${p.retention}` : 'Unlimited'}</span>
                     </div>
                     <div class="profile-meta-item">
-                        <span class="meta-label">Destination</span>
-                        <span class="meta-value" title="${escapeHtml(destination)}">${escapeHtml(destination)}</span>
-                    </div>
-                    <div class="profile-meta-item">
                         <span class="meta-label">Last Run</span>
                         <span class="meta-value">${p.last_run ? new Date(p.last_run).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : 'Never'}</span>
                     </div>
@@ -2932,6 +3200,7 @@ async function loadProfiles() {
             const runBtn = document.createElement('button');
             runBtn.className = 'btn btn-primary btn-sm';
             runBtn.textContent = '▶ Run Now';
+            runBtn.disabled = !canBackupSelectedVault;
             runBtn.addEventListener('click', () => {
                 runBtn.disabled = true;
                 runBtn.textContent = 'Running…';
@@ -2954,6 +3223,7 @@ async function loadProfiles() {
             const editBtn = document.createElement('button');
             editBtn.className = 'btn btn-ghost btn-sm';
             editBtn.textContent = '✏️ Edit';
+            editBtn.disabled = !canBackupSelectedVault;
             editBtn.addEventListener('click', () => openProfileModal(p));
 
             const openBackupsBtn = document.createElement('button');
@@ -2961,7 +3231,8 @@ async function loadProfiles() {
             openBackupsBtn.textContent = p.vault_id ? 'Restore points' : 'Open Backups';
             openBackupsBtn.addEventListener('click', () => {
                 if (p.vault_id) {
-                    navigateTo('settings');
+                    selectedVaultId = p.vault_id;
+                    showVaultPane();
                     void showByosSnapshots(p.vault_id);
                 } else {
                     openManagedProfileFolder(p.folder);
@@ -2984,18 +3255,31 @@ async function loadProfiles() {
     }
 }
 
-async function openProfileModal(profile = null) {
+function closeProfileModal({ returnFocus = true } = {}) {
+    document.getElementById('profile-modal').classList.add('hidden');
+    const target = profileModalReturnFocus;
+    profileModalReturnFocus = null;
+    if (returnFocus && target?.isConnected) target.focus();
+}
+
+async function openProfileModal(profile = null, vaultId = selectedVaultId) {
     const modal = document.getElementById('profile-modal');
+    profileModalReturnFocus = document.activeElement;
     const title = document.getElementById('profile-modal-title');
     const form = document.getElementById('profile-form');
     const picker = document.getElementById('profile-vault');
     const saveButton = form.querySelector('button[type="submit"]');
     saveButton.disabled = true;
-    picker.innerHTML = '<option value="">SaveState-managed storage</option>';
-    picker.disabled = true;
+    const destinationId = profile?.vault_id || (vaultId === vaultModel.MANAGED_VAULT_ID ? null : vaultId);
+    const destination = byosVaults.find(vault => vault.id === destinationId);
+    picker.value = destinationId || '';
+    document.getElementById('profile-vault-name').value = destination?.label || 'Cloud - Personal';
+    document.getElementById('profile-vault-help').textContent = profile
+        ? 'This source stays in its original vault. Create another source to back up to a different vault.'
+        : 'This source and its restore points will belong to this vault.';
 
     if (profile) {
-        title.textContent = 'Edit Backup Profile';
+        title.textContent = 'Edit Backup Source';
         document.getElementById('profile-edit-id').value = profile.id;
         document.getElementById('profile-name').value = profile.name;
         document.getElementById('profile-source').value = profile.source_path;
@@ -3016,45 +3300,19 @@ async function openProfileModal(profile = null) {
         }
         document.getElementById('profile-retention').value = profile.retention || 0;
     } else {
-        title.textContent = 'Create Backup Profile';
+        title.textContent = 'Add Backup Source';
         form.reset();
         document.getElementById('profile-edit-id').value = '';
         document.getElementById('profile-schedule-interval').value = 1;
+        picker.value = destinationId || '';
+        document.getElementById('profile-vault-name').value = destination?.label || 'Cloud - Personal';
     }
 
     modal.classList.remove('hidden');
-    try {
-        const [vaults, entitlement] = await Promise.all([
-            invoke('cmd_byos_list_vaults'), invoke('cmd_byos_entitlements'),
-        ]);
-        byosVaults = vaults || [];
-        if (entitlement.enabled || profile?.vault_id) {
-            byosVaults.forEach(vault => {
-                const option = document.createElement('option');
-                option.value = vault.id;
-                option.textContent = `${vault.label} · ${vault.provider.toUpperCase()}`;
-                picker.appendChild(option);
-            });
-        }
-        picker.value = profile?.vault_id || '';
-        picker.disabled = Boolean(profile);
-        document.getElementById('profile-vault-help').textContent = profile
-            ? 'Destination is fixed for this profile. Create a new profile to use another destination.'
-            : 'Choose a connected bucket or SaveState-managed storage before saving this profile.';
-    } catch (error) {
-        document.getElementById('profile-vault-help').textContent = `Could not load destinations: ${friendlyError(error)}`;
-        if (profile?.vault_id) {
-            const current = document.createElement('option');
-            current.value = profile.vault_id;
-            current.textContent = 'Current customer-owned destination';
-            picker.appendChild(current);
-            picker.value = profile.vault_id;
-        }
-    } finally {
-        saveButton.disabled = false;
-    }
+    saveButton.disabled = false;
     updateProfileFolderPreview();
     updateScheduleTimePreview();
+    document.getElementById('profile-name').focus();
 }
 
 function updateScheduleTimePreview() {
@@ -3065,7 +3323,7 @@ function updateScheduleTimePreview() {
 
     const rawTimes = timesInput.value.split(',').map(value => value.trim()).filter(Boolean);
     if (rawTimes.length === 0) {
-        help.textContent = 'Leave blank for a manual-only profile. UTC equivalents appear here after you enter a time.';
+        help.textContent = 'Leave blank to run this source manually. UTC equivalents appear here after you enter a time.';
         return;
     }
 
@@ -3132,76 +3390,16 @@ function shortenPath(path) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Settings — customer-owned storage
+// Vault restore points — customer-owned storage
 // ────────────────────────────────────────────────────────────────
-async function loadByos() {
-    const status = document.getElementById('byos-status');
-    const list = document.getElementById('byos-vault-list');
-    const openButton = document.getElementById('btn-byos-open');
-    try {
-        const vaults = await invoke('cmd_byos_list_vaults');
-        const entitlement = await invoke('cmd_byos_entitlements').catch(() => null);
-        byosVaults = vaults || [];
-        // Expired subscribers can reconnect an existing repository for
-        // restore. Native code refuses to create a new one without a plan.
-        openButton.classList.remove('hidden');
-        openButton.textContent = entitlement?.enabled ? 'Connect storage' : 'Reconnect existing storage';
-        status.textContent = entitlement === null
-            ? 'Plan check is temporarily unavailable. Existing restore points in your bucket remain accessible.'
-            : entitlement.enabled
-            ? 'Available on this plan. Customer-owned bytes do not count toward your SaveState-managed storage allowance.'
-            : 'An eligible active plan is needed for new backups. You can reconnect an existing repository here to restore files.';
-        list.replaceChildren();
-        if (byosVaults.length === 0) {
-            const empty = document.createElement('p');
-            empty.className = 'text-muted text-sm';
-            empty.textContent = 'No customer-owned destinations connected on this PC.';
-            list.appendChild(empty);
-        }
-        byosVaults.forEach(vault => {
-            const row = document.createElement('div');
-            row.className = 'byos-vault-row';
-            const detail = document.createElement('div');
-            const name = document.createElement('strong');
-            name.textContent = vault.label;
-            const location = document.createElement('small');
-            location.textContent = `${vault.provider.toUpperCase()} · ${vault.endpoint} · ${vault.bucket} · ${vault.region} · ${vault.prefix}`;
-            detail.append(name, location);
-            const actions = document.createElement('div');
-            actions.className = 'byos-vault-actions';
-            const view = document.createElement('button');
-            view.type = 'button';
-            view.className = 'btn btn-ghost btn-sm';
-            view.textContent = 'Restore points';
-            view.addEventListener('click', () => void showByosSnapshots(vault.id));
-            const remove = document.createElement('button');
-            remove.type = 'button';
-            remove.className = 'btn btn-ghost btn-sm';
-            remove.textContent = 'Disconnect';
-            remove.addEventListener('click', async () => {
-                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its bucket and every backup stay with your provider. Profiles using it must be removed first.`, { title: 'Disconnect storage' });
-                if (!accepted) return;
-                try {
-                    await invoke('cmd_byos_remove_vault', { vaultId: vault.id });
-                    document.getElementById('byos-snapshots').classList.add('hidden');
-                    showToast('Destination disconnected. Remote backups were not deleted.', 'success');
-                    await loadByos();
-                } catch (error) { showToast(friendlyError(error), 'error'); }
-            });
-            actions.append(view, remove);
-            row.append(detail, actions);
-            list.appendChild(row);
-        });
-    } catch (error) {
-        openButton.classList.add('hidden');
-        status.textContent = `Could not load storage destinations: ${friendlyError(error)}`;
-    }
-}
-
 async function showByosSnapshots(vaultId) {
     const container = document.getElementById('byos-snapshots');
     const vault = byosVaults.find(item => item.id === vaultId);
+    const workspaceGeneration = workspaceUiGeneration;
+    const requestGeneration = ++snapshotLoadGeneration;
+    visibleSnapshotVaultId = vaultId;
     container.classList.remove('hidden');
+    container.scrollIntoView({ block: 'nearest' });
     container.replaceChildren();
     const heading = document.createElement('h4');
     heading.textContent = `${vault?.label || 'Customer-owned storage'} restore points`;
@@ -3211,6 +3409,7 @@ async function showByosSnapshots(vaultId) {
     container.append(heading, status);
     try {
         const snapshots = await invoke('cmd_byos_list_snapshots', { vaultId });
+        if (selectedVaultId !== vaultId || workspaceGeneration !== workspaceUiGeneration || requestGeneration !== snapshotLoadGeneration) return;
         status.textContent = snapshots.length
             ? 'These restore points are read directly from your bucket. Choose a folder; SaveState creates a new restore subfolder inside it.'
             : 'No restore points in this bucket yet.';
@@ -3246,6 +3445,7 @@ async function showByosSnapshots(vaultId) {
             container.appendChild(row);
         });
     } catch (error) {
+        if (selectedVaultId !== vaultId || workspaceGeneration !== workspaceUiGeneration || requestGeneration !== snapshotLoadGeneration) return;
         status.textContent = `Could not read restore points: ${friendlyError(error)}`;
     }
 }
@@ -3254,7 +3454,6 @@ async function showByosSnapshots(vaultId) {
 // ────────────────────────────────────────────────────────────────
 async function loadSettings() {
     void loadOrganizationInstallationStatus();
-    void loadByos();
     try {
         const settings = await invoke('cmd_get_settings');
         const webhookInput = document.getElementById('settings-webhook-url');

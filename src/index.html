@@ -110,7 +110,7 @@
                     <li>
                         <a href="#" data-view="profiles" class="nav-link">
                             <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                            <span>Profiles</span>
+                            <span>Vaults</span>
                         </a>
                     </li>
                     <li>
@@ -128,7 +128,7 @@
                     <li>
                         <a href="#" data-view="backups" class="nav-link">
                             <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5" rx="1"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
-                            <span>My Backups</span>
+                            <span>Cloud Backups</span>
                         </a>
                     </li>
                     <li>
@@ -231,27 +231,78 @@
                     <div class="quick-actions">
                         <button class="btn btn-primary" id="btn-goto-profiles">
                             <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                            Manage Profiles
+                            Manage Vaults
                         </button>
                         <button class="btn btn-ghost" id="btn-goto-backup">Quick Backup</button>
                         <button class="btn btn-ghost" id="btn-goto-backups">View Backups</button>
                     </div>
                 </section>
 
-                <!-- ── PROFILES ─────────────────────── -->
+                <!-- ── VAULTS ───────────────────────── -->
                 <section id="page-profiles" class="page">
-                    <div class="page-header">
-                        <h2 class="page-title">Backup Profiles</h2>
-                        <button class="btn btn-primary btn-sm" id="btn-create-profile">
-                            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            New Profile
-                        </button>
-                    </div>
-                    <p class="text-muted" id="profile-limit-summary" style="margin: -0.5rem 0 1.25rem;">Scheduled-profile allowance is loading… Manual-only profiles do not count.</p>
-                    <div id="profiles-list" class="profiles-grid">
-                        <div class="empty-state glass-card">
-                            <p class="text-muted">No backup profiles yet. Create one to get started.</p>
+                    <div id="vault-overview">
+                        <div class="page-header vault-page-header">
+                            <div>
+                                <h2 class="page-title">Vaults</h2>
+                                <p class="page-intro">Choose where backups live, then set up sources and schedules inside that vault.</p>
+                            </div>
+                            <button type="button" class="btn btn-primary btn-sm hidden" id="btn-byos-open">Add Vault</button>
                         </div>
+                        <p id="byos-status" class="text-muted text-sm vault-plan-note" role="status">Loading vaults…</p>
+                        <div id="byos-vault-list" class="vault-list" aria-live="polite"></div>
+                        <div id="vault-unowned" class="hidden"></div>
+                        <form id="byos-form" class="byos-form vault-connect-form hidden" autocomplete="off">
+                            <div class="vault-connect-heading">
+                                <h3>Add a storage vault</h3>
+                                <p class="text-muted text-sm">Connect a bucket you own. This PC keeps its credentials locally.</p>
+                            </div>
+                            <div class="byos-field-grid">
+                                <div class="form-group"><label for="byos-label">Vault name</label><input type="text" id="byos-label" required maxlength="80" placeholder="e.g. Office backups" /></div>
+                                <div class="form-group"><label for="byos-provider">Connector</label><select class="select-input" id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option></select></div>
+                                <div class="form-group"><label for="byos-endpoint">S3 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" /></div>
+                                <div class="form-group"><label for="byos-region">Region</label><input type="text" id="byos-region" required placeholder="eu-central-003 or auto" /></div>
+                                <div class="form-group"><label for="byos-bucket">Bucket</label><input type="text" id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
+                                <div class="form-group"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input type="text" id="byos-prefix" placeholder="Auto-generated if blank" /></div>
+                                <div class="form-group"><label for="byos-key-id">Access key ID</label><input type="text" id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
+                                <div class="form-group"><label for="byos-secret">Secret access key</label><input id="byos-secret" required type="password" autocomplete="new-password" spellcheck="false" /></div>
+                            </div>
+                            <p class="text-muted text-sm">Keys stay in Windows Credential Manager on this PC. Your provider sets storage charges and data location. Connecting does not change other vaults.</p>
+                            <div class="byos-actions"><button type="button" class="btn btn-ghost btn-sm" id="btn-byos-cancel">Cancel</button><button type="submit" class="btn btn-primary btn-sm" id="btn-byos-connect">Connect and test</button></div>
+                        </form>
+                    </div>
+
+                    <div id="vault-detail" class="hidden">
+                        <button type="button" class="btn btn-ghost btn-sm vault-back" id="btn-vault-back"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>All vaults</button>
+                        <div class="page-header vault-detail-header">
+                            <div>
+                                <h2 class="page-title" id="vault-detail-title">Vault</h2>
+                                <p class="page-intro" id="vault-detail-subtitle"></p>
+                            </div>
+                            <div class="vault-detail-actions">
+                                <button type="button" class="btn btn-ghost btn-sm" id="btn-vault-browse">Browse backups</button>
+                                <button class="btn btn-primary btn-sm" id="btn-create-profile">
+                                    <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                    Add backup source
+                                </button>
+                            </div>
+                        </div>
+                        <details id="vault-connection-details" class="vault-connection-details hidden">
+                            <summary>Connection details</summary>
+                            <dl>
+                                <div><dt>Endpoint</dt><dd id="vault-detail-endpoint"></dd></div>
+                                <div><dt>Bucket</dt><dd id="vault-detail-bucket"></dd></div>
+                                <div><dt>Region</dt><dd id="vault-detail-region"></dd></div>
+                                <div><dt>Folder prefix</dt><dd id="vault-detail-prefix"></dd></div>
+                            </dl>
+                        </details>
+                        <p class="text-muted text-sm" id="profile-limit-summary">Scheduled-profile allowance is loading…</p>
+                        <div class="vault-sources-header"><h3>Backup sources &amp; schedules</h3><span id="vault-source-count" class="text-muted text-sm"></span></div>
+                        <div id="profiles-list" class="profiles-grid" aria-live="polite"></div>
+                        <div id="vault-database-section" class="vault-database-section hidden">
+                            <div><h3>Database backups</h3><p id="vault-database-summary" class="text-muted text-sm"></p></div>
+                            <button type="button" class="btn btn-ghost btn-sm" id="btn-vault-databases">Manage databases</button>
+                        </div>
+                        <div id="byos-snapshots" class="byos-snapshots hidden" aria-live="polite"></div>
                     </div>
                 </section>
 
@@ -423,7 +474,7 @@
                 <!-- ── QUICK BACKUP ─────────────────── -->
                 <section id="page-backup" class="page">
                     <h2 class="page-title">Quick Backup</h2>
-                    <p class="text-muted" style="margin-bottom: 1.5rem;">One-off backup without a profile. Files are auto-encrypted with your master key.</p>
+                    <p class="text-muted" style="margin-bottom: 1.5rem;">One-off backup to Cloud - Personal. Files are encrypted locally with your vault key.</p>
 
                     <div class="quick-backup-folder-selector glass-card">
                         <div class="folder-selector-row">
@@ -466,7 +517,7 @@
                 <!-- ── BACKUPS LIST ────────────────── -->
                 <section id="page-backups" class="page">
                     <div class="page-header">
-                        <h2 class="page-title">My Backups</h2>
+                        <h2 class="page-title">Cloud - Personal Backups</h2>
                         <div class="page-header-actions">
                             <button class="btn btn-ghost btn-sm" id="btn-refresh-backups">↻ Refresh</button>
                             <button class="btn btn-primary btn-sm" id="btn-create-folder">
@@ -612,33 +663,6 @@
                 <section id="page-settings" class="page">
                     <h2 class="page-title">Settings</h2>
 
-                    <div class="settings-section byos-section" id="byos-section">
-                        <div class="byos-heading">
-                            <div>
-                                <h3>Your storage destinations</h3>
-                                <p class="text-muted">Keep SaveState-managed storage and add your own S3-compatible bucket. Each backup profile uses one destination.</p>
-                            </div>
-                            <button type="button" class="btn btn-primary btn-sm hidden" id="btn-byos-open">Connect bucket</button>
-                        </div>
-                        <p id="byos-status" class="text-muted text-sm" role="status">Checking your plan…</p>
-                        <div id="byos-vault-list" class="byos-vault-list" aria-live="polite"></div>
-                        <form id="byos-form" class="byos-form hidden" autocomplete="off">
-                            <div class="byos-field-grid">
-                                <div class="form-group"><label for="byos-label">Name</label><input id="byos-label" required maxlength="80" placeholder="e.g. Office B2 bucket" /></div>
-                                <div class="form-group"><label for="byos-provider">Provider</label><select id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option></select></div>
-                                <div class="form-group"><label for="byos-endpoint">S3 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" /></div>
-                                <div class="form-group"><label for="byos-region">Region</label><input id="byos-region" required placeholder="eu-central-003 or auto" /></div>
-                                <div class="form-group"><label for="byos-bucket">Bucket</label><input id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
-                                <div class="form-group"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input id="byos-prefix" placeholder="Auto-generated if blank" /></div>
-                                <div class="form-group"><label for="byos-key-id">Access key ID</label><input id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
-                                <div class="form-group"><label for="byos-secret">Secret access key</label><input id="byos-secret" required type="password" autocomplete="new-password" spellcheck="false" /></div>
-                            </div>
-                            <p class="text-muted text-sm">Keys stay in Windows Credential Manager on this PC. SaveState cannot recover them. Your provider determines storage charges and data location.</p>
-                            <div class="byos-actions"><button type="button" class="btn btn-ghost btn-sm" id="btn-byos-cancel">Cancel</button><button type="submit" class="btn btn-primary btn-sm" id="btn-byos-connect">Connect and test</button></div>
-                        </form>
-                        <div id="byos-snapshots" class="byos-snapshots hidden" aria-live="polite"></div>
-                    </div>
-
                     <!-- App Updates -->
                     <div class="settings-section glass-card" id="settings-update-section">
                         <div class="settings-update-row">
@@ -779,32 +803,33 @@
         </div>
     </div>
 
-    <!-- Profile Create/Edit Modal -->
+    <!-- Vault backup source Create/Edit Modal -->
     <div id="profile-modal" class="modal-overlay hidden">
-        <div class="modal glass-card">
-            <h3 id="profile-modal-title">Create Backup Profile</h3>
+        <div class="modal glass-card" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title" aria-describedby="profile-vault-help">
+            <h3 id="profile-modal-title">Add Backup Source</h3>
             <form id="profile-form" autocomplete="off">
                 <input type="hidden" id="profile-edit-id" />
                 <div class="form-group">
-                    <label for="profile-name">Profile Name</label>
-                    <input type="text" id="profile-name" placeholder='e.g. "Production Database"' required />
+                    <label for="profile-name">Backup name</label>
+                    <input type="text" id="profile-name" placeholder="e.g. Office documents" required />
                 </div>
                 <div class="form-group">
-                    <label>Source Folder</label>
+                    <label for="profile-source">Folder to back up</label>
                     <div class="input-row">
                         <input type="text" id="profile-source" placeholder="Select folder…" readonly required />
                         <button type="button" class="btn btn-ghost btn-sm" id="btn-pick-profile-source">Browse</button>
                     </div>
                 </div>
                 <div class="form-group">
-                    <label for="profile-vault">Storage destination</label>
-                    <select id="profile-vault"><option value="">SaveState-managed storage</option></select>
-                    <p id="profile-vault-help" class="text-muted text-sm">Choose before creating this profile. Existing restore points remain in their original destination.</p>
+                    <label for="profile-vault-name">Vault</label>
+                    <input type="text" id="profile-vault-name" readonly />
+                    <input type="hidden" id="profile-vault" value="" />
+                    <p id="profile-vault-help" class="text-muted text-sm">This backup source stays in its vault. Existing restore points remain there.</p>
                 </div>
                 <div class="form-group">
-                    <label for="profile-schedule-times">Backup Times <span class="text-muted text-sm">(optional; this machine's local time, e.g. 15:30, 02:00)</span></label>
+                    <label for="profile-schedule-times">Scheduled times <span class="text-muted text-sm">(optional; this machine's local time, e.g. 15:30, 02:00)</span></label>
                     <input type="text" id="profile-schedule-times" placeholder="e.g. 15:30, 02:00" aria-describedby="profile-schedule-time-help" />
-                    <p class="text-muted text-sm" id="profile-schedule-time-help">Leave blank for a manual-only profile. UTC equivalents appear here after you enter a time.</p>
+                    <p class="text-muted text-sm" id="profile-schedule-time-help">Leave blank to run this source manually. UTC equivalents appear here after you enter a time.</p>
                 </div>
                 <div class="form-group">
                     <label for="profile-schedule-interval">Repeat Every (days) <span class="text-muted text-sm">(used only when backup times are set)</span></label>
@@ -821,7 +846,7 @@
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn btn-ghost" id="btn-cancel-profile">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save Profile</button>
+                    <button type="submit" class="btn btn-primary">Save source</button>
                 </div>
             </form>
         </div>
@@ -830,18 +855,18 @@
     <!-- Profile deletion confirmation -->
     <div id="profile-delete-modal" class="modal-overlay hidden">
         <div class="modal glass-card profile-delete-modal" role="dialog" aria-modal="true" aria-labelledby="profile-delete-title">
-            <h3 id="profile-delete-title">Delete backup profile?</h3>
+            <h3 id="profile-delete-title">Delete backup source?</h3>
             <p class="text-muted" id="profile-delete-copy"></p>
             <label class="check-row profile-delete-choice">
                 <input type="checkbox" id="profile-delete-backups" />
                 <span>
-                    Delete all backups within this profile
-                    <small>Only versions still inside this profile folder are deleted. Backups moved elsewhere are preserved.</small>
+                    Also delete this source's stored backups
+                    <small>Only versions still inside this source's folder are deleted. Backups moved elsewhere are preserved.</small>
                 </span>
             </label>
             <div class="modal-actions">
                 <button type="button" class="btn btn-ghost" id="btn-cancel-profile-delete">Cancel</button>
-                <button type="button" class="btn btn-danger" id="btn-confirm-profile-delete">Delete Profile</button>
+                <button type="button" class="btn btn-danger" id="btn-confirm-profile-delete">Delete source</button>
             </div>
         </div>
     </div>
@@ -886,6 +911,7 @@
     <script src="logout-flow.js"></script>
     <script src="vault-recovery.js"></script>
     <script src="storage-usage.js"></script>
+    <script src="vault-model.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

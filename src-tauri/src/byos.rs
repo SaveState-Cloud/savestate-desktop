@@ -47,7 +47,6 @@ pub struct NewVault {
 #[serde(rename_all = "camelCase")]
 pub struct ByosEntitlement {
     enabled: bool,
-    max_vaults: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,7 +190,7 @@ fn owner_scope(api: &SaveStateClient) -> Result<String> {
     ))
 }
 
-async fn require_entitlement(api: &SaveStateClient) -> Result<u32> {
+async fn require_entitlement(api: &SaveStateClient) -> Result<()> {
     let entitlements = api
         .get_entitlements()
         .await
@@ -199,11 +198,11 @@ async fn require_entitlement(api: &SaveStateClient) -> Result<u32> {
     if !entitlements.byos_enabled {
         bail!("Customer-owned storage requires an eligible active plan");
     }
-    Ok(entitlements.max_byos_vaults)
+    Ok(())
 }
 
 pub(crate) async fn verify_entitlement(api: &SaveStateClient) -> Result<()> {
-    require_entitlement(api).await.map(|_| ())
+    require_entitlement(api).await
 }
 
 fn session(vault: &Vault, credentials: VaultCredentials, mode: &str) -> RepoSession {
@@ -343,18 +342,12 @@ pub async fn cmd_byos_entitlements(
         guard.byos_scope().ok_or("Sign in first")?;
         guard.api.clone()
     };
-    let value = match api.get_entitlements().await {
-        Ok(value) => value,
-        Err(_) => {
-            return Ok(ByosEntitlement {
-                enabled: false,
-                max_vaults: 0,
-            })
-        }
-    };
+    let value = api.get_entitlements().await.map_err(|_| {
+        "Plan check is unavailable. Existing customer-owned restore points remain accessible."
+            .to_string()
+    })?;
     Ok(ByosEntitlement {
         enabled: value.byos_enabled,
-        max_vaults: value.max_byos_vaults,
     })
 }
 
@@ -390,31 +383,8 @@ pub async fn cmd_byos_add_vault(
     // repository in that state; a customer may still need their own objects.
     let entitlement = context.api.get_entitlements().await.ok();
     let active = entitlement.as_ref().is_some_and(|value| value.byos_enabled);
-    let max_vaults = if active {
-        entitlement
-            .as_ref()
-            .map_or(25, |value| value.max_byos_vaults)
-    } else {
-        25
-    };
     let (vault, credentials) =
         validate(input, context.account_scope.clone()).map_err(|e| e.to_string())?;
-    let count: u32 = {
-        let guard = state.0.lock().map_err(|e| e.to_string())?;
-        guard
-            .db
-            .query_row(
-                "SELECT COUNT(*) FROM byos_vaults WHERE owner_account = ?1",
-                params![context.account_scope],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?
-    };
-    if count >= max_vaults {
-        return Err(format!(
-            "This account has reached its {max_vaults}-destination safety limit"
-        ));
-    }
     {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
         let duplicate: u32 = guard.db.query_row(

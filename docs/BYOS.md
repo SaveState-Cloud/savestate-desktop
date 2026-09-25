@@ -1,29 +1,34 @@
 # Customer-owned storage (BYOS)
 
-Implementation and acceptance record for the next desktop release. This is
-**not** a claim that an older installed production app already has BYOS.
+Implementation and acceptance record for customer-owned vaults. The vault-first
+navigation below is a desktop change on this branch; do not describe it as
+available in an installed release until a new installer is published.
 
 ## Customer flow
 
-1. On an eligible active plan, open **Settings → Your storage destinations**.
+1. Open **Vaults**. **Cloud - Personal** is the permanent SaveState-managed
+   vault. On an eligible active plan, select **Add Vault** to connect another
+   storage destination.
 2. Create a bucket with an S3-compatible provider and enter its endpoint,
    region, bucket name, access key ID and secret. A dedicated bucket or prefix
    is recommended. SaveState generates an account-scoped prefix if left blank.
 3. **Connect and test** opens or creates a Kopia repository and runs Kopia's
-   storage-provider validation before the destination is saved.
-4. Create a file/folder backup profile and choose the connected destination.
-   SaveState-managed storage remains the default. A profile's destination is
-   fixed after creation; create a second profile to change it without moving or
-   deleting existing restore points.
-5. Run or schedule the profile normally. Open **Restore points** in Settings to
-   browse snapshots directly from the bucket and restore into a new local
-   folder. Disconnecting a destination never deletes remote objects.
+   storage-provider validation before the vault is saved.
+4. Open any vault and add one or more file/folder backup sources. Each source
+   can have its own local-time schedule and retention or be manual-only. Its
+   destination is fixed after creation; add another source to back up the same
+   folder to a different vault without moving its existing restore points.
+5. Run a source in its vault. Use **Restore points** inside a custom vault to
+   browse snapshots directly from its bucket and restore into a new local
+   folder. **Browse backups** inside Cloud - Personal opens the managed backup
+   browser. Disconnecting a custom vault never deletes remote objects.
 
 ## Boundaries and recovery
 
 - Customer-owned object bytes do not count toward SaveState's managed-storage
-  quota, and provider charges are paid by the customer. The existing automated
-  schedule limit still applies to scheduled BYOS profiles.
+  quota, and provider charges are paid by the customer. There is no numerical
+  cap on custom vaults. The existing automated schedule limit applies across
+  all vaults, not separately to each vault.
 - File/folder profiles are supported. Quick backups and native database
   profiles still use SaveState-managed storage.
 - The S3 key pair stays in Windows Credential Manager on the device. The API
@@ -42,7 +47,7 @@ Implementation and acceptance record for the next desktop release. This is
   one or run backups without an active eligible plan. If a replacement
   subscription creates a new service workspace, create a new backup profile;
   the old service-scoped schedule is not silently moved, while the existing
-  customer-owned restore points remain available from Settings.
+  customer-owned restore points remain available from Vaults.
 - The website vault cannot directly browse customer-owned objects because
   SaveState does not hold the customer's storage credentials. Use the desktop
   app's Restore points view for BYOS.
@@ -52,8 +57,18 @@ Implementation and acceptance record for the next desktop release. This is
 ## Verification and release notes
 
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
-  the desktop checks passed: 54 UI tests, 3 logout-flow tests, and 106 Rust
-  tests (one optional database integration test ignored).
+  the desktop checks passed: 61 UI tests, 3 logout-flow tests, and 106 Rust
+  tests (one optional database integration test ignored). The API checks passed
+  288 unit tests and 6 disposable-D1 runtime tests.
+- The vault-first development build was opened at the Windows app's 802×632
+  window size. Cloud - Personal and two existing customer-owned vaults rendered;
+  the B2 vault showed its existing source, its edit form kept the destination
+  fixed, and its restore points loaded from the private test bucket. Add Vault
+  and Add Backup Source forms were inspected and cancelled without writing
+  backup or provider data. The source dialog focused its name field, wrapped
+  Shift+Tab to its final action, and Escape returned focus to Add backup source;
+  cancelling Add Vault restored keyboard focus to its button. Connector setup
+  was absent from Settings.
 - A disposable local S3 round trip passed in the Windows development app:
   connect/validate, create profile, back up a 111-byte file, list the restore
   point, and restore to a separate directory. Original and restored SHA-256

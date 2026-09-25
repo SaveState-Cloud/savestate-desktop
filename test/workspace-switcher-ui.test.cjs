@@ -28,4 +28,7 @@ test('switching invalidates repository and visible workspace state', () => {
   assert.match(app, /currentFolder = '\/'/);
   assert.match(app, /folderList = \[\]/);
   assert.match(app, /workspaceUiGeneration \+= 1/);
+  assert.match(app, /byosVaults = \[\]/);
+  assert.match(app, /document\.getElementById\('byos-form'\)\.reset\(\)/);
+  assert.match(app, /document\.getElementById\('profile-modal'\)\.classList\.add\('hidden'\)/);
 });
