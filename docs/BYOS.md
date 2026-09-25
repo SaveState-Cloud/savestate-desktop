@@ -5,7 +5,7 @@ the currently installed production app already has BYOS.
 
 ## Customer flow
 
-1. On an active Pro or Ultra plan, open **Settings → Your storage destinations**.
+1. On an eligible active plan, open **Settings → Your storage destinations**.
 2. Create a bucket with an S3-compatible provider and enter its endpoint,
    region, bucket name, access key ID and secret. A dedicated bucket or prefix
    is recommended. SaveState generates an account-scoped prefix if left blank.

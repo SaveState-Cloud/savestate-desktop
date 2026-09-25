@@ -3136,7 +3136,7 @@ async function loadByos() {
             ? 'Plan check is temporarily unavailable. Existing restore points in your bucket remain accessible.'
             : entitlement.enabled
             ? 'Available on this plan. Customer-owned bytes do not count toward your SaveState-managed storage allowance.'
-            : 'A Pro or Ultra plan is needed for new backups. You can reconnect an existing repository here to restore files.';
+            : 'An eligible active plan is needed for new backups. You can reconnect an existing repository here to restore files.';
         list.replaceChildren();
         if (byosVaults.length === 0) {
             const empty = document.createElement('p');
