@@ -18,6 +18,7 @@ let updatePhase = 'idle';
 let updateStatusMessage = 'Update status is loading…';
 let updateProgressPercent = 0;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const PROFILE_REFRESH_INTERVAL_MS = 30 * 1000;
 
 // ── Page map ──────────────────────────────────────────────────────
 const pages = {
@@ -82,6 +83,10 @@ async function init() {
 
     await checkAuthStatus();
     setInterval(() => void checkForUpdates(), UPDATE_CHECK_INTERVAL_MS);
+    // A scheduled backup can finish while this page is open without a click.
+    // Refresh its last/next-run labels even if a native progress event was
+    // missed while the window was in the background.
+    setInterval(refreshVisibleProfiles, PROFILE_REFRESH_INTERVAL_MS);
 }
 
 document.addEventListener('DOMContentLoaded', init);
@@ -94,6 +99,7 @@ function setupEventListeners() {
     // this a no-op while the existing 15-minute repository session is valid.
     window.addEventListener('focus', () => {
         warmRepositoryInBackground();
+        refreshVisibleProfiles();
     });
 
     // Nav links
@@ -1145,6 +1151,14 @@ function navigateTo(pageId) {
     if (pageId === 'profiles') loadProfiles();
     if (pageId === 'databases') loadDatabaseProfiles();
     if (pageId === 'settings') loadSettings();
+}
+
+function refreshVisibleProfiles() {
+    if (authenticatedSessionActive && serviceWorkspaceReady
+        && pages.profiles?.classList.contains('active')
+        && document.getElementById('profile-modal')?.classList.contains('hidden')) {
+        void loadProfiles();
+    }
 }
 
 // ────────────────────────────────────────────────────────────────

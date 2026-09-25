@@ -1,7 +1,7 @@
 # Customer-owned storage (BYOS)
 
-Implementation note for the next desktop release. This is **not** a claim that
-the currently installed production app already has BYOS.
+Implementation and acceptance record for the next desktop release. This is
+**not** a claim that an older installed production app already has BYOS.
 
 ## Customer flow
 
@@ -49,21 +49,36 @@ the currently installed production app already has BYOS.
 - The initial Windows release accepts HTTPS S3-compatible endpoints, plus
   loopback HTTP for local MinIO testing. Arbitrary remote HTTP is rejected.
 
-## Verification before release
+## Verification and release notes
 
-- API unit/runtime tests and desktop Rust/UI tests must pass.
-- Disposable local S3 test: provider validation, connect/create, tagged
-  snapshot, list, restore and file-content comparison. The 2026-09-24 local
-  emulator round trip passed. On 2026-09-25, a signed-in Windows development
-  app also connected and validated a disposable local S3 bucket. That GUI test
-  exposed and fixed an account-scope guard that had rejected every BYOS
-  connection; its regression test and the desktop test suites now pass. The
-  GUI profile backup and restore, a live Backblaze B2 or Cloudflare R2 bucket,
-  scheduled execution, and a signed production installer are still unverified.
-- Before production, repeat connect/backup/restore with a disposable provider
-  bucket and a signed development app, verify cancellation/sign-out and a
-  replacement-PC reconnect before releasing the desktop installer. The API
-  key-retention fix and the public Terms, Privacy, and DPA distinction between
-  managed and customer-owned objects were deployed on 2026-09-25. Recheck
-  those live policies and the matching API before release. Do not advertise
-  BYOS as available on the live website until the desktop release gate passes.
+- API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
+  the desktop checks passed: 54 UI tests, 3 logout-flow tests, and 106 Rust
+  tests (one optional database integration test ignored).
+- A disposable local S3 round trip passed in the Windows development app:
+  connect/validate, create profile, back up a 111-byte file, list the restore
+  point, and restore to a separate directory. Original and restored SHA-256
+  both equal `07F4C368C2DAEF5B50A34CA4F44368703B04449FBF671D913CED9EE7BD7C2DBA`.
+- A real Backblaze B2 EU test used only private bucket
+  `savestate-byos-qa-20260925-8` and a 24-hour bucket-scoped application key.
+  The Windows development app connected and validated the provider, backed
+  up the same 111-byte file, listed the restore point directly from B2, and
+  restored into a separate directory with the same SHA-256. No existing B2
+  bucket or production backup was touched. Initial connection took roughly
+  three minutes; investigate if that is representative for new customers.
+- A 11:27 Europe/Copenhagen scheduled profile ran successfully at 11:28:07
+  (09:28:07 UTC) and advanced its next run to 2026-09-26 11:27 local. The
+  profile screen did not visibly refresh immediately during this observation;
+  the database's `last_run`, `next_run`, and `schedule_state` confirmed success.
+  The profile screen now also polls while visible and refreshes on focus, so
+  a missed native progress event cannot leave those labels stale indefinitely.
+- The API key-retention fix and public Terms, Privacy, and DPA distinction
+  between managed and customer-owned objects were deployed on 2026-09-25.
+  Recheck those live policies and the matching API before publishing BYOS
+  availability on the website.
+- Not yet proven by this test: sign-out while a BYOS backup is active,
+  replacement-PC reconnect using the original prefix and master key, and
+  installation/update of the signed production installer. Unit tests cover
+  logout cancellation and reconnection key/prefix boundaries, but do not
+  replace a second-PC acceptance test. Verify the signed installer and updater
+  feed after the release workflow publishes them; do not describe these
+  untested paths as fully verified.

@@ -37,3 +37,10 @@ test('an expired subscription still reaches Settings and can only reconnect exis
   assert.match(native, /AccountContext::capture_byos/);
   assert.match(native, /if mode == "backup" \{\s*verify_entitlement/);
 });
+
+test('the visible profile page refreshes after background scheduled backups', () => {
+  assert.match(app, /PROFILE_REFRESH_INTERVAL_MS = 30 \* 1000/);
+  assert.match(app, /setInterval\(refreshVisibleProfiles, PROFILE_REFRESH_INTERVAL_MS\)/);
+  assert.match(app, /window\.addEventListener\('focus',[\s\S]*?refreshVisibleProfiles\(\)/);
+  assert.match(app, /function refreshVisibleProfiles\(\)[\s\S]*?pages\.profiles\?\.classList\.contains\('active'\)[\s\S]*?void loadProfiles\(\)/);
+});
