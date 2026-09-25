@@ -54,8 +54,12 @@ the currently installed production app already has BYOS.
 - API unit/runtime tests and desktop Rust/UI tests must pass.
 - Disposable local S3 test: provider validation, connect/create, tagged
   snapshot, list, restore and file-content comparison. The 2026-09-24 local
-  emulator round trip passed; it did **not** exercise a live Backblaze B2 or
-  Cloudflare R2 account, app login, scheduled execution, or Windows installer.
+  emulator round trip passed. On 2026-09-25, a signed-in Windows development
+  app also connected and validated a disposable local S3 bucket. That GUI test
+  exposed and fixed an account-scope guard that had rejected every BYOS
+  connection; its regression test and the desktop test suites now pass. The
+  GUI profile backup and restore, a live Backblaze B2 or Cloudflare R2 bucket,
+  scheduled execution, and a signed production installer are still unverified.
 - Before production, repeat connect/backup/restore with a disposable provider
   bucket and a signed development app, verify cancellation/sign-out and a
   replacement-PC reconnect before releasing the desktop installer. The API
