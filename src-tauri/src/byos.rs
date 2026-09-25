@@ -197,7 +197,7 @@ async fn require_entitlement(api: &SaveStateClient) -> Result<u32> {
         .await
         .context("Could not verify BYOS access; try again when the API is available")?;
     if !entitlements.byos_enabled {
-        bail!("BYOS is available on an active Pro or Ultra plan");
+        bail!("Customer-owned storage requires an eligible active plan");
     }
     Ok(entitlements.max_byos_vaults)
 }
