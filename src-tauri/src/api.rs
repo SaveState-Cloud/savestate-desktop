@@ -67,8 +67,6 @@ pub struct EntitlementResponse {
     pub profile_limit: Option<u32>,
     #[serde(default, alias = "byosEnabled")]
     pub byos_enabled: bool,
-    #[serde(default, alias = "maxByosVaults")]
-    pub max_byos_vaults: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,6 +438,8 @@ pub struct RepoSession {
     pub bucket: String,
     pub prefix: String,
     pub endpoint: String,
+    #[serde(skip)]
+    pub local_path: Option<String>,
     #[serde(default)]
     pub endpoint_host: Option<String>,
     pub region: String,

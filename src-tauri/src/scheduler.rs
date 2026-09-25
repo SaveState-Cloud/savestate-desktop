@@ -15,7 +15,7 @@ pub struct FailureClassification {
 /// contain a source path and remain solely in the local SQLite database.
 pub fn classify_schedule_failure(error: &str) -> FailureClassification {
     let value = error.to_ascii_lowercase();
-    if value.contains("source path does not exist") {
+    if value.contains("source path does not exist") || value.contains("source folder is missing") {
         return FailureClassification {
             code: "source_missing",
             retryable: false,
@@ -63,6 +63,18 @@ pub fn classify_schedule_failure(error: &str) -> FailureClassification {
     if value.contains("byos_bucket_not_found") {
         return FailureClassification {
             code: "storage_destination_missing",
+            retryable: false,
+        };
+    }
+    if value.contains("external_drive_missing") {
+        return FailureClassification {
+            code: "external_drive_missing",
+            retryable: false,
+        };
+    }
+    if value.contains("external_drive_changed") || value.contains("external_repository_missing") {
+        return FailureClassification {
+            code: "external_vault_mismatch",
             retryable: false,
         };
     }
@@ -243,6 +255,12 @@ mod tests {
             "storage_credentials_invalid"
         );
         assert!(!classify_schedule_failure("BYOS_BUCKET_NOT_FOUND").retryable);
+        assert_eq!(
+            classify_schedule_failure("EXTERNAL_DRIVE_MISSING: connect disk").code,
+            "external_drive_missing"
+        );
+        assert!(!classify_schedule_failure("EXTERNAL_DRIVE_CHANGED: wrong disk").retryable);
+        assert!(!classify_schedule_failure("EXTERNAL_REPOSITORY_MISSING").retryable);
         assert!(classify_schedule_failure("request timed out").retryable);
     }
 
