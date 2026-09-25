@@ -890,7 +890,11 @@ function setupTauriListeners() {
         if (p.stage === 'done') {
             showToast('Backup completed!', 'success');
             setTimeout(resetBackupMode, 2000);
-            loadBackups();
+            // Customer-owned vaults read their own restore points; refreshing
+            // the managed manifest here can show an unrelated API error.
+            if (selectedVaultId === vaultModel.MANAGED_VAULT_ID && serviceWorkspaceReady) {
+                loadBackups();
+            }
             // Reload profiles to update "Last Run" and reset progress
             if (document.getElementById('page-profiles').classList.contains('active')) {
                 loadProfiles();

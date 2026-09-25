@@ -62,6 +62,10 @@ test('restore-point copy works for both buckets and external-drive vaults', () =
   assert.match(app, /fileCount === 1 \? 'file' : 'files'/);
 });
 
+test('a custom-vault backup does not refresh the separate managed manifest', () => {
+  assert.match(app, /if \(p\.stage === 'done'\) \{[\s\S]*?if \(selectedVaultId === vaultModel\.MANAGED_VAULT_ID && serviceWorkspaceReady\) \{\s*loadBackups\(\);/);
+});
+
 test('vault creation is not numerically capped and plan-check errors are distinct', () => {
   assert.doesNotMatch(native, /destination safety limit|max_vaults/);
   assert.match(native, /Plan check is unavailable/);

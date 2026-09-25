@@ -75,7 +75,7 @@ available in an installed release until a new installer is published.
   Windows development build opened and passed an in-app external-vault
   backup/restore acceptance pass. A signed production release has not been
   published.
-- For the drive connector, 68 desktop UI checks, 3 logout checks, and 109 Rust
+- For the drive connector, 69 desktop UI checks, 3 logout checks, and 109 Rust
   checks passed (one optional integration test ignored). Kopia 0.23.1 created
   a disposable local filesystem repository, validated the provider, backed up
   a folder, and restored its file with a matching SHA-256 hash. Native tests
@@ -95,6 +95,10 @@ available in an installed release until a new installer is published.
   still held the engine gate returned a busy message; retrying after it
   finished succeeded. This simulates a path change, not unplugging hardware.
   The QA vault and its temporary folder remain available for follow-up tests.
+  The first backup also revealed a misleading managed-manifest error toast:
+  the backup-completion listener refreshed Cloud - Personal even while the
+  external vault was selected. That refresh is now limited to the managed
+  vault, and a regression check covers the boundary.
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
   the desktop checks passed: 62 UI tests, 3 logout-flow tests, and 106 Rust
   tests (one optional database integration test ignored). The API checks passed
