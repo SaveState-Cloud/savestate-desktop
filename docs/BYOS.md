@@ -53,4 +53,8 @@ the currently installed production app already has BYOS.
 - Before production, repeat connect/backup/restore with a disposable provider
   bucket and a signed development app, verify cancellation/sign-out and a
   replacement-PC reconnect, then release the matching API before the desktop
-  installer. Do not advertise BYOS on the live website until these gates pass.
+  installer. The public Terms and Privacy notice currently describe only
+  SaveState-managed Backblaze storage and automatic deletion at expiry; update
+  them to distinguish customer-owned objects, provider region/charges, and
+  their separate retention before a BYOS production launch. Do not advertise
+  BYOS on the live website until these gates pass.
