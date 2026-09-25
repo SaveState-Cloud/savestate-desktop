@@ -39,7 +39,10 @@ the currently installed production app already has BYOS.
   encrypted account-key envelope is retained after managed service expiry
   for this purpose; an explicit account-erasure request deletes it. A former
   subscriber can reconnect an existing repository, but cannot create a new
-  one or run backups without an active eligible plan.
+  one or run backups without an active eligible plan. If a replacement
+  subscription creates a new service workspace, create a new backup profile;
+  the old service-scoped schedule is not silently moved, while the existing
+  customer-owned restore points remain available from Settings.
 - The website vault cannot directly browse customer-owned objects because
   SaveState does not hold the customer's storage credentials. Use the desktop
   app's Restore points view for BYOS.
