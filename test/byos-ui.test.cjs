@@ -54,6 +54,14 @@ test('external drives are real filesystem vaults and never require cloud keys', 
   assert.match(app, /vault\.available === false \? 'Drive disconnected'/);
 });
 
+test('restore-point copy works for both buckets and external-drive vaults', () => {
+  assert.match(app, /Loading restore points from this vault/);
+  assert.match(app, /These restore points are read directly from this vault/);
+  assert.match(app, /No restore points in this vault yet/);
+  assert.match(app, /Restore from this vault/);
+  assert.match(app, /fileCount === 1 \? 'file' : 'files'/);
+});
+
 test('vault creation is not numerically capped and plan-check errors are distinct', () => {
   assert.doesNotMatch(native, /destination safety limit|max_vaults/);
   assert.match(native, /Plan check is unavailable/);

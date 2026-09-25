@@ -71,11 +71,11 @@ available in an installed release until a new installer is published.
 ## Verification and release notes
 
 - External-drive support is implemented on the `feat/vault-first-desktop`
-  branch, not in the installed production app. The Windows development app
-  could not be rebuilt in place while its executable remained open, and app
-  control reported access denied. A visual
-  in-app backup/restore acceptance pass is still required before release.
-- For the drive connector, 67 desktop UI checks, 3 logout checks, and 109 Rust
+  branch, not in the installed production app. On 2026-09-25, an optimized
+  Windows development build opened and passed an in-app external-vault
+  backup/restore acceptance pass. A signed production release has not been
+  published.
+- For the drive connector, 68 desktop UI checks, 3 logout checks, and 109 Rust
   checks passed (one optional integration test ignored). Kopia 0.23.1 created
   a disposable local filesystem repository, validated the provider, backed up
   a folder, and restored its file with a matching SHA-256 hash. Native tests
@@ -83,6 +83,18 @@ available in an installed release until a new installer is published.
   rejecting backup sources that overlap the repository. This test used a
   disposable folder, not a physical USB drive; unplug/replug behavior remains
   to be accepted on real hardware.
+- In the development app, a disposable `External Drive QA` filesystem vault
+  was created and connected without credentials. A manual-only source backed
+  up one `README.md` file; Restore points listed one snapshot, and restoring
+  into a separate folder produced the same SHA-256 as the source:
+  `FFB9E219523F89CB816573E5A4826FD49373DB4E81478FC88B5A88AF498E976E`.
+  Renaming the disposable vault folder made the app show **Disconnected** and
+  disable **Run Now**; **Find drive folder** accepted the moved folder with
+  its original marker and returned the vault to **Connected** without losing
+  its source or snapshot. The first relocation attempt while another task
+  still held the engine gate returned a busy message; retrying after it
+  finished succeeded. This simulates a path change, not unplugging hardware.
+  The QA vault and its temporary folder remain available for follow-up tests.
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
   the desktop checks passed: 62 UI tests, 3 logout-flow tests, and 106 Rust
   tests (one optional database integration test ignored). The API checks passed

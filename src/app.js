@@ -3587,14 +3587,14 @@ async function showByosSnapshots(vaultId) {
     heading.textContent = `${vault?.label || 'Customer-owned storage'} restore points`;
     const status = document.createElement('p');
     status.className = 'text-muted text-sm';
-    status.textContent = 'Loading from your bucket…';
+    status.textContent = 'Loading restore points from this vault…';
     container.append(heading, status);
     try {
         const snapshots = await invoke('cmd_byos_list_snapshots', { vaultId });
         if (selectedVaultId !== vaultId || workspaceGeneration !== workspaceUiGeneration || requestGeneration !== snapshotLoadGeneration) return;
         status.textContent = snapshots.length
-            ? 'These restore points are read directly from your bucket. Choose a folder; SaveState creates a new restore subfolder inside it.'
-            : 'No restore points in this bucket yet.';
+            ? 'These restore points are read directly from this vault. Choose a folder; SaveState creates a new restore subfolder inside it.'
+            : 'No restore points in this vault yet.';
         snapshots.sort((a, b) => String(b.startTime).localeCompare(String(a.startTime)));
         snapshots.forEach(snapshot => {
             const row = document.createElement('div');
@@ -3604,7 +3604,8 @@ async function showByosSnapshots(vaultId) {
             name.textContent = snapshot.sourcePath?.split(/[\\/]/).pop() || 'Backup';
             const meta = document.createElement('small');
             const timestamp = new Date(snapshot.startTime);
-            meta.textContent = `${Number.isNaN(timestamp.getTime()) ? 'Date unavailable' : timestamp.toLocaleString()} · ${formatBytes(snapshot.size || 0)} · ${snapshot.fileCount || 0} files`;
+            const fileCount = snapshot.fileCount || 0;
+            meta.textContent = `${Number.isNaN(timestamp.getTime()) ? 'Date unavailable' : timestamp.toLocaleString()} · ${formatBytes(snapshot.size || 0)} · ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`;
             detail.append(name, meta);
             const restore = document.createElement('button');
             restore.type = 'button';
@@ -3613,7 +3614,7 @@ async function showByosSnapshots(vaultId) {
             restore.addEventListener('click', async () => {
                 const targetPath = await open({ directory: true });
                 if (!targetPath) return;
-                const accepted = await confirmDialog(`Restore this backup into a new subfolder inside ${targetPath}? Existing files will not be replaced.`, { title: 'Restore from your bucket' });
+                const accepted = await confirmDialog(`Restore this backup into a new subfolder inside ${targetPath}? Existing files will not be replaced.`, { title: 'Restore from this vault' });
                 if (!accepted) return;
                 restore.disabled = true;
                 restore.textContent = 'Restoring…';
