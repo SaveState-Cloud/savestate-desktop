@@ -35,8 +35,11 @@ the currently installed production app already has BYOS.
   lost provider credentials. Record the displayed prefix before replacing the
   device.
 - Existing customer-owned restore points remain browsable after the plan
-  lapses, provided the user can sign in and unlock the same master key. New
-  BYOS destinations and backups require an active eligible plan.
+  lapses, provided the user can sign in and unlock the same master key. The
+  encrypted account-key envelope is retained after managed service expiry
+  for this purpose; an explicit account-erasure request deletes it. A former
+  subscriber can reconnect an existing repository, but cannot create a new
+  one or run backups without an active eligible plan.
 - The website vault cannot directly browse customer-owned objects because
   SaveState does not hold the customer's storage credentials. Use the desktop
   app's Restore points view for BYOS.

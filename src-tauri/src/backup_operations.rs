@@ -15,6 +15,21 @@ pub struct AccountContext {
 }
 
 impl AccountContext {
+    pub fn capture_byos(state: &AppState) -> Result<Self> {
+        let account_scope = state.byos_scope().ok_or_else(|| {
+            anyhow!("Sign in and unlock your account before opening customer-owned storage")
+        })?;
+        let master_key = state
+            .master_key
+            .ok_or_else(|| anyhow!("Backup encryption key is unavailable"))?;
+        Ok(Self {
+            api: state.api.clone(),
+            account_scope,
+            repository_password: hex::encode(master_key),
+            session_generation: state.session_generation,
+        })
+    }
+
     pub fn ensure_current(&self, state: &AppStateWrapper) -> Result<()> {
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
         if !context_matches_session(

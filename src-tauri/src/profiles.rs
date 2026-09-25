@@ -178,12 +178,14 @@ pub async fn cmd_create_profile(
         crate::byos::verify_entitlement(&api)
             .await
             .map_err(|error| error.to_string())?;
-        crate::byos::require_vault(
-            &state,
-            profile.owner_account.as_deref().unwrap_or_default(),
-            vault_id,
-        )
-        .map_err(|error| error.to_string())?;
+        let byos_owner = {
+            let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
+            guard
+                .byos_scope()
+                .ok_or_else(|| "Sign in before choosing customer-owned storage".to_string())?
+        };
+        crate::byos::require_vault(&state, &byos_owner, vault_id)
+            .map_err(|error| error.to_string())?;
     } else {
         profile.folder = api
             .ensure_profile_folder(&profile.id, &profile.name)

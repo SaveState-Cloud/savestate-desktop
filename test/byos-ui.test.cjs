@@ -27,3 +27,13 @@ test('customer-owned secrets stay local and restores cannot overwrite an existin
   assert.match(native, /The remote bucket and its backups remain the customer's property/);
   assert.match(app, /Customer-owned bytes do not count toward your SaveState-managed storage allowance/);
 });
+
+test('an expired subscription still reaches Settings and can only reconnect existing storage', () => {
+  assert.match(app, /serviceWorkspaceReady = Boolean\(result\.service_workspace_ready\)/);
+  assert.match(app, /if \(serviceWorkspaceReady\)/);
+  assert.match(app, /navigateTo\('settings'\)/);
+  assert.match(app, /Reconnect existing storage/);
+  assert.match(native, /connect\(&app, &session, &context\.repository_password, active, None\)/);
+  assert.match(native, /AccountContext::capture_byos/);
+  assert.match(native, /if mode == "backup" \{\s*verify_entitlement/);
+});

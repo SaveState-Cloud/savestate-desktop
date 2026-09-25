@@ -183,6 +183,14 @@ pub(crate) fn require_vault(state: &AppStateWrapper, owner: &str, id: &str) -> R
     get_vault(state, owner, id)
 }
 
+fn owner_scope(api: &SaveStateClient) -> Result<String> {
+    Ok(format!(
+        "user:{}",
+        api.account_user_id()
+            .ok_or_else(|| anyhow!("Account identity is unavailable"))?
+    ))
+}
+
 async fn require_entitlement(api: &SaveStateClient) -> Result<u32> {
     let entitlements = api
         .get_entitlements()
@@ -332,10 +340,18 @@ pub async fn cmd_byos_entitlements(
 ) -> Result<ByosEntitlement, String> {
     let api = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        guard.account_scope().ok_or("Sign in first")?;
+        guard.byos_scope().ok_or("Sign in first")?;
         guard.api.clone()
     };
-    let value = api.get_entitlements().await.map_err(|e| e.to_string())?;
+    let value = match api.get_entitlements().await {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(ByosEntitlement {
+                enabled: false,
+                max_vaults: 0,
+            })
+        }
+    };
     Ok(ByosEntitlement {
         enabled: value.byos_enabled,
         max_vaults: value.max_byos_vaults,
@@ -347,7 +363,7 @@ pub async fn cmd_byos_list_vaults(
     state: tauri::State<'_, AppStateWrapper>,
 ) -> Result<Vec<Vault>, String> {
     let guard = state.0.lock().map_err(|e| e.to_string())?;
-    let owner = guard.account_scope().ok_or("Sign in first")?;
+    let owner = guard.byos_scope().ok_or("Sign in first")?;
     let mut stmt = guard.db.prepare(
         "SELECT id, owner_account, label, provider, endpoint, region, bucket, prefix, created_at
          FROM byos_vaults WHERE owner_account = ?1 ORDER BY created_at DESC"
@@ -368,11 +384,19 @@ pub async fn cmd_byos_add_vault(
 ) -> Result<Vault, String> {
     let context = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        AccountContext::capture(&guard).map_err(|e| e.to_string())?
+        AccountContext::capture_byos(&guard).map_err(|e| e.to_string())?
     };
-    let max_vaults = require_entitlement(&context.api)
-        .await
-        .map_err(|e| e.to_string())?;
+    // With no eligible service, reconnection is restore-only. Never create a
+    // repository in that state; a customer may still need their own objects.
+    let entitlement = context.api.get_entitlements().await.ok();
+    let active = entitlement.as_ref().is_some_and(|value| value.byos_enabled);
+    let max_vaults = if active {
+        entitlement
+            .as_ref()
+            .map_or(25, |value| value.max_byos_vaults)
+    } else {
+        25
+    };
     let (vault, credentials) =
         validate(input, context.account_scope.clone()).map_err(|e| e.to_string())?;
     let count: u32 = {
@@ -407,12 +431,14 @@ pub async fn cmd_byos_add_vault(
     context
         .ensure_current(state.inner())
         .map_err(|e| e.to_string())?;
-    connect(&app, &session, &context.repository_password, true, None)
+    connect(&app, &session, &context.repository_password, active, None)
         .await
         .map_err(|e| e.to_string())?;
-    validate_provider(&app, &session, &context.repository_password)
-        .await
-        .map_err(|e| e.to_string())?;
+    if active {
+        validate_provider(&app, &session, &context.repository_password)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     context
         .ensure_current(state.inner())
         .map_err(|e| e.to_string())?;
@@ -447,15 +473,15 @@ pub async fn cmd_byos_remove_vault(
     let _engine = kopia::try_begin_update().map_err(|e| e.to_string())?;
     let owner = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        guard.account_scope().ok_or("Sign in first")?
+        guard.byos_scope().ok_or("Sign in first")?
     };
     let vault = get_vault(state.inner(), &owner, &vault_id).map_err(|e| e.to_string())?;
     let guard = state.0.lock().map_err(|e| e.to_string())?;
     let profiles: u32 = guard
         .db
         .query_row(
-            "SELECT COUNT(*) FROM backup_profiles WHERE owner_account = ?1 AND vault_id = ?2",
-            params![owner, vault_id],
+            "SELECT COUNT(*) FROM backup_profiles WHERE vault_id = ?1",
+            params![vault_id],
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())?;
@@ -494,7 +520,7 @@ async fn checked_session(
         verify_entitlement(&context.api).await?;
     }
     context.ensure_current(state)?;
-    let vault = get_vault(state, &context.account_scope, vault_id)?;
+    let vault = get_vault(state, &owner_scope(&context.api)?, vault_id)?;
     read_session(&vault, mode)
 }
 
@@ -546,7 +572,7 @@ pub async fn cmd_byos_list_snapshots(
 ) -> Result<Vec<KopiaSnapshot>, String> {
     let context = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        AccountContext::capture(&guard).map_err(|e| e.to_string())?
+        AccountContext::capture_byos(&guard).map_err(|e| e.to_string())?
     };
     list_snapshots(&app, state.inner(), &context, &vault_id)
         .await
@@ -573,7 +599,7 @@ pub async fn cmd_byos_restore(
     let restore_path = parent.join(folder_name);
     let context = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        AccountContext::capture(&guard).map_err(|e| e.to_string())?
+        AccountContext::capture_byos(&guard).map_err(|e| e.to_string())?
     };
     let snapshots = list_snapshots(&app, state.inner(), &context, &vault_id)
         .await

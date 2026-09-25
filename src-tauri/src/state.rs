@@ -46,6 +46,15 @@ impl AppState {
         Some(format!("{email}::{workspace_id}"))
     }
 
+    /// BYOS belongs to the login identity, not a subscription service. A
+    /// deleted/expired service must not hide customer-owned restore points.
+    pub fn byos_scope(&self) -> Option<String> {
+        if self.api.token.is_none() || self.master_key.is_none() {
+            return None;
+        }
+        Some(format!("user:{}", self.api.account_user_id()?))
+    }
+
     pub fn account_email(&self) -> Option<String> {
         if self.api.token.is_none() || self.master_key.is_none() {
             return None;
@@ -71,7 +80,7 @@ mod tests {
         state.email = Some(" Owner@Example.COM ".into());
         assert!(state.account_scope().is_none());
 
-        let claims = URL_SAFE_NO_PAD.encode(br#"{"serviceId":12}"#);
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"sub":7,"serviceId":12}"#);
         state.api.set_token(format!("header.{claims}.signature"));
         assert!(state.account_scope().is_none());
 
@@ -81,5 +90,11 @@ mod tests {
             Some("owner@example.com::service:12")
         );
         assert_eq!(state.account_email().as_deref(), Some("owner@example.com"));
+        assert_eq!(state.byos_scope().as_deref(), Some("user:7"));
+
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"sub":7,"serviceId":null}"#);
+        state.api.set_token(format!("header.{claims}.signature"));
+        assert!(state.account_scope().is_none());
+        assert_eq!(state.byos_scope().as_deref(), Some("user:7"));
     }
 }

@@ -531,6 +531,15 @@ impl SaveStateClient {
         Self::workspace_id_from_token(self.token.as_deref()?)
     }
 
+    pub fn account_user_id(&self) -> Option<u64> {
+        let token = self.token.as_deref()?;
+        let payload = token.split('.').nth(1)?;
+        let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        let id = claims.get("sub")?.as_u64()?;
+        (id > 0).then_some(id)
+    }
+
     pub(crate) fn workspace_id_from_token(token: &str) -> Option<String> {
         let payload = token.split('.').nth(1)?;
         let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;

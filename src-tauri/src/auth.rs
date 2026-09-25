@@ -582,6 +582,7 @@ pub struct AuthStatus {
     pub authenticated: bool,
     pub email: Option<String>,
     pub master_key_ready: bool,
+    pub service_workspace_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1028,6 +1029,7 @@ pub async fn cmd_get_auth_status(
         authenticated: guard.api.token.is_some(),
         email: guard.email.clone(),
         master_key_ready: guard.master_key.is_some(),
+        service_workspace_ready: guard.api.workspace_id().is_some(),
     })
 }
 
