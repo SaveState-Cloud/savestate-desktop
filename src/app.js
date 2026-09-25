@@ -46,6 +46,7 @@ let pendingBackupErrorToast = null;
 let pendingRestoreErrorToast = null;
 let repositoryRecoveryPromptOpen = false;
 let authenticatedSessionActive = false;
+let serviceWorkspaceReady = false;
 let repositoryWarmupPromise = null;
 let repositorySessionGeneration = 0;
 let legacyProfileNoticeShown = false;
@@ -985,10 +986,16 @@ async function checkAuthStatus() {
         if (result && result.authenticated && result.master_key_ready) {
             if (!authenticatedSessionActive) repositorySessionGeneration += 1;
             authenticatedSessionActive = true;
+            serviceWorkspaceReady = Boolean(result.service_workspace_ready);
             showView('app');
-            warmRepositoryInBackground();
-            loadDashboard();
-            loadSettings();
+            if (serviceWorkspaceReady) {
+                warmRepositoryInBackground();
+                loadDashboard();
+            } else {
+                navigateTo('settings');
+                showToast('Your SaveState plan is no longer active. You can still restore from customer-owned storage here.', 'info');
+            }
+            if (serviceWorkspaceReady) loadSettings();
             if (!legacyProfileNoticeShown) {
                 legacyProfileNoticeShown = true;
                 invoke('cmd_count_unowned_profiles')
@@ -1012,6 +1019,7 @@ async function checkAuthStatus() {
 
 function endAuthenticatedSession() {
     authenticatedSessionActive = false;
+    serviceWorkspaceReady = false;
     currentAccount = null;
     repositorySessionGeneration += 1;
     repositoryWarmupPromise = null;
@@ -1068,6 +1076,7 @@ async function switchWorkspace(workspaceId) {
     renderWorkspaceSwitcher();
     try {
         await invoke('cmd_switch_account_workspace', { workspaceId });
+        serviceWorkspaceReady = true;
         workspaceUiGeneration += 1;
         repositorySessionGeneration += 1;
         repositoryWarmupPromise = null;
@@ -1093,7 +1102,7 @@ async function switchWorkspace(workspaceId) {
 }
 
 function warmRepositoryInBackground() {
-    if (!authenticatedSessionActive || repositoryWarmupPromise) return;
+    if (!authenticatedSessionActive || !serviceWorkspaceReady || repositoryWarmupPromise) return;
 
     const sessionGeneration = repositorySessionGeneration;
     const warmup = invoke('cmd_warm_repository')
@@ -1122,6 +1131,7 @@ function showView(viewId) {
 }
 
 function navigateTo(pageId) {
+    if (!serviceWorkspaceReady && pageId !== 'settings') pageId = 'settings';
     Object.values(pages).forEach(p => { if (p) p.classList.remove('active'); });
     const target = pages[pageId];
     if (target) target.classList.add('active');
@@ -1428,6 +1438,10 @@ async function loadDashboard() {
             endAuthenticatedSession();
             showLoginAuthCard();
             showView('login');
+        } else if (String(e).includes('404') || String(e).includes('No service found')) {
+            serviceWorkspaceReady = false;
+            navigateTo('settings');
+            showToast('No active SaveState plan. Customer-owned restore points remain available in Settings.', 'info');
         } else {
             showToast('Failed to load account: ' + String(e), 'error');
         }
@@ -3114,12 +3128,15 @@ async function loadByos() {
         const vaults = await invoke('cmd_byos_list_vaults');
         const entitlement = await invoke('cmd_byos_entitlements').catch(() => null);
         byosVaults = vaults || [];
-        openButton.classList.toggle('hidden', !entitlement?.enabled);
+        // Expired subscribers can reconnect an existing repository for
+        // restore. Native code refuses to create a new one without a plan.
+        openButton.classList.remove('hidden');
+        openButton.textContent = entitlement?.enabled ? 'Connect storage' : 'Reconnect existing storage';
         status.textContent = entitlement === null
             ? 'Plan check is temporarily unavailable. Existing restore points in your bucket remain accessible.'
             : entitlement.enabled
             ? 'Available on this plan. Customer-owned bytes do not count toward your SaveState-managed storage allowance.'
-            : 'Connect new storage on an active Pro or Ultra plan. Existing destinations and restore points remain yours.';
+            : 'A Pro or Ultra plan is needed for new backups. You can reconnect an existing repository here to restore files.';
         list.replaceChildren();
         if (byosVaults.length === 0) {
             const empty = document.createElement('p');
