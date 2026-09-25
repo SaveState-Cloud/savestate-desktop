@@ -8,6 +8,7 @@ const { open, confirm: confirmDialog } = window.__TAURI__.dialog;
 const vaultRecoveryUi = window.SaveStateVaultRecovery;
 const storageUsageUi = window.SaveStateStorageUsage;
 const vaultModel = window.SaveStateVaultModel;
+const vaultConnectorForm = window.SaveStateVaultConnectorForm;
 
 // ── Auto-updater state ───────────────────────────────────────────
 let availableUpdateVersion = null;
@@ -564,6 +565,7 @@ function setupEventListeners() {
         vaultManagerOpen = true;
         showVaultPane();
         document.getElementById('byos-form').classList.remove('hidden');
+        vaultConnectorForm.apply(document);
         document.getElementById('byos-form').scrollIntoView({ block: 'nearest' });
         document.getElementById('byos-label').focus();
     });
@@ -573,8 +575,7 @@ function setupEventListeners() {
         document.getElementById('btn-byos-open').focus();
     });
     document.getElementById('byos-provider').addEventListener('change', () => {
-        const defaults = { b2: 'eu-central-003', r2: 'auto', s3: '', minio: 'us-east-1' };
-        document.getElementById('byos-region').value = defaults[document.getElementById('byos-provider').value] || '';
+        vaultConnectorForm.apply(document, { providerChanged: true });
     });
     document.getElementById('byos-form').addEventListener('submit', async (event) => {
         event.preventDefault();

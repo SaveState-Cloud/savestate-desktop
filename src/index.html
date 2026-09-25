@@ -267,8 +267,8 @@
                             <div class="byos-field-grid">
                                 <div class="form-group"><label for="byos-label">Vault name</label><input type="text" id="byos-label" required maxlength="80" placeholder="e.g. Office backups" /></div>
                                 <div class="form-group"><label for="byos-provider">Connector</label><select class="select-input" id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option></select></div>
-                                <div class="form-group"><label for="byos-endpoint">S3 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" /></div>
-                                <div class="form-group"><label for="byos-region">Region</label><input type="text" id="byos-region" required placeholder="eu-central-003 or auto" /></div>
+                                <div class="form-group"><label id="byos-endpoint-label" for="byos-endpoint">Backblaze B2 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" aria-describedby="byos-endpoint-help" /><p class="field-help" id="byos-endpoint-help">Use the S3 endpoint shown for your B2 bucket.</p></div>
+                                <div class="form-group"><label for="byos-region">Region</label><input type="text" id="byos-region" required placeholder="e.g. eu-central-003" /></div>
                                 <div class="form-group"><label for="byos-bucket">Bucket</label><input type="text" id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
                                 <div class="form-group"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input type="text" id="byos-prefix" placeholder="Auto-generated if blank" /></div>
                                 <div class="form-group"><label for="byos-key-id">Access key ID</label><input type="text" id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
@@ -920,6 +920,7 @@
     <script src="vault-recovery.js"></script>
     <script src="storage-usage.js"></script>
     <script src="vault-model.js"></script>
+    <script src="vault-connector-form.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
