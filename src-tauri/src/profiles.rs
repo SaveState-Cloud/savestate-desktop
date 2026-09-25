@@ -110,6 +110,7 @@ pub async fn cmd_create_profile(
     schedule: Option<String>,
     retention: i64,
     _folder: Option<String>,
+    vault_id: Option<String>,
 ) -> std::result::Result<BackupProfile, String> {
     let (owner_account, api) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
@@ -138,6 +139,7 @@ pub async fn cmd_create_profile(
         last_error: None,
         last_error_code: None,
         schedule_state: "scheduled".to_string(),
+        vault_id: vault_id.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -172,16 +174,30 @@ pub async fn cmd_create_profile(
         }
     }
 
-    profile.folder = api
-        .ensure_profile_folder(&profile.id, &profile.name)
-        .await
+    if let Some(vault_id) = vault_id.as_deref() {
+        crate::byos::verify_entitlement(&api)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::byos::require_vault(
+            &state,
+            profile.owner_account.as_deref().unwrap_or_default(),
+            vault_id,
+        )
         .map_err(|error| error.to_string())?;
+    } else {
+        profile.folder = api
+            .ensure_profile_folder(&profile.id, &profile.name)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let create_result = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         db::create_profile(&guard.db, &profile).map_err(|e| e.to_string())
     };
     if let Err(error) = create_result {
-        let _ = api.detach_profile_folder(&profile.id).await;
+        if vault_id.is_none() {
+            let _ = api.detach_profile_folder(&profile.id).await;
+        }
         return Err(error);
     }
 
@@ -201,6 +217,7 @@ pub async fn cmd_update_profile(
     retention: i64,
     enabled: bool,
     _folder: Option<String>,
+    vault_id: Option<String>,
 ) -> std::result::Result<BackupProfile, String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.len() > 80 {
@@ -210,15 +227,22 @@ pub async fn cmd_update_profile(
         && schedule
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
-    let (was_automated, api) = {
+    let (was_automated, api, existing_vault_id) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
             .account_scope()
             .ok_or_else(|| "Sign in before editing a backup profile".to_string())?;
         let existing = db::get_profile_for_account(&guard.db, &id, &owner_account)
             .map_err(|e| e.to_string())?;
-        (is_automated_profile(&existing), guard.api.clone())
+        (
+            is_automated_profile(&existing),
+            guard.api.clone(),
+            existing.vault_id,
+        )
     };
+    if existing_vault_id != vault_id {
+        return Err("A profile's storage destination cannot be changed after creation. Create a new profile to use another destination; existing restore points stay where they are.".into());
+    }
     let profile_limit = if requested_is_automated && !was_automated {
         Some(
             api.get_entitlements()
@@ -251,10 +275,15 @@ pub async fn cmd_update_profile(
             Some(existing.id.as_str()),
         )?;
     }
-    let managed_folder = api
-        .ensure_profile_folder(&id, &name)
-        .await
-        .map_err(|error| error.to_string())?;
+    let managed_folder = if vault_id.is_none() {
+        Some(
+            api.ensure_profile_folder(&id, &name)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let profile = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
@@ -266,7 +295,9 @@ pub async fn cmd_update_profile(
         existing.source_path = source_path;
         existing.schedule = schedule.clone();
         existing.retention = retention;
-        existing.folder = managed_folder;
+        if let Some(folder) = managed_folder {
+            existing.folder = folder;
+        }
         existing.enabled = enabled;
         existing.next_run = if enabled {
             compute_next_run(schedule.as_deref())
@@ -295,9 +326,6 @@ pub async fn cmd_delete_profile(
     id: String,
     delete_backups: Option<bool>,
 ) -> std::result::Result<(), String> {
-    let engine = crate::kopia::begin_operation()
-        .await
-        .map_err(|error| error.to_string())?;
     let (owner_account, api, profile) = {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
         let owner_account = guard
@@ -307,17 +335,37 @@ pub async fn cmd_delete_profile(
             .map_err(|e| e.to_string())?;
         (owner_account, guard.api.clone(), profile)
     };
-    if delete_backups.unwrap_or(false) {
-        crate::backup::delete_snapshots_in_folder(&app, &engine, state.inner(), &profile.folder)
-            .await
-            .map_err(|error| error.to_string())?;
-        api.delete_folder(&profile.folder)
-            .await
-            .map_err(|error| error.to_string())?;
+    if profile.vault_id.is_some() {
+        if delete_backups.unwrap_or(false) {
+            let context = {
+                let guard = state.0.lock().map_err(|e| e.to_string())?;
+                AccountContext::capture(&guard).map_err(|e| e.to_string())?
+            };
+            crate::byos::delete_profile_snapshots(&app, state.inner(), &context, &profile)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     } else {
-        api.detach_profile_folder(&profile.id)
+        let engine = crate::kopia::begin_operation()
             .await
             .map_err(|error| error.to_string())?;
+        if delete_backups.unwrap_or(false) {
+            crate::backup::delete_snapshots_in_folder(
+                &app,
+                &engine,
+                state.inner(),
+                &profile.folder,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            api.delete_folder(&profile.folder)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            api.detach_profile_folder(&profile.id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
     {
         let guard = state.0.lock().map_err(|e| format!("Lock: {}", e))?;
@@ -344,6 +392,9 @@ pub async fn cmd_list_profiles(
         )
     };
     for profile in &mut profiles {
+        if profile.vault_id.is_some() {
+            continue;
+        }
         if let Ok(folder) = api.ensure_profile_folder(&profile.id, &profile.name).await {
             if folder != profile.folder {
                 profile.folder = folder;
@@ -704,6 +755,13 @@ pub async fn run_profile_backup_with_context(
     trigger: &'static str,
     context: AccountContext,
 ) -> Result<String> {
+    let byos_profile = {
+        let guard = state.0.lock().map_err(|e| anyhow!("Lock: {e}"))?;
+        db::get_profile_for_account(&guard.db, profile_id, &context.account_scope)?
+    };
+    if byos_profile.vault_id.is_some() {
+        return crate::byos::backup_profile(&app, state, context, &byos_profile, trigger).await;
+    }
     let operation = crate::backup_operations::begin_with_context(state, context, "Backup profile")?;
     crate::kopia::prepare_repository_for_backup(&app, &operation).await?;
     // Keep the full scheduled/profile workflow under one operation lease so
@@ -1433,6 +1491,7 @@ mod schedule_time_tests {
             last_error: None,
             last_error_code: None,
             schedule_state: "scheduled".to_string(),
+            vault_id: None,
             created_at: "2026-08-18T10:00:00Z".to_string(),
         }
     }

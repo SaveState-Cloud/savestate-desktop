@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS backup_profiles (
     last_error  TEXT,
     last_error_code TEXT,
     schedule_state TEXT NOT NULL DEFAULT 'scheduled',
+    vault_id TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -80,6 +81,19 @@ CREATE TABLE IF NOT EXISTS app_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS byos_vaults (
+    id TEXT PRIMARY KEY,
+    owner_account TEXT NOT NULL,
+    label TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    region TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_byos_vaults_owner ON byos_vaults(owner_account);
 "#;
 
 /// Safely add the profile_id column if it doesn't exist yet.
@@ -142,6 +156,8 @@ pub struct BackupProfile {
     pub last_error_code: Option<String>,
     #[serde(default = "default_schedule_state")]
     pub schedule_state: String,
+    #[serde(default)]
+    pub vault_id: Option<String>,
     pub created_at: String,
 }
 
@@ -226,6 +242,7 @@ pub fn init_db(data_dir: &Path) -> Result<Connection> {
     for migration in PROFILE_RESILIENCE_MIGRATIONS {
         let _ = conn.execute(migration, []);
     }
+    let _ = conn.execute("ALTER TABLE backup_profiles ADD COLUMN vault_id TEXT", []);
     normalize_disabled_profile_state(&conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_database_profiles_owner_account
@@ -411,8 +428,8 @@ pub fn create_profile(conn: &Connection, profile: &BackupProfile) -> Result<()> 
     conn.execute(
         "INSERT INTO backup_profiles
            (id, owner_account, name, source_path, schedule, retention, folder, enabled, last_run,
-            next_run, retry_count, retry_at, last_error, last_error_code, schedule_state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            next_run, retry_count, retry_at, last_error, last_error_code, schedule_state, created_at, vault_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             profile.id,
             profile.owner_account,
@@ -430,6 +447,7 @@ pub fn create_profile(conn: &Connection, profile: &BackupProfile) -> Result<()> 
             profile.last_error_code,
             profile.schedule_state,
             profile.created_at,
+            profile.vault_id,
         ],
     )
     .context("Failed to create backup profile")?;
@@ -443,7 +461,8 @@ pub fn update_profile(conn: &Connection, profile: &BackupProfile) -> Result<()> 
             "UPDATE backup_profiles
          SET name = ?1, source_path = ?2, schedule = ?3, retention = ?4, folder = ?5,
              enabled = ?6, last_run = ?7, next_run = ?8, retry_count = ?9,
-             retry_at = ?10, last_error = ?11, last_error_code = ?12, schedule_state = ?13
+             retry_at = ?10, last_error = ?11, last_error_code = ?12, schedule_state = ?13,
+             vault_id = ?16
          WHERE id = ?14 AND owner_account IS ?15",
             params![
                 profile.name,
@@ -461,6 +480,7 @@ pub fn update_profile(conn: &Connection, profile: &BackupProfile) -> Result<()> 
                 profile.schedule_state,
                 profile.id,
                 profile.owner_account,
+                profile.vault_id,
             ],
         )
         .context("Failed to update backup profile")?;
@@ -515,6 +535,7 @@ fn profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackupProfile> 
         last_error_code: row.get(13)?,
         schedule_state: row.get(14)?,
         created_at: row.get(15)?,
+        vault_id: row.get(16)?,
     })
 }
 
@@ -525,7 +546,7 @@ pub(crate) fn list_profiles(conn: &Connection) -> Result<Vec<BackupProfile>> {
         .prepare(
             "SELECT id, owner_account, name, source_path, schedule, retention, folder, enabled,
                     last_run, next_run, retry_count, retry_at, last_error, last_error_code,
-                    schedule_state, created_at
+                    schedule_state, created_at, vault_id
              FROM backup_profiles
              ORDER BY created_at DESC",
         )
@@ -550,7 +571,7 @@ pub fn list_profiles_for_account(
         .prepare(
             "SELECT id, owner_account, name, source_path, schedule, retention, folder, enabled,
                     last_run, next_run, retry_count, retry_at, last_error, last_error_code,
-                    schedule_state, created_at
+                    schedule_state, created_at, vault_id
              FROM backup_profiles
              WHERE owner_account = ?1
              ORDER BY created_at DESC",
@@ -568,7 +589,7 @@ pub(crate) fn get_profile(conn: &Connection, id: &str) -> Result<BackupProfile> 
     conn.query_row(
         "SELECT id, owner_account, name, source_path, schedule, retention, folder, enabled,
                 last_run, next_run, retry_count, retry_at, last_error, last_error_code,
-                schedule_state, created_at
+                schedule_state, created_at, vault_id
          FROM backup_profiles WHERE id = ?1",
         params![id],
         profile_from_row,
@@ -584,7 +605,7 @@ pub fn get_profile_for_account(
     conn.query_row(
         "SELECT id, owner_account, name, source_path, schedule, retention, folder, enabled,
                 last_run, next_run, retry_count, retry_at, last_error, last_error_code,
-                schedule_state, created_at
+                schedule_state, created_at, vault_id
          FROM backup_profiles WHERE id = ?1 AND owner_account = ?2",
         params![id, owner_account],
         profile_from_row,
@@ -1199,6 +1220,7 @@ mod tests {
             last_error: None,
             last_error_code: None,
             schedule_state: "scheduled".to_string(),
+            vault_id: None,
             created_at: "2026-08-19T12:00:00Z".to_string(),
         }
     }
@@ -1231,6 +1253,41 @@ mod tests {
             created_at: "2026-08-24T09:00:00Z".to_string(),
             has_credentials: false,
         }
+    }
+
+    #[test]
+    fn byos_destination_survives_profile_round_trip_without_changing_managed_profiles() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let mut byos = test_profile();
+        byos.vault_id = Some("customer-bucket-1".to_string());
+        create_profile(&conn, &byos).unwrap();
+        let saved = get_profile_for_account(&conn, &byos.id, "owner@example.com").unwrap();
+        assert_eq!(saved.vault_id.as_deref(), Some("customer-bucket-1"));
+
+        byos.vault_id = None;
+        update_profile(&conn, &byos).unwrap();
+        let managed = get_profile_for_account(&conn, &byos.id, "owner@example.com").unwrap();
+        assert_eq!(managed.vault_id, None);
+    }
+
+    #[test]
+    fn existing_profile_database_gains_optional_vault_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("savestate.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(&SCHEMA.replace("    vault_id TEXT,\n", ""))
+                .unwrap();
+        }
+        let upgraded = init_db(temp.path()).unwrap();
+        create_profile(&upgraded, &test_profile()).unwrap();
+        assert_eq!(
+            get_profile_for_account(&upgraded, "profile-1", "owner@example.com")
+                .unwrap()
+                .vault_id,
+            None,
+        );
     }
 
     #[test]

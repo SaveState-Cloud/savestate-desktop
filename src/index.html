@@ -612,6 +612,33 @@
                 <section id="page-settings" class="page">
                     <h2 class="page-title">Settings</h2>
 
+                    <div class="settings-section byos-section" id="byos-section">
+                        <div class="byos-heading">
+                            <div>
+                                <h3>Your storage destinations</h3>
+                                <p class="text-muted">Keep SaveState-managed storage and add your own S3-compatible bucket. Each backup profile uses one destination.</p>
+                            </div>
+                            <button type="button" class="btn btn-primary btn-sm hidden" id="btn-byos-open">Connect bucket</button>
+                        </div>
+                        <p id="byos-status" class="text-muted text-sm" role="status">Checking your plan…</p>
+                        <div id="byos-vault-list" class="byos-vault-list" aria-live="polite"></div>
+                        <form id="byos-form" class="byos-form hidden" autocomplete="off">
+                            <div class="byos-field-grid">
+                                <div class="form-group"><label for="byos-label">Name</label><input id="byos-label" required maxlength="80" placeholder="e.g. Office B2 bucket" /></div>
+                                <div class="form-group"><label for="byos-provider">Provider</label><select id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option></select></div>
+                                <div class="form-group"><label for="byos-endpoint">S3 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" /></div>
+                                <div class="form-group"><label for="byos-region">Region</label><input id="byos-region" required placeholder="eu-central-003 or auto" /></div>
+                                <div class="form-group"><label for="byos-bucket">Bucket</label><input id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
+                                <div class="form-group"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input id="byos-prefix" placeholder="Auto-generated if blank" /></div>
+                                <div class="form-group"><label for="byos-key-id">Access key ID</label><input id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
+                                <div class="form-group"><label for="byos-secret">Secret access key</label><input id="byos-secret" required type="password" autocomplete="new-password" spellcheck="false" /></div>
+                            </div>
+                            <p class="text-muted text-sm">Keys stay in Windows Credential Manager on this PC. SaveState cannot recover them. Your provider determines storage charges and data location.</p>
+                            <div class="byos-actions"><button type="button" class="btn btn-ghost btn-sm" id="btn-byos-cancel">Cancel</button><button type="submit" class="btn btn-primary btn-sm" id="btn-byos-connect">Connect and test</button></div>
+                        </form>
+                        <div id="byos-snapshots" class="byos-snapshots hidden" aria-live="polite"></div>
+                    </div>
+
                     <!-- App Updates -->
                     <div class="settings-section glass-card" id="settings-update-section">
                         <div class="settings-update-row">
@@ -770,6 +797,11 @@
                     </div>
                 </div>
                 <div class="form-group">
+                    <label for="profile-vault">Storage destination</label>
+                    <select id="profile-vault"><option value="">SaveState-managed storage</option></select>
+                    <p id="profile-vault-help" class="text-muted text-sm">Choose before creating this profile. Existing restore points remain in their original destination.</p>
+                </div>
+                <div class="form-group">
                     <label for="profile-schedule-times">Backup Times <span class="text-muted text-sm">(optional; this machine's local time, e.g. 15:30, 02:00)</span></label>
                     <input type="text" id="profile-schedule-times" placeholder="e.g. 15:30, 02:00" aria-describedby="profile-schedule-time-help" />
                     <p class="text-muted text-sm" id="profile-schedule-time-help">Leave blank for a manual-only profile. UTC equivalents appear here after you enter a time.</p>
@@ -782,10 +814,10 @@
                     <label for="profile-retention">Retention (keep last N backups, 0 = unlimited)</label>
                     <input type="number" id="profile-retention" value="0" min="0" />
                 </div>
-                <div class="form-group">
-                    <label for="profile-folder-preview">Backup folder</label>
+                <div class="form-group" id="profile-managed-folder-group">
+                    <label for="profile-folder-preview">Managed backup folder</label>
                     <div class="profile-folder-preview" id="profile-folder-preview" aria-live="polite">/Backup Profile</div>
-                    <p class="text-muted text-sm">Created automatically from the profile name. Move any version out of this folder to preserve it independently.</p>
+                    <p class="text-muted text-sm">Created automatically from the profile name.</p>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn btn-ghost" id="btn-cancel-profile">Cancel</button>

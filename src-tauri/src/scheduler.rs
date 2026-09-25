@@ -54,6 +54,18 @@ pub fn classify_schedule_failure(error: &str) -> FailureClassification {
             retryable: false,
         };
     }
+    if value.contains("byos_credentials_invalid") {
+        return FailureClassification {
+            code: "storage_credentials_invalid",
+            retryable: false,
+        };
+    }
+    if value.contains("byos_bucket_not_found") {
+        return FailureClassification {
+            code: "storage_destination_missing",
+            retryable: false,
+        };
+    }
     if value.contains("storage limit")
         || value.contains("storage quota")
         || value.contains("insufficient storage")
@@ -149,6 +161,7 @@ mod tests {
             last_error: None,
             last_error_code: None,
             schedule_state: state.into(),
+            vault_id: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }
@@ -225,6 +238,11 @@ mod tests {
             classify_schedule_failure("DATABASE_TOOL_NOT_FOUND: missing mysqldump").code,
             "database_tool_missing"
         );
+        assert_eq!(
+            classify_schedule_failure("BYOS_CREDENTIALS_INVALID: check key").code,
+            "storage_credentials_invalid"
+        );
+        assert!(!classify_schedule_failure("BYOS_BUCKET_NOT_FOUND").retryable);
         assert!(classify_schedule_failure("request timed out").retryable);
     }
 
