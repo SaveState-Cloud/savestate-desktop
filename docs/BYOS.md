@@ -55,9 +55,8 @@ the currently installed production app already has BYOS.
   Cloudflare R2 account, app login, scheduled execution, or Windows installer.
 - Before production, repeat connect/backup/restore with a disposable provider
   bucket and a signed development app, verify cancellation/sign-out and a
-  replacement-PC reconnect, then release the matching API before the desktop
-  installer. The public Terms and Privacy notice currently describe only
-  SaveState-managed Backblaze storage and automatic deletion at expiry; update
-  them to distinguish customer-owned objects, provider region/charges, and
-  their separate retention before a BYOS production launch. Do not advertise
-  BYOS on the live website until these gates pass.
+  replacement-PC reconnect before releasing the desktop installer. The API
+  key-retention fix and the public Terms, Privacy, and DPA distinction between
+  managed and customer-owned objects were deployed on 2026-09-25. Recheck
+  those live policies and the matching API before release. Do not advertise
+  BYOS as available on the live website until the desktop release gate passes.
