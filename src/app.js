@@ -577,6 +577,22 @@ function setupEventListeners() {
     document.getElementById('byos-provider').addEventListener('change', () => {
         vaultConnectorForm.apply(document, { providerChanged: true });
     });
+    document.getElementById('btn-byos-choose-folder').addEventListener('click', async () => {
+        const folder = await open({ directory: true, title: 'Choose a folder on the external drive' });
+        if (typeof folder === 'string') document.getElementById('byos-endpoint').value = folder;
+    });
+    document.getElementById('btn-vault-find-folder').addEventListener('click', async () => {
+        const vault = byosVaults.find(item => item.id === selectedVaultId);
+        if (!vault || vault.provider !== 'filesystem') return;
+        const folder = await open({ directory: true, title: 'Find the original vault folder' });
+        if (typeof folder !== 'string') return;
+        try {
+            const relocated = await invoke('cmd_byos_relocate_vault', { vaultId: vault.id, folderPath: folder });
+            byosVaults = byosVaults.map(item => item.id === vault.id ? relocated : item);
+            showToast('External drive vault reconnected', 'success');
+            await loadProfiles();
+        } catch (error) { showToast(friendlyError(error), 'error'); }
+    });
     document.getElementById('byos-form').addEventListener('submit', async (event) => {
         event.preventDefault();
         const button = document.getElementById('btn-byos-connect');
@@ -594,6 +610,7 @@ function setupEventListeners() {
                 secretAccessKey: document.getElementById('byos-secret').value,
             } });
             document.getElementById('byos-form').reset();
+            vaultConnectorForm.apply(document, { providerChanged: true });
             document.getElementById('byos-form').classList.add('hidden');
             byosVaults = [...byosVaults.filter(vault => vault.id !== connected.id), connected];
             selectVault(connected.id);
@@ -1150,6 +1167,13 @@ function availableVaults(profiles = [], databases = []) {
     return vaults;
 }
 
+function vaultLocationLabel(vault) {
+    if (vault.provider === 'filesystem') {
+        return vault.available === false ? 'External drive · Disconnected' : 'External drive · Connected';
+    }
+    return `${vault.provider.toUpperCase()} · ${vault.bucket}`;
+}
+
 function renderWorkspaceSwitcher() {
     const current = accountWorkspaces.find((workspace) => workspace.current) || accountWorkspaces[0];
     const vaults = availableVaults();
@@ -1159,7 +1183,7 @@ function renderWorkspaceSwitcher() {
         ? (current?.label || 'Personal') : active.label;
     document.getElementById('workspace-current-kind').textContent = managed
         ? (current?.plan || 'SaveState Cloud')
-        : `${active.provider.toUpperCase()} · ${active.bucket}`;
+        : vaultLocationLabel(active);
     const menu = document.getElementById('workspace-menu');
     const focusedOption = menu.contains(document.activeElement) ? {
         vaultId: document.activeElement.dataset.vaultId,
@@ -1173,7 +1197,7 @@ function renderWorkspaceSwitcher() {
             <span class="workspace-option-icon">${workspaceIcon({ kind: vault.managed ? current?.kind : 'storage' })}</span>
             <span class="workspace-option-copy">
                 <strong>${escapeHtml(vault.label)}</strong>
-                <small>${escapeHtml(vault.managed ? (current?.plan || 'SaveState Cloud') : `${vault.provider.toUpperCase()} · ${vault.bucket}`)}</small>
+                <small>${escapeHtml(vault.managed ? (current?.plan || 'SaveState Cloud') : vaultLocationLabel(vault))}</small>
             </span>
             <span class="workspace-option-check">${active.id === vault.id ? '✓' : ''}</span>
         </button>
@@ -1256,7 +1280,7 @@ function syncVaultContextUi() {
         : 'Dashboard';
     if (custom) {
         document.getElementById('custom-vault-dashboard-location').textContent = vault
-            ? `${vault.provider.toUpperCase()} · ${vault.bucket} · ${vault.region} · Storage you control`
+            ? `${vaultLocationLabel(vault)} · Storage you control`
             : 'Connecting to your storage…';
     }
 }
@@ -3058,7 +3082,7 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
             + (vault.managed ? ` · ${vault.databaseCount} database backup${vault.databaseCount === 1 ? '' : 's'}` : '')
             + ` · ${vault.scheduledCount} scheduled`;
     const signature = JSON.stringify(vaults.map(vault => [
-        vault.id, vault.label, vault.provider, vault.bucket, vault.region, vault.managed,
+        vault.id, vault.label, vault.provider, vault.endpoint, vault.bucket, vault.region, vault.available, vault.managed,
     ]));
     if (signature === lastVaultRowsSignature) {
         [...list.querySelectorAll('.vault-row-main')].forEach(button => {
@@ -3082,13 +3106,15 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
         name.textContent = vault.label;
         const kind = document.createElement('span');
         kind.className = 'vault-kind';
-        kind.textContent = vault.managed ? 'Included' : `${vault.provider.toUpperCase()} connector`;
+        kind.textContent = vault.managed ? 'Included' : vault.provider === 'filesystem' ? 'External drive' : `${vault.provider.toUpperCase()} connector`;
         heading.append(name, kind);
         const location = document.createElement('span');
         location.className = 'vault-row-location';
         location.textContent = vault.managed
             ? 'SaveState-managed encrypted storage'
-            : `${vault.bucket} · ${vault.region} · Customer-owned storage`;
+            : vault.provider === 'filesystem'
+                ? `${vault.endpoint} · ${vault.available === false ? 'Drive disconnected' : 'Local encrypted storage'}`
+                : `${vault.bucket} · ${vault.region} · Customer-owned storage`;
         const count = document.createElement('span');
         count.className = 'vault-row-count';
         count.textContent = countLabel(vault);
@@ -3105,7 +3131,7 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
             remove.textContent = 'Disconnect';
             remove.setAttribute('aria-label', `Disconnect ${vault.label}`);
             remove.addEventListener('click', async () => {
-                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its bucket and every backup stay with your provider. Remove its backup sources first.`, { title: 'Disconnect vault' });
+                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its ${vault.provider === 'filesystem' ? 'drive folder' : 'bucket'} and every backup stay untouched. Remove its backup sources first.`, { title: 'Disconnect vault' });
                 if (!accepted) return;
                 try {
                     await invoke('cmd_byos_remove_vault', { vaultId: vault.id });
@@ -3113,7 +3139,7 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
                     if (selectedVaultId === vault.id) selectedVaultId = vaultModel.MANAGED_VAULT_ID;
                     renderWorkspaceSwitcher();
                     syncVaultContextUi();
-                    showToast('Vault disconnected. Remote backups were not deleted.', 'success');
+                    showToast('Vault disconnected. Backups were not deleted.', 'success');
                     void loadProfiles();
                 } catch (error) { showToast(friendlyError(error), 'error'); }
             });
@@ -3190,18 +3216,24 @@ async function loadProfiles({ remoteResults = null } = {}) {
             document.getElementById('vault-detail-title').textContent = selectedVault.label;
             document.getElementById('vault-detail-subtitle').textContent = selectedVault.managed
                 ? 'SaveState-managed encrypted storage · Included with your plan'
-                : `${selectedVault.provider.toUpperCase()} · ${selectedVault.bucket} · ${selectedVault.region} · Stored with your provider`;
+                : `${vaultLocationLabel(selectedVault)} · Storage you control`;
             document.getElementById('vault-connection-details').classList.toggle('hidden', selectedVault.managed);
             if (!selectedVault.managed) {
+                const local = selectedVault.provider === 'filesystem';
+                document.getElementById('vault-detail-endpoint-label').textContent = local ? 'Vault folder' : 'Endpoint';
+                for (const id of ['bucket', 'region', 'prefix']) {
+                    document.getElementById(`vault-detail-${id}-row`).classList.toggle('hidden', local);
+                }
                 document.getElementById('vault-detail-endpoint').textContent = selectedVault.endpoint;
                 document.getElementById('vault-detail-bucket').textContent = selectedVault.bucket;
                 document.getElementById('vault-detail-region').textContent = selectedVault.region;
                 document.getElementById('vault-detail-prefix').textContent = selectedVault.prefix;
             }
+            document.getElementById('btn-vault-find-folder').classList.toggle('hidden', selectedVault.provider !== 'filesystem');
             document.getElementById('btn-vault-browse').textContent = selectedVault.managed ? 'Browse backups' : 'Restore points';
-            document.getElementById('btn-vault-browse').disabled = selectedVault.managed && !serviceWorkspaceReady;
+            document.getElementById('btn-vault-browse').disabled = (selectedVault.managed && !serviceWorkspaceReady) || selectedVault.available === false;
             canBackupSelectedVault = serviceWorkspaceReady && (selectedVault.managed || Boolean(entitlement?.enabled))
-                && !(Boolean(vaultError) && !selectedVault.managed);
+                && !(Boolean(vaultError) && !selectedVault.managed) && selectedVault.available !== false;
             document.getElementById('btn-create-profile').disabled = !canBackupSelectedVault;
             document.getElementById('btn-vault-databases').disabled = !serviceWorkspaceReady;
             document.getElementById('profile-limit-summary').textContent = !resolvedRemote

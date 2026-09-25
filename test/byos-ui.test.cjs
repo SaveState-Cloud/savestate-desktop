@@ -29,7 +29,7 @@ test('customer-owned secrets stay local and restores cannot overwrite an existin
   assert.match(native, /credential_entry\(&vault\.owner_account, &vault\.id\)/);
   assert.match(native, /serde_json::to_vec\(&credentials\)/);
   assert.match(native, /std::fs::create_dir\(&restore_path\)/);
-  assert.match(native, /The remote bucket and its backups remain the customer's property/);
+  assert.match(native, /The bucket or local folder and its backups remain the customer's property/);
   assert.match(app, /custom vaults use storage you control; their bytes do not count toward your managed storage allowance/i);
 });
 
@@ -38,9 +38,20 @@ test('an expired subscription still reaches Vaults and can only reconnect existi
   assert.match(app, /if \(serviceWorkspaceReady\)/);
   assert.match(app, /navigateTo\('profiles'\)/);
   assert.match(app, /Reconnect Vault/);
-  assert.match(native, /connect\(&app, &session, &context\.repository_password, active, None\)/);
+  assert.match(native, /connect\([\s\S]*?&context\.repository_password,[\s\S]*?active && !had_marker,[\s\S]*?local && !had_marker,[\s\S]*?\)/);
   assert.match(native, /AccountContext::capture_byos/);
   assert.match(native, /if mode == "backup" \{\s*verify_entitlement/);
+});
+
+test('external drives are real filesystem vaults and never require cloud keys', () => {
+  assert.match(html, /<option value="filesystem">External drive<\/option>/);
+  assert.match(html, /id="btn-byos-choose-folder"/);
+  assert.match(app, /invoke\('cmd_byos_relocate_vault'/);
+  assert.match(native, /"filesystem"\.into\(\), format!\("--path=\{path\}"\)/);
+  assert.match(native, /EXTERNAL_DRIVE_CHANGED/);
+  assert.match(native, /ensure_source_outside_vault\(source, &session\)/);
+  assert.match(app, /selectedVault\.available === false/);
+  assert.match(app, /vault\.available === false \? 'Drive disconnected'/);
 });
 
 test('vault creation is not numerically capped and plan-check errors are distinct', () => {

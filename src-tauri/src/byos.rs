@@ -1,7 +1,6 @@
-//! Customer-owned S3-compatible repositories. Provider credentials never leave
-//! this computer: SQLite contains only destination metadata and Windows
-//! Credential Manager contains the access key pair. BYOS never calls the
-//! managed repository gateway, manifest, storage quota, or restore meter.
+//! Customer-owned repositories. S3 credentials stay in Windows Credential
+//! Manager; filesystem vaults use a local folder and no provider credentials.
+//! Neither destination calls the managed repository gateway or quota meter.
 
 use crate::api::{RepoSession, SaveStateClient};
 use crate::backup_operations::{self, AccountContext, BackupControl};
@@ -12,8 +11,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::Emitter;
+
+const LOCAL_MARKER: &str = ".savestate-vault-id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +32,8 @@ pub struct Vault {
     pub bucket: String,
     pub prefix: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -64,13 +70,154 @@ fn credential_entry(owner: &str, vault_id: &str) -> Result<keyring::v1::Entry> {
     .context("Windows Credential Manager is unavailable")
 }
 
+fn local_folder(input: &str) -> Result<String> {
+    let path = Path::new(input.trim());
+    if !path.is_absolute() {
+        bail!("Choose an existing folder on a local drive");
+    }
+    let canonical =
+        fs::canonicalize(path).context("Drive or folder not found. Connect it and try again")?;
+    if !canonical.is_dir() || canonical.file_name().is_none() {
+        bail!("Choose a dedicated folder inside the drive, not the drive root");
+    }
+    let text = canonical.to_string_lossy();
+    #[cfg(windows)]
+    if text.starts_with(r"\\?\UNC\") {
+        bail!("Choose a local drive folder. Network locations need a separate connector");
+    }
+    #[cfg(windows)]
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if text.starts_with(r"\\") {
+        bail!("Choose a local drive folder. Network locations need a separate connector");
+    }
+    Ok(text.to_string())
+}
+
+fn marker_path(folder: &str) -> PathBuf {
+    Path::new(folder).join(LOCAL_MARKER)
+}
+
+fn has_local_repository(folder: &str) -> bool {
+    ["kopia.repository.f", "kopia.repository"]
+        .iter()
+        .any(|name| Path::new(folder).join(name).is_file())
+}
+
+fn existing_marker(folder: &str) -> Result<Option<String>> {
+    match fs::read_to_string(marker_path(folder)) {
+        Ok(value) => {
+            let id = value.trim();
+            uuid::Uuid::parse_str(id)
+                .context("This folder has an invalid SaveState vault marker")?;
+            Ok(Some(id.to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("Could not read the drive's SaveState vault marker"),
+    }
+}
+
+fn verify_local_marker(session: &RepoSession, allow_unmarked: bool) -> Result<()> {
+    let Some(folder) = session.local_path.as_deref() else {
+        return Ok(());
+    };
+    if !Path::new(folder).is_dir() {
+        bail!("EXTERNAL_DRIVE_MISSING: Connect the drive containing this vault and retry");
+    }
+    match existing_marker(folder)? {
+        Some(id) if id == session.bucket => {
+            if !has_local_repository(folder) {
+                bail!("EXTERNAL_REPOSITORY_MISSING: This drive folder is marked as a vault but its backup repository is missing");
+            }
+            Ok(())
+        },
+        None if allow_unmarked => Ok(()),
+        _ => bail!("EXTERNAL_DRIVE_CHANGED: This folder is not the original vault. Check the drive before retrying"),
+    }
+}
+
+fn save_local_marker(session: &RepoSession) -> Result<()> {
+    let folder = session
+        .local_path
+        .as_deref()
+        .context("Local vault path is missing")?;
+    if existing_marker(folder)?.is_some() {
+        return verify_local_marker(session, false);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path(folder))
+        .context("Could not mark this folder as the SaveState vault; check its permissions or whether another vault uses it")?;
+    file.write_all(format!("{}\n", session.bucket).as_bytes())
+        .context("Could not write this folder's SaveState vault marker")?;
+    file.sync_all()
+        .context("Could not save this folder's SaveState vault marker")?;
+    verify_local_marker(session, false)
+}
+
+fn ensure_source_outside_vault(source: &Path, session: &RepoSession) -> Result<()> {
+    let Some(folder) = session.local_path.as_deref() else {
+        return Ok(());
+    };
+    let source = fs::canonicalize(source).context("Backup source is no longer available")?;
+    let destination =
+        fs::canonicalize(folder).context("External vault drive is no longer available")?;
+    let source = source.to_string_lossy().to_ascii_lowercase();
+    let destination = destination.to_string_lossy().to_ascii_lowercase();
+    let prefix = |path: &str| {
+        format!(
+            "{}{}",
+            path.trim_end_matches(['\\', '/']),
+            std::path::MAIN_SEPARATOR
+        )
+    };
+    if source == destination
+        || source.starts_with(&prefix(&destination))
+        || destination.starts_with(&prefix(&source))
+    {
+        bail!("Choose a backup source outside this vault's storage folder so it cannot back itself up");
+    }
+    Ok(())
+}
+
 fn validate(input: NewVault, owner_account: String) -> Result<(Vault, VaultCredentials)> {
     let label = input.label.trim();
     if label.is_empty() || label.len() > 80 {
         bail!("Give this storage destination a name of up to 80 characters");
     }
+    if input.provider == "filesystem" {
+        let folder = local_folder(&input.endpoint)?;
+        let marker = existing_marker(&folder)?;
+        if marker.is_none()
+            && fs::read_dir(&folder)
+                .context("Could not read the selected folder")?
+                .next()
+                .is_some()
+            && !has_local_repository(&folder)
+        {
+            bail!("Choose an empty folder or an existing SaveState repository folder");
+        }
+        return Ok((
+            Vault {
+                id: uuid::Uuid::new_v4().to_string(),
+                owner_account,
+                label: label.to_string(),
+                provider: input.provider,
+                endpoint: folder,
+                region: String::new(),
+                bucket: marker.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                prefix: String::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                available: Some(true),
+            },
+            VaultCredentials {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+            },
+        ));
+    }
     if !matches!(input.provider.as_str(), "s3" | "b2" | "r2" | "minio") {
-        bail!("Choose S3, Backblaze B2, Cloudflare R2, or MinIO");
+        bail!("Choose an external drive, S3, Backblaze B2, Cloudflare R2, or MinIO");
     }
     let url = reqwest::Url::parse(input.endpoint.trim())
         .context("Enter a valid endpoint URL, including https://")?;
@@ -146,6 +293,7 @@ fn validate(input: NewVault, owner_account: String) -> Result<(Vault, VaultCrede
             bucket: bucket.to_string(),
             prefix,
             created_at: chrono::Utc::now().to_rfc3339(),
+            available: None,
         },
         VaultCredentials {
             access_key_id: input.access_key_id,
@@ -165,6 +313,7 @@ fn vault_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vault> {
         bucket: row.get(6)?,
         prefix: row.get(7)?,
         created_at: row.get(8)?,
+        available: None,
     })
 }
 
@@ -211,6 +360,7 @@ fn session(vault: &Vault, credentials: VaultCredentials, mode: &str) -> RepoSess
         bucket: vault.bucket.clone(),
         prefix: vault.prefix.clone(),
         endpoint: vault.endpoint.clone(),
+        local_path: (vault.provider == "filesystem").then(|| vault.endpoint.clone()),
         endpoint_host: None,
         region: vault.region.clone(),
         access_key_id: credentials.access_key_id,
@@ -220,6 +370,18 @@ fn session(vault: &Vault, credentials: VaultCredentials, mode: &str) -> RepoSess
 }
 
 fn read_session(vault: &Vault, mode: &str) -> Result<RepoSession> {
+    if vault.provider == "filesystem" {
+        let session = session(
+            vault,
+            VaultCredentials {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+            },
+            mode,
+        );
+        verify_local_marker(&session, false)?;
+        return Ok(session);
+    }
     let bytes = credential_entry(&vault.owner_account, &vault.id)?
         .get_secret()
         .context("Storage credentials are missing on this PC. Reconnect the destination")?;
@@ -254,20 +416,30 @@ fn safe_output(output: &std::process::Output, action: &str) -> Result<()> {
     }
 }
 
+fn storage_connect_args(session: &RepoSession) -> Vec<String> {
+    if let Some(path) = &session.local_path {
+        vec!["filesystem".into(), format!("--path={path}")]
+    } else {
+        kopia::s3_connect_args(session)
+    }
+}
+
 async fn connect(
     app: &tauri::AppHandle,
     session: &RepoSession,
     password: &str,
     create_if_missing: bool,
     cancellation: Option<&Arc<BackupControl>>,
+    allow_unmarked: bool,
 ) -> Result<()> {
     let app = app.clone();
     let session = session.clone();
     let password = password.to_string();
     let cancellation = cancellation.cloned();
     tokio::task::spawn_blocking(move || -> Result<()> {
+        verify_local_marker(&session, allow_unmarked)?;
         let mut args = vec!["repository".into(), "connect".into()];
-        args.extend(kopia::s3_connect_args(&session));
+        args.extend(storage_connect_args(&session));
         let output = kopia::run_kopia_for_backup(
             &app,
             &args,
@@ -280,7 +452,7 @@ async fn connect(
             let stderr = String::from_utf8_lossy(&output.stderr);
             if create_if_missing && kopia::repository_is_missing(&stderr) {
                 let mut create = vec!["repository".into(), "create".into()];
-                create.extend(kopia::s3_connect_args(&session));
+                create.extend(storage_connect_args(&session));
                 let output = kopia::run_kopia_for_backup(
                     &app,
                     &create,
@@ -361,11 +533,21 @@ pub async fn cmd_byos_list_vaults(
         "SELECT id, owner_account, label, provider, endpoint, region, bucket, prefix, created_at
          FROM byos_vaults WHERE owner_account = ?1 ORDER BY created_at DESC"
     ).map_err(|e| e.to_string())?;
-    let vaults = stmt
+    let mut vaults = stmt
         .query_map(params![owner], vault_from_row)
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
+    for vault in &mut vaults {
+        if vault.provider == "filesystem" {
+            let credentials = VaultCredentials {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+            };
+            vault.available =
+                Some(verify_local_marker(&session(vault, credentials, "restore"), false).is_ok());
+        }
+    }
     Ok(vaults)
 }
 
@@ -385,15 +567,32 @@ pub async fn cmd_byos_add_vault(
     let active = entitlement.as_ref().is_some_and(|value| value.byos_enabled);
     let (vault, credentials) =
         validate(input, context.account_scope.clone()).map_err(|e| e.to_string())?;
+    let local = vault.provider == "filesystem";
+    let had_marker = local
+        && existing_marker(&vault.endpoint)
+            .map_err(|e| e.to_string())?
+            .is_some();
     {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
-        let duplicate: u32 = guard.db.query_row(
-            "SELECT COUNT(*) FROM byos_vaults WHERE owner_account = ?1 AND endpoint = ?2 AND bucket = ?3 AND prefix = ?4",
-            params![vault.owner_account, vault.endpoint, vault.bucket, vault.prefix],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
+        let duplicate: u32 = if local {
+            guard.db.query_row(
+                "SELECT COUNT(*) FROM byos_vaults WHERE owner_account = ?1 AND provider = 'filesystem' AND (lower(endpoint) = lower(?2) OR bucket = ?3)",
+                params![vault.owner_account, vault.endpoint, vault.bucket],
+                |row| row.get(0),
+            )
+        } else {
+            guard.db.query_row(
+                "SELECT COUNT(*) FROM byos_vaults WHERE owner_account = ?1 AND endpoint = ?2 AND bucket = ?3 AND prefix = ?4",
+                params![vault.owner_account, vault.endpoint, vault.bucket, vault.prefix],
+                |row| row.get(0),
+            )
+        }.map_err(|e| e.to_string())?;
         if duplicate > 0 {
-            return Err("This bucket and prefix are already connected on this PC".into());
+            return Err(if local {
+                "This external-drive vault is already connected on this PC. Select it and use Find drive folder if its drive letter changed".into()
+            } else {
+                "This bucket and prefix are already connected on this PC".into()
+            });
         }
     }
     let session = session(&vault, credentials, "backup");
@@ -401,9 +600,16 @@ pub async fn cmd_byos_add_vault(
     context
         .ensure_current(state.inner())
         .map_err(|e| e.to_string())?;
-    connect(&app, &session, &context.repository_password, active, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    connect(
+        &app,
+        &session,
+        &context.repository_password,
+        active && !had_marker,
+        None,
+        local && !had_marker,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if active {
         validate_provider(&app, &session, &context.repository_password)
             .await
@@ -412,14 +618,20 @@ pub async fn cmd_byos_add_vault(
     context
         .ensure_current(state.inner())
         .map_err(|e| e.to_string())?;
-    let credentials = VaultCredentials {
-        access_key_id: session.access_key_id,
-        secret_access_key: session.secret_access_key,
+    let entry = if local {
+        save_local_marker(&session).map_err(|e| e.to_string())?;
+        None
+    } else {
+        let credentials = VaultCredentials {
+            access_key_id: session.access_key_id.clone(),
+            secret_access_key: session.secret_access_key.clone(),
+        };
+        let entry = credential_entry(&vault.owner_account, &vault.id).map_err(|e| e.to_string())?;
+        entry
+            .set_secret(&serde_json::to_vec(&credentials).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("Could not securely save storage credentials: {e}"))?;
+        Some(entry)
     };
-    let entry = credential_entry(&vault.owner_account, &vault.id).map_err(|e| e.to_string())?;
-    entry
-        .set_secret(&serde_json::to_vec(&credentials).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("Could not securely save storage credentials: {e}"))?;
     let result = {
         let guard = state.0.lock().map_err(|e| e.to_string())?;
         guard.db.execute(
@@ -429,7 +641,9 @@ pub async fn cmd_byos_add_vault(
         )
     };
     if let Err(error) = result {
-        let _ = entry.delete_credential();
+        if let Some(entry) = entry {
+            let _ = entry.delete_credential();
+        }
         return Err(format!("Could not save the destination: {error}"));
     }
     Ok(vault)
@@ -458,13 +672,15 @@ pub async fn cmd_byos_remove_vault(
     if profiles > 0 {
         return Err("Move or delete profiles using this destination first".into());
     }
-    let entry = credential_entry(&vault.owner_account, &vault.id).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::v1::Error::NoEntry) => {}
-        Err(error) => {
-            return Err(format!(
-                "Could not remove local storage credentials: {error}"
-            ))
+    if vault.provider != "filesystem" {
+        let entry = credential_entry(&vault.owner_account, &vault.id).map_err(|e| e.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::v1::Error::NoEntry) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove local storage credentials: {error}"
+                ))
+            }
         }
     }
     guard
@@ -474,8 +690,56 @@ pub async fn cmd_byos_remove_vault(
             params![vault_id, owner],
         )
         .map_err(|e| e.to_string())?;
-    // The remote bucket and its backups remain the customer's property.
+    // The bucket or local folder and its backups remain the customer's property.
     Ok(())
+}
+
+#[tauri::command]
+pub async fn cmd_byos_relocate_vault(
+    state: tauri::State<'_, AppStateWrapper>,
+    vault_id: String,
+    folder_path: String,
+) -> Result<Vault, String> {
+    let _engine = kopia::try_begin_update().map_err(|e| e.to_string())?;
+    let owner = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.byos_scope().ok_or("Sign in first")?
+    };
+    let mut vault = get_vault(state.inner(), &owner, &vault_id).map_err(|e| e.to_string())?;
+    if vault.provider != "filesystem" {
+        return Err("Only external-drive vaults can be relocated".into());
+    }
+    let folder = local_folder(&folder_path).map_err(|e| e.to_string())?;
+    if existing_marker(&folder)
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        != Some(&vault.bucket)
+    {
+        return Err("This is not the original vault folder. Choose the folder with its SaveState vault marker".into());
+    }
+    if !has_local_repository(&folder) {
+        return Err("This folder has the vault marker but its backup repository is missing".into());
+    }
+    {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let duplicate: u32 = guard.db.query_row(
+            "SELECT COUNT(*) FROM byos_vaults WHERE owner_account = ?1 AND provider = 'filesystem' AND id != ?2 AND lower(endpoint) = lower(?3)",
+            params![owner, vault_id, folder], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if duplicate > 0 {
+            return Err("This folder is already connected to another vault".into());
+        }
+        guard
+            .db
+            .execute(
+                "UPDATE byos_vaults SET endpoint = ?1 WHERE id = ?2 AND owner_account = ?3",
+                params![folder, vault_id, owner],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    vault.endpoint = folder;
+    vault.available = Some(true);
+    Ok(vault)
 }
 
 async fn checked_session(
@@ -502,7 +766,15 @@ async fn list_snapshots(
 ) -> Result<Vec<KopiaSnapshot>> {
     let session = checked_session(state, context, vault_id, "restore").await?;
     let _engine = kopia::begin_operation().await?;
-    connect(app, &session, &context.repository_password, false, None).await?;
+    connect(
+        app,
+        &session,
+        &context.repository_password,
+        false,
+        None,
+        false,
+    )
+    .await?;
     list_connected_snapshots(app, &session, &context.repository_password).await
 }
 
@@ -580,10 +852,24 @@ pub async fn cmd_byos_restore(
     let session = checked_session(state.inner(), &context, &vault_id, "restore")
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(folder) = session.local_path.as_deref() {
+        let target = fs::canonicalize(parent).map_err(|e| e.to_string())?;
+        let vault = fs::canonicalize(folder).map_err(|e| e.to_string())?;
+        if target.starts_with(vault) {
+            return Err("Choose a restore folder outside the vault's storage folder".into());
+        }
+    }
     let _engine = kopia::begin_operation().await.map_err(|e| e.to_string())?;
-    connect(&app, &session, &context.repository_password, false, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    connect(
+        &app,
+        &session,
+        &context.repository_password,
+        false,
+        None,
+        false,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     context
         .ensure_current(state.inner())
         .map_err(|e| e.to_string())?;
@@ -625,6 +911,7 @@ pub(crate) async fn backup_profile(
     if !source.exists() {
         bail!("Source folder is missing: {}", profile.source_path);
     }
+    ensure_source_outside_vault(source, &session)?;
     let operation = backup_operations::begin_with_context(state, context, profile.name.clone())?;
     let _engine = kopia::begin_operation().await?;
     let result: Result<String> = async {
@@ -632,8 +919,9 @@ pub(crate) async fn backup_profile(
             app,
             &session,
             &operation.context.repository_password,
-            true,
+            session.local_path.is_none(),
             Some(&operation.control),
+            false,
         )
         .await?;
         operation.ensure_not_cancelled()?;
@@ -774,7 +1062,15 @@ pub(crate) async fn delete_profile_snapshots(
     let session = checked_session(state, context, vault_id, "delete").await?;
     let snapshots = list_snapshots(app, state, context, vault_id).await?;
     let _engine = kopia::begin_operation().await?;
-    connect(app, &session, &context.repository_password, false, None).await?;
+    connect(
+        app,
+        &session,
+        &context.repository_password,
+        false,
+        None,
+        false,
+    )
+    .await?;
     for item in snapshots
         .into_iter()
         .filter(|item| item.profile_id.as_deref() == Some(&profile.id))
@@ -799,6 +1095,84 @@ mod tests {
             access_key_id: "test-key".into(),
             secret_access_key: "test-secret".into(),
         }
+    }
+
+    fn drive_input(folder: &Path) -> NewVault {
+        NewVault {
+            label: "Archive drive".into(),
+            provider: "filesystem".into(),
+            endpoint: folder.to_string_lossy().into_owned(),
+            region: String::new(),
+            bucket: String::new(),
+            prefix: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+        }
+    }
+
+    #[test]
+    fn local_vault_requires_a_subfolder_and_no_cloud_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("vault");
+        fs::create_dir(&folder).unwrap();
+        let (vault, credentials) = validate(drive_input(&folder), "owner".into()).unwrap();
+        assert_eq!(vault.provider, "filesystem");
+        assert!(credentials.access_key_id.is_empty());
+        let session = session(&vault, credentials, "backup");
+        assert_eq!(storage_connect_args(&session)[0], "filesystem");
+        assert_eq!(
+            storage_connect_args(&session)[1],
+            format!("--path={}", vault.endpoint)
+        );
+        assert!(verify_local_marker(&session, false).is_err());
+        fs::write(folder.join("kopia.repository.f"), "test").unwrap();
+        save_local_marker(&session).unwrap();
+        verify_local_marker(&session, false).unwrap();
+    }
+
+    #[test]
+    fn replaced_or_missing_external_drive_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("vault");
+        fs::create_dir(&folder).unwrap();
+        let (vault, credentials) = validate(drive_input(&folder), "owner".into()).unwrap();
+        let session = session(&vault, credentials, "backup");
+        fs::write(folder.join("kopia.repository.f"), "test").unwrap();
+        save_local_marker(&session).unwrap();
+        fs::remove_file(folder.join("kopia.repository.f")).unwrap();
+        assert!(verify_local_marker(&session, false)
+            .unwrap_err()
+            .to_string()
+            .contains("EXTERNAL_REPOSITORY_MISSING"));
+        fs::write(folder.join("kopia.repository.f"), "test").unwrap();
+        fs::write(
+            marker_path(&vault.endpoint),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        assert!(verify_local_marker(&session, false)
+            .unwrap_err()
+            .to_string()
+            .contains("EXTERNAL_DRIVE_CHANGED"));
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(verify_local_marker(&session, false)
+            .unwrap_err()
+            .to_string()
+            .contains("EXTERNAL_DRIVE_MISSING"));
+    }
+
+    #[test]
+    fn backup_source_cannot_include_local_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let vault_folder = root.path().join("vault");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&vault_folder).unwrap();
+        let (vault, credentials) = validate(drive_input(&vault_folder), "owner".into()).unwrap();
+        let session = session(&vault, credentials, "backup");
+        assert!(ensure_source_outside_vault(root.path(), &session).is_err());
+        assert!(ensure_source_outside_vault(&vault_folder, &session).is_err());
+        ensure_source_outside_vault(&source, &session).unwrap();
     }
 
     #[test]

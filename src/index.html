@@ -262,19 +262,20 @@
                         <form id="byos-form" class="byos-form vault-connect-form hidden" autocomplete="off">
                             <div class="vault-connect-heading">
                                 <h3>Add a storage vault</h3>
-                                <p class="text-muted text-sm">Connect a bucket you own. This PC keeps its credentials locally.</p>
+                                <p class="text-muted text-sm">Connect your own storage. Cloud credentials stay on this PC; external drives need no access keys.</p>
                             </div>
                             <div class="byos-field-grid">
                                 <div class="form-group"><label for="byos-label">Vault name</label><input type="text" id="byos-label" required maxlength="80" placeholder="e.g. Office backups" /></div>
-                                <div class="form-group"><label for="byos-provider">Connector</label><select class="select-input" id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option></select></div>
+                                <div class="form-group"><label for="byos-provider">Connector</label><select class="select-input" id="byos-provider"><option value="b2">Backblaze B2</option><option value="r2">Cloudflare R2</option><option value="s3">S3-compatible</option><option value="minio">MinIO</option><option value="filesystem">External drive</option></select></div>
                                 <div class="form-group"><label id="byos-endpoint-label" for="byos-endpoint">Backblaze B2 endpoint</label><input id="byos-endpoint" required type="url" placeholder="https://s3.eu-central-003.backblazeb2.com" aria-describedby="byos-endpoint-help" /><p class="field-help" id="byos-endpoint-help">Use the S3 endpoint shown for your B2 bucket.</p></div>
-                                <div class="form-group"><label for="byos-region">Region</label><input type="text" id="byos-region" required placeholder="e.g. eu-central-003" /></div>
-                                <div class="form-group"><label for="byos-bucket">Bucket</label><input type="text" id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
-                                <div class="form-group"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input type="text" id="byos-prefix" placeholder="Auto-generated if blank" /></div>
-                                <div class="form-group"><label for="byos-key-id">Access key ID</label><input type="text" id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
-                                <div class="form-group"><label for="byos-secret">Secret access key</label><input id="byos-secret" required type="password" autocomplete="new-password" spellcheck="false" /></div>
+                                <div class="form-group hidden" id="byos-folder-picker"><button type="button" class="btn btn-ghost btn-sm" id="btn-byos-choose-folder">Choose vault folder…</button></div>
+                                <div class="form-group" id="byos-region-field"><label for="byos-region">Region</label><input type="text" id="byos-region" required placeholder="e.g. eu-central-003" /></div>
+                                <div class="form-group" id="byos-bucket-field"><label for="byos-bucket">Bucket</label><input type="text" id="byos-bucket" required maxlength="63" placeholder="my-backups" /></div>
+                                <div class="form-group" id="byos-prefix-field"><label for="byos-prefix">Folder inside bucket <span class="text-muted">(optional)</span></label><input type="text" id="byos-prefix" placeholder="Auto-generated if blank" /></div>
+                                <div class="form-group" id="byos-key-id-field"><label for="byos-key-id">Access key ID</label><input type="text" id="byos-key-id" required autocomplete="off" spellcheck="false" /></div>
+                                <div class="form-group" id="byos-secret-field"><label for="byos-secret">Secret access key</label><input id="byos-secret" required type="password" autocomplete="new-password" spellcheck="false" /></div>
                             </div>
-                            <p class="text-muted text-sm">Keys stay in Windows Credential Manager on this PC. Your provider sets storage charges and data location. Connecting does not change other vaults.</p>
+                            <p class="text-muted text-sm" id="byos-storage-note">Keys stay in Windows Credential Manager on this PC. Your provider sets storage charges and data location. Connecting does not change other vaults.</p>
                             <div class="byos-actions"><button type="button" class="btn btn-ghost btn-sm" id="btn-byos-cancel">Cancel</button><button type="submit" class="btn btn-primary btn-sm" id="btn-byos-connect">Connect and test</button></div>
                         </form>
                     </div>
@@ -287,6 +288,7 @@
                                 <p class="page-intro" id="vault-detail-subtitle"></p>
                             </div>
                             <div class="vault-detail-actions">
+                                <button type="button" class="btn btn-ghost btn-sm hidden" id="btn-vault-find-folder">Find drive folder</button>
                                 <button type="button" class="btn btn-ghost btn-sm" id="btn-vault-browse">Browse backups</button>
                                 <button class="btn btn-primary btn-sm" id="btn-create-profile">
                                     <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -297,10 +299,10 @@
                         <details id="vault-connection-details" class="vault-connection-details hidden">
                             <summary>Connection details</summary>
                             <dl>
-                                <div><dt>Endpoint</dt><dd id="vault-detail-endpoint"></dd></div>
-                                <div><dt>Bucket</dt><dd id="vault-detail-bucket"></dd></div>
-                                <div><dt>Region</dt><dd id="vault-detail-region"></dd></div>
-                                <div><dt>Folder prefix</dt><dd id="vault-detail-prefix"></dd></div>
+                                <div><dt id="vault-detail-endpoint-label">Endpoint</dt><dd id="vault-detail-endpoint"></dd></div>
+                                <div id="vault-detail-bucket-row"><dt>Bucket</dt><dd id="vault-detail-bucket"></dd></div>
+                                <div id="vault-detail-region-row"><dt>Region</dt><dd id="vault-detail-region"></dd></div>
+                                <div id="vault-detail-prefix-row"><dt>Folder prefix</dt><dd id="vault-detail-prefix"></dd></div>
                             </dl>
                         </details>
                         <p class="text-muted text-sm" id="profile-limit-summary">Scheduled-profile allowance is loading…</p>

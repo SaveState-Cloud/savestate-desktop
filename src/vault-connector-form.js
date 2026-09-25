@@ -28,6 +28,13 @@
             regionPlaceholder: 'us-east-1',
             defaultRegion: 'us-east-1',
         },
+        filesystem: {
+            endpointLabel: 'Vault folder on external drive',
+            endpointPlaceholder: 'Choose a dedicated folder on your drive',
+            endpointHelp: 'Use a folder inside the drive, not its root. Keep the drive connected for scheduled backups.',
+            regionPlaceholder: '',
+            defaultRegion: '',
+        },
     };
 
     function apply(document, { providerChanged = false } = {}) {
@@ -36,13 +43,31 @@
         if (!connector) throw new Error(`Unknown storage connector: ${provider}`);
         const endpoint = document.getElementById('byos-endpoint');
         const region = document.getElementById('byos-region');
+        const local = provider === 'filesystem';
         document.getElementById('byos-endpoint-label').textContent = connector.endpointLabel;
         document.getElementById('byos-endpoint-help').textContent = connector.endpointHelp;
         endpoint.placeholder = connector.endpointPlaceholder;
+        endpoint.type = local ? 'text' : 'url';
+        endpoint.readOnly = local;
         region.placeholder = connector.regionPlaceholder;
+        for (const id of ['region', 'bucket', 'prefix', 'key-id', 'secret']) {
+            const field = document.getElementById(`byos-${id}-field`);
+            if (field) field.classList.toggle('hidden', local);
+            const input = document.getElementById(`byos-${id}`);
+            if (input && id !== 'prefix') input.required = !local;
+        }
+        document.getElementById('byos-folder-picker')?.classList.toggle('hidden', !local);
+        const note = document.getElementById('byos-storage-note');
+        if (note) note.textContent = local
+            ? 'Backups stay encrypted on the selected drive. SaveState never formats or erases it. Scheduled backups fail while the drive is disconnected.'
+            : 'Keys stay in Windows Credential Manager on this PC. Your provider sets storage charges and data location. Connecting does not change other vaults.';
         if (providerChanged) {
             endpoint.value = '';
             region.value = connector.defaultRegion;
+            for (const id of ['bucket', 'prefix', 'key-id', 'secret']) {
+                const input = document.getElementById(`byos-${id}`);
+                if (input) input.value = '';
+            }
         }
     }
 

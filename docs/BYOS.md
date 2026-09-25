@@ -10,11 +10,15 @@ available in an installed release until a new installer is published.
    SaveState-managed vault and shows its plan there. Open the selector and
    choose **Add vault** to connect another storage destination. **Manage
    vaults** shows the full connector list and disconnect controls.
-2. Create a bucket with an S3-compatible provider and enter its endpoint,
-   region, bucket name, access key ID and secret. A dedicated bucket or prefix
-   is recommended. SaveState generates an account-scoped prefix if left blank.
+2. Choose a connector. For S3-compatible cloud storage, create a bucket and
+   enter its endpoint, region, bucket name, access key ID and secret. A
+   dedicated bucket or prefix is recommended. SaveState generates an
+   account-scoped prefix if left blank. For **External drive**, select an
+   existing dedicated folder inside the drive; no cloud keys are required.
 3. **Connect and test** opens or creates a Kopia repository and runs Kopia's
-   storage-provider validation before the vault is saved.
+   storage-provider validation before the vault is saved. A new drive vault
+   gets an ID marker in its folder so a later drive-letter collision cannot
+   silently initialize a repository on a different disk.
 4. Select a vault in the lower-left corner and add one or more file/folder backup sources. Each source
    can have its own local-time schedule and retention or be manual-only. Its
    destination is fixed after creation; add another source to back up the same
@@ -24,18 +28,19 @@ available in an installed release until a new installer is published.
    folder. **Browse backups** inside Cloud - Personal opens the managed backup
    browser. Custom vaults have their own dashboard and source list; managed-only
    database and quick-backup pages are not shown while one is selected.
-   Disconnecting a custom vault never deletes remote objects.
+   Disconnecting a custom vault never deletes its bucket or drive data.
 
 ## Boundaries and recovery
 
-- Customer-owned object bytes do not count toward SaveState's managed-storage
-  quota, and provider charges are paid by the customer. There is no numerical
+- Customer-owned repository bytes do not count toward SaveState's managed-storage
+  quota. Cloud-provider charges and external-drive ownership are the customer's responsibility. There is no numerical
   cap on custom vaults. The existing automated schedule limit applies across
   all vaults, not separately to each vault.
 - File/folder profiles are supported. Quick backups and native database
   profiles still use SaveState-managed storage.
-- The S3 key pair stays in Windows Credential Manager on the device. The API
-  stores only plan entitlement; it never receives these keys or object bytes.
+- The S3 key pair stays in Windows Credential Manager on the device. External
+  drive vaults use no S3 keys. The API stores only plan entitlement; it never
+  receives these keys or customer-owned backup bytes.
   Destination metadata and profile mappings are local SQLite data.
 - Kopia encrypts the repository with the account's client-side master key.
   The same account key plus the provider credentials, endpoint, bucket and
@@ -56,9 +61,28 @@ available in an installed release until a new installer is published.
   app's Restore points view for BYOS.
 - The initial Windows release accepts HTTPS S3-compatible endpoints, plus
   loopback HTTP for local MinIO testing. Arbitrary remote HTTP is rejected.
+- External-drive vaults require an existing dedicated folder on a local drive.
+  If that folder disappears or its marker changes, backup and restore stop
+  before Kopia writes. A drive-letter change can be repaired with **Find drive
+  folder**, which accepts only the original marked folder. A backup source
+  cannot contain or sit inside its own repository folder. Keep another copy of
+  important data: a drive kept next to the PC is not an off-site backup.
 
 ## Verification and release notes
 
+- External-drive support is implemented on the `feat/vault-first-desktop`
+  branch, not in the installed production app. The Windows development app
+  could not be rebuilt in place while its executable remained open, and app
+  control reported access denied. A visual
+  in-app backup/restore acceptance pass is still required before release.
+- For the drive connector, 67 desktop UI checks, 3 logout checks, and 109 Rust
+  checks passed (one optional integration test ignored). Kopia 0.23.1 created
+  a disposable local filesystem repository, validated the provider, backed up
+  a folder, and restored its file with a matching SHA-256 hash. Native tests
+  cover missing/replaced drive markers and
+  rejecting backup sources that overlap the repository. This test used a
+  disposable folder, not a physical USB drive; unplug/replug behavior remains
+  to be accepted on real hardware.
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
   the desktop checks passed: 62 UI tests, 3 logout-flow tests, and 106 Rust
   tests (one optional database integration test ignored). The API checks passed

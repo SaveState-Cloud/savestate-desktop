@@ -8,7 +8,11 @@ function form(provider) {
   const elements = Object.fromEntries([
     'byos-provider', 'byos-endpoint', 'byos-region',
     'byos-endpoint-label', 'byos-endpoint-help',
-  ].map(id => [id, { value: '', placeholder: '', textContent: '' }]));
+    'byos-folder-picker', 'byos-storage-note',
+    'byos-bucket', 'byos-prefix', 'byos-key-id', 'byos-secret',
+    'byos-region-field', 'byos-bucket-field', 'byos-prefix-field',
+    'byos-key-id-field', 'byos-secret-field',
+  ].map(id => [id, { value: '', placeholder: '', textContent: '', classList: { hidden: false, toggle(name, value) { if (name === 'hidden') this.hidden = value; } } }]));
   elements['byos-provider'].value = provider;
   elements['byos-endpoint'].value = 'https://previous-provider.example.com';
   elements['byos-region'].value = 'previous-region';
@@ -38,6 +42,20 @@ test('reopening a form keeps unfinished input', () => {
   connectorForm.apply(document);
   assert.equal(elements['byos-endpoint'].value, 'https://previous-provider.example.com');
   assert.equal(elements['byos-region'].value, 'previous-region');
+});
+
+test('external drive uses a folder picker without cloud-only fields or keys', () => {
+  const { elements, document } = form('filesystem');
+  connectorForm.apply(document, { providerChanged: true });
+  assert.equal(elements['byos-endpoint-label'].textContent, 'Vault folder on external drive');
+  assert.equal(elements['byos-endpoint'].type, 'text');
+  assert.equal(elements['byos-endpoint'].readOnly, true);
+  assert.equal(elements['byos-folder-picker'].classList.hidden, false);
+  for (const id of ['region', 'bucket', 'prefix', 'key-id', 'secret']) {
+    assert.equal(elements[`byos-${id}-field`].classList.hidden, true);
+  }
+  assert.equal(elements['byos-secret'].required, false);
+  assert.match(elements['byos-storage-note'].textContent, /never formats or erases/);
 });
 
 test('the form loads provider copy before the app and links help to the endpoint', () => {

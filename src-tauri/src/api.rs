@@ -438,6 +438,8 @@ pub struct RepoSession {
     pub bucket: String,
     pub prefix: String,
     pub endpoint: String,
+    #[serde(skip)]
+    pub local_path: Option<String>,
     #[serde(default)]
     pub endpoint_host: Option<String>,
     pub region: String,
