@@ -269,6 +269,7 @@ fn main() {
             byos::cmd_byos_list_vaults,
             byos::cmd_byos_add_vault,
             byos::cmd_byos_remove_vault,
+            byos::cmd_byos_relocate_vault,
             byos::cmd_byos_list_snapshots,
             byos::cmd_byos_restore,
             // Database backups

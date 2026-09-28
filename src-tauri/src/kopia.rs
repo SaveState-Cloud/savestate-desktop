@@ -500,7 +500,7 @@ fn build_kopia_command(
     }
     cmd.env("KOPIA_CACHE_DIRECTORY", &cache_dir);
 
-    if let Some(s) = session {
+    if let Some(s) = session.filter(|s| s.local_path.is_none()) {
         cmd.env("AWS_ACCESS_KEY_ID", &s.access_key_id);
         cmd.env("AWS_SECRET_ACCESS_KEY", &s.secret_access_key);
         cmd.env("AWS_REGION", &s.region);

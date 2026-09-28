@@ -1,33 +1,46 @@
 # Customer-owned storage (BYOS)
 
-Implementation and acceptance record for the next desktop release. This is
-**not** a claim that an older installed production app already has BYOS.
+Implementation and acceptance record for customer-owned vaults. The vault-first
+navigation below is a desktop change on this branch; do not describe it as
+available in an installed release until a new installer is published.
 
 ## Customer flow
 
-1. On an eligible active plan, open **Settings → Your storage destinations**.
-2. Create a bucket with an S3-compatible provider and enter its endpoint,
-   region, bucket name, access key ID and secret. A dedicated bucket or prefix
-   is recommended. SaveState generates an account-scoped prefix if left blank.
+1. The lower-left selector is the active vault. **Personal** is the permanent
+   SaveState-managed vault and shows its plan there. Open the selector and
+   choose **Add vault** to connect another storage destination. **Manage
+   vaults** shows the full connector list and disconnect controls.
+2. Choose a connector. For S3-compatible cloud storage, create a bucket and
+   enter its endpoint, region, bucket name, access key ID and secret. A
+   dedicated bucket or prefix is recommended. SaveState generates an
+   account-scoped prefix if left blank. For **External drive**, select an
+   existing dedicated folder inside the drive; no cloud keys are required.
 3. **Connect and test** opens or creates a Kopia repository and runs Kopia's
-   storage-provider validation before the destination is saved.
-4. Create a file/folder backup profile and choose the connected destination.
-   SaveState-managed storage remains the default. A profile's destination is
-   fixed after creation; create a second profile to change it without moving or
-   deleting existing restore points.
-5. Run or schedule the profile normally. Open **Restore points** in Settings to
-   browse snapshots directly from the bucket and restore into a new local
-   folder. Disconnecting a destination never deletes remote objects.
+   storage-provider validation before the vault is saved. A new drive vault
+   gets an ID marker in its folder so a later drive-letter collision cannot
+   silently initialize a repository on a different disk.
+4. Select a vault in the lower-left corner and add one or more file/folder backup sources. Each source
+   can have its own local-time schedule and retention or be manual-only. Its
+   destination is fixed after creation; add another source to back up the same
+   folder to a different vault without moving its existing restore points.
+5. Run a source in its vault. Use **Restore points** inside a custom vault to
+   browse snapshots directly from its bucket and restore into a new local
+   folder. **Browse backups** inside Cloud - Personal opens the managed backup
+   browser. Custom vaults have their own dashboard and source list; managed-only
+   database and quick-backup pages are not shown while one is selected.
+   Disconnecting a custom vault never deletes its bucket or drive data.
 
 ## Boundaries and recovery
 
-- Customer-owned object bytes do not count toward SaveState's managed-storage
-  quota, and provider charges are paid by the customer. The existing automated
-  schedule limit still applies to scheduled BYOS profiles.
+- Customer-owned repository bytes do not count toward SaveState's managed-storage
+  quota. Cloud-provider charges and external-drive ownership are the customer's responsibility. There is no numerical
+  cap on custom vaults. The existing automated schedule limit applies across
+  all vaults, not separately to each vault.
 - File/folder profiles are supported. Quick backups and native database
   profiles still use SaveState-managed storage.
-- The S3 key pair stays in Windows Credential Manager on the device. The API
-  stores only plan entitlement; it never receives these keys or object bytes.
+- The S3 key pair stays in Windows Credential Manager on the device. External
+  drive vaults use no S3 keys. The API stores only plan entitlement; it never
+  receives these keys or customer-owned backup bytes.
   Destination metadata and profile mappings are local SQLite data.
 - Kopia encrypts the repository with the account's client-side master key.
   The same account key plus the provider credentials, endpoint, bucket and
@@ -42,18 +55,64 @@ Implementation and acceptance record for the next desktop release. This is
   one or run backups without an active eligible plan. If a replacement
   subscription creates a new service workspace, create a new backup profile;
   the old service-scoped schedule is not silently moved, while the existing
-  customer-owned restore points remain available from Settings.
+  customer-owned restore points remain available from Vaults.
 - The website vault cannot directly browse customer-owned objects because
   SaveState does not hold the customer's storage credentials. Use the desktop
   app's Restore points view for BYOS.
 - The initial Windows release accepts HTTPS S3-compatible endpoints, plus
   loopback HTTP for local MinIO testing. Arbitrary remote HTTP is rejected.
+- External-drive vaults require an existing dedicated folder on a local drive.
+  If that folder disappears or its marker changes, backup and restore stop
+  before Kopia writes. A drive-letter change can be repaired with **Find drive
+  folder**, which accepts only the original marked folder. A backup source
+  cannot contain or sit inside its own repository folder. Keep another copy of
+  important data: a drive kept next to the PC is not an off-site backup.
 
 ## Verification and release notes
 
+- External-drive support is implemented on the `feat/vault-first-desktop`
+  branch, not in the installed production app. On 2026-09-25, an optimized
+  Windows development build opened and passed an in-app external-vault
+  backup/restore acceptance pass. A signed production release has not been
+  published.
+- For the drive connector, 69 desktop UI checks, 3 logout checks, and 109 Rust
+  checks passed (one optional integration test ignored). Kopia 0.23.1 created
+  a disposable local filesystem repository, validated the provider, backed up
+  a folder, and restored its file with a matching SHA-256 hash. Native tests
+  cover missing/replaced drive markers and
+  rejecting backup sources that overlap the repository. This test used a
+  disposable folder, not a physical USB drive; unplug/replug behavior remains
+  to be accepted on real hardware.
+- In the development app, a disposable `External Drive QA` filesystem vault
+  was created and connected without credentials. A manual-only source backed
+  up one `README.md` file; Restore points listed one snapshot, and restoring
+  into a separate folder produced the same SHA-256 as the source:
+  `FFB9E219523F89CB816573E5A4826FD49373DB4E81478FC88B5A88AF498E976E`.
+  Renaming the disposable vault folder made the app show **Disconnected** and
+  disable **Run Now**; **Find drive folder** accepted the moved folder with
+  its original marker and returned the vault to **Connected** without losing
+  its source or snapshot. The first relocation attempt while another task
+  still held the engine gate returned a busy message; retrying after it
+  finished succeeded. This simulates a path change, not unplugging hardware.
+  The QA vault and its temporary folder remain available for follow-up tests.
+  The first backup also revealed a misleading managed-manifest error toast:
+  the backup-completion listener refreshed Cloud - Personal even while the
+  external vault was selected. That refresh is now limited to the managed
+  vault, and a regression check covers the boundary.
 - API unit/runtime tests and desktop Rust/UI tests must pass. On 2026-09-25,
-  the desktop checks passed: 54 UI tests, 3 logout-flow tests, and 106 Rust
-  tests (one optional database integration test ignored).
+  the desktop checks passed: 62 UI tests, 3 logout-flow tests, and 106 Rust
+  tests (one optional database integration test ignored). The API checks passed
+  288 unit tests and 6 disposable-D1 runtime tests.
+- The development build was opened at the Windows app's 802×632 window size.
+  The lower-left selector displayed Personal and two customer-owned vaults.
+  Selecting B2 changed the active vault and its source list, hid managed-only
+  navigation, showed a B2-specific dashboard, and loaded restore points from
+  the private test bucket. Selecting Personal again restored managed navigation
+  and its own empty source list. Manage vaults and its connect form opened and
+  the form was cancelled without writing backup or provider data. The source
+  dialog focused its name field, wrapped Shift+Tab to its final action, and
+  Escape returned focus to Add backup source; cancelling Add Vault restored
+  keyboard focus to its button. Connector setup was absent from Settings.
 - A disposable local S3 round trip passed in the Windows development app:
   connect/validate, create profile, back up a 111-byte file, list the restore
   point, and restore to a separate directory. Original and restored SHA-256

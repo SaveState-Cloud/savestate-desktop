@@ -21,7 +21,7 @@ test('profiles use an automatic folder instead of a user-selected destination', 
 });
 
 test('profile deletion defaults to preserving backups and offers the exact destructive choice', () => {
-  assert.match(html, /Delete all backups within this profile/);
+  assert.match(html, /Also delete this source's stored backups/);
   assert.match(html, /Backups moved elsewhere are preserved/);
   assert.match(app, /const deleteBackups = document\.getElementById\('profile-delete-backups'\)\.checked/);
   assert.match(app, /deleteBackups \}/);
