@@ -52,7 +52,7 @@ jobs:
           }
           npm run "build:$target"
       - name: Upload internal installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: savestate-vault-${{ github.event.inputs.environment || github.ref_name }}-${{ github.sha }}
           path: |
