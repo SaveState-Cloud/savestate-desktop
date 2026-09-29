@@ -617,6 +617,33 @@ pub(crate) fn run_kopia(
         .with_context(|| format!("Failed to execute kopia at {:?}", bin))
 }
 
+fn run_kopia_maintenance_command(
+    app: &tauri::AppHandle,
+    args: &[String],
+    password: &str,
+    session: &RepoSession,
+) -> Result<Output> {
+    let command = build_kopia_command(app, args, Some(password), Some(session));
+    crate::subprocess::run(
+        command,
+        crate::subprocess::Limits {
+            timeout: Duration::from_secs(30 * 60),
+            output_bytes: 4 * 1024 * 1024,
+        },
+        &|| false,
+    )
+    .map_err(|error| {
+        let detail = format!("{error:#}");
+        if detail.contains("DATABASE_TOOL_TIMEOUT") {
+            anyhow!("Storage cleanup exceeded 30 minutes and was stopped. Retry cleanup after checking the connection")
+        } else if detail.contains("DATABASE_TOOL_OUTPUT_LIMIT") {
+            anyhow!("Storage cleanup produced too much diagnostic output and was stopped")
+        } else {
+            error.context("Supervised storage cleanup failed")
+        }
+    })
+}
+
 pub(crate) fn run_kopia_for_backup(
     app: &tauri::AppHandle,
     args: &[String],
@@ -2736,7 +2763,7 @@ async fn run_maintenance_with_context(
             "--full".to_string(),
             "--no-progress".to_string(),
         ];
-        let first = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
+        let first = run_kopia_maintenance_command(&app_c, &args, &password, &session_c)?;
         if first.status.success() {
             return Ok(());
         }
@@ -2756,10 +2783,10 @@ async fn run_maintenance_with_context(
             format!("--owner={}", owner),
             "--no-progress".to_string(),
         ];
-        let changed = run_kopia(&app_c, &set_owner, Some(&password), Some(&session_c))?;
+        let changed = run_kopia_maintenance_command(&app_c, &set_owner, &password, &session_c)?;
         ensure_success(&changed, "maintenance owner update")?;
 
-        let retry = run_kopia(&app_c, &args, Some(&password), Some(&session_c))?;
+        let retry = run_kopia_maintenance_command(&app_c, &args, &password, &session_c)?;
         ensure_success(&retry, "maintenance run")
     })
     .await
