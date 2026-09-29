@@ -19,12 +19,12 @@ use crate::state::AppStateWrapper;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -50,15 +50,10 @@ static CANCELLED_RESTORES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static LAST_RETENTION: OnceLock<Mutex<Option<CachedRetention>>> = OnceLock::new();
 static OPERATION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
-static CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
 static SESSION_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CLEANUP_COORDINATOR: OnceLock<Mutex<CleanupCoordinator>> = OnceLock::new();
 
-struct LastCleanup {
-    account_scope: String,
-    completed_at: Instant,
-}
-
-static LAST_CLEANUP: OnceLock<Mutex<Option<LastCleanup>>> = OnceLock::new();
+static LAST_CLEANUP: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn backup_session_cache() -> &'static Mutex<Option<CachedBackupSession>> {
     BACKUP_SESSION.get_or_init(|| Mutex::new(None))
@@ -84,28 +79,23 @@ fn operation_gate() -> &'static RwLock<()> {
     OPERATION_GATE.get_or_init(|| RwLock::new(()))
 }
 
-fn last_cleanup() -> &'static Mutex<Option<LastCleanup>> {
-    LAST_CLEANUP.get_or_init(|| Mutex::new(None))
+fn last_cleanup() -> &'static Mutex<HashMap<String, Instant>> {
+    LAST_CLEANUP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn cleanup_within_cooldown(account_scope: &str) -> bool {
     last_cleanup()
         .lock()
         .map(|last| {
-            last.as_ref().is_some_and(|cleanup| {
-                cleanup.account_scope == account_scope
-                    && cleanup.completed_at.elapsed() < Duration::from_secs(30 * 60)
-            })
+            last.get(account_scope)
+                .is_some_and(|completed_at| completed_at.elapsed() < Duration::from_secs(30 * 60))
         })
         .unwrap_or(false)
 }
 
 fn mark_cleanup_complete(account_scope: &str) {
     if let Ok(mut last) = last_cleanup().lock() {
-        *last = Some(LastCleanup {
-            account_scope: account_scope.to_string(),
-            completed_at: Instant::now(),
-        });
+        last.insert(account_scope.to_string(), Instant::now());
     }
 }
 
@@ -118,15 +108,24 @@ pub struct EngineLease<'a> {
     _guard: RwLockReadGuard<'a, ()>,
 }
 
-fn begin_operation_in(gate: &RwLock<()>) -> Result<EngineLease<'_>> {
-    gate.try_read().map(|guard| EngineLease { _guard: guard }).map_err(|_| {
-        anyhow!("The engine is busy with maintenance, an account change, or an update; try again when it finishes")
-    })
+async fn begin_operation_in<'a>(
+    gate: &'a RwLock<()>,
+    generation: &AtomicU64,
+) -> Result<EngineLease<'a>> {
+    let captured_generation = generation.load(Ordering::SeqCst);
+    let guard = gate.read().await;
+    if captured_generation != generation.load(Ordering::SeqCst) {
+        return Err(anyhow!(
+            "The account or vault changed while this operation was waiting; start it again"
+        ));
+    }
+    Ok(EngineLease { _guard: guard })
 }
 
 pub async fn begin_operation() -> Result<EngineLease<'static>> {
-    // New work cannot queue captured old account state behind a session change.
-    begin_operation_in(operation_gate())
+    // Wait behind maintenance rather than failing the backup. If an account
+    // change completes while queued, reject the captured old-account work.
+    begin_operation_in(operation_gate(), &SESSION_CACHE_GENERATION).await
 }
 
 /// Reserve the engine exclusively for an update. This deliberately does not
@@ -191,19 +190,107 @@ pub struct EngineProgress {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageCleanupProgress {
     pub status: String,
     pub message: String,
+    pub account_scope: String,
 }
 
-fn emit_storage_cleanup(app: &tauri::AppHandle, status: &str, message: &str) {
-    let _ = app.emit(
-        "storage-cleanup",
-        StorageCleanupProgress {
-            status: status.to_string(),
-            message: message.to_string(),
-        },
-    );
+struct CleanupRecord {
+    progress: StorageCleanupProgress,
+    updated_at: Instant,
+}
+
+#[derive(Default)]
+struct CleanupCoordinator {
+    pending: VecDeque<AccountContext>,
+    statuses: HashMap<String, CleanupRecord>,
+    worker_running: bool,
+}
+
+impl CleanupCoordinator {
+    fn enqueue(&mut self, context: AccountContext, force: bool) -> (&'static str, bool) {
+        let scope = context.account_scope.clone();
+        if let Some(record) = self.statuses.get(&scope) {
+            if record.progress.status == "pending" || record.progress.status == "running" {
+                return ("running", false);
+            }
+            // Do not retry a broken repository on every dashboard refresh.
+            if !force
+                && record.progress.status == "failed"
+                && record.updated_at.elapsed() < Duration::from_secs(5 * 60)
+            {
+                return ("retry_later", false);
+            }
+        }
+        self.pending.push_back(context);
+        self.statuses.insert(
+            scope.clone(),
+            CleanupRecord {
+                progress: StorageCleanupProgress {
+                    status: "pending".to_string(),
+                    message: "Deleted storage is queued for safe cleanup".to_string(),
+                    account_scope: scope,
+                },
+                updated_at: Instant::now(),
+            },
+        );
+        let start_worker = !self.worker_running;
+        self.worker_running = true;
+        ("scheduled", start_worker)
+    }
+}
+
+fn cleanup_coordinator() -> &'static Mutex<CleanupCoordinator> {
+    CLEANUP_COORDINATOR.get_or_init(|| Mutex::new(CleanupCoordinator::default()))
+}
+
+fn persist_cleanup_request(app: &tauri::AppHandle, scope: &str) -> Result<()> {
+    let state = app.state::<AppStateWrapper>();
+    let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+    crate::db::request_cleanup(&guard.db, scope)
+}
+
+fn clear_cleanup_request(app: &tauri::AppHandle, scope: &str) -> Result<()> {
+    let state = app.state::<AppStateWrapper>();
+    let guard = state.0.lock().map_err(|error| anyhow!("Lock: {error}"))?;
+    crate::db::clear_cleanup_request(&guard.db, scope)
+}
+
+fn cleanup_status_for_scope(scope: &str) -> StorageCleanupProgress {
+    cleanup_coordinator()
+        .lock()
+        .ok()
+        .and_then(|queue| {
+            queue
+                .statuses
+                .get(scope)
+                .map(|record| record.progress.clone())
+        })
+        .unwrap_or_else(|| StorageCleanupProgress {
+            status: "idle".to_string(),
+            message: String::new(),
+            account_scope: scope.to_string(),
+        })
+}
+
+fn set_cleanup_status(app: &tauri::AppHandle, scope: &str, status: &str, message: &str) {
+    let progress = StorageCleanupProgress {
+        status: status.to_string(),
+        message: message.to_string(),
+        account_scope: scope.to_string(),
+    };
+    if let Ok(mut queue) = cleanup_coordinator().lock() {
+        queue.statuses.insert(
+            scope.to_string(),
+            CleanupRecord {
+                progress: progress.clone(),
+                updated_at: Instant::now(),
+            },
+        );
+    }
+    let _ = app.emit("storage-cleanup", progress);
 }
 
 fn emit_progress(app: &tauri::AppHandle, id: &str, stage: &str, progress: f64, message: &str) {
@@ -1116,7 +1203,11 @@ pub async fn backup_paths_with_operation(
                 .map(|result| result.maintenance_recommended)
                 .unwrap_or(false)
             {
-                schedule_storage_cleanup(app.clone());
+                schedule_storage_cleanup_with_context(
+                    app.clone(),
+                    operation.context.clone(),
+                    false,
+                );
             }
             Ok(snapshot.id)
         }
@@ -1569,7 +1660,11 @@ pub async fn backup_stream_with_operation(
                 .map(|result| result.maintenance_recommended)
                 .unwrap_or(false)
             {
-                schedule_storage_cleanup(app.clone());
+                schedule_storage_cleanup_with_context(
+                    app.clone(),
+                    operation.context.clone(),
+                    false,
+                );
             }
             Ok(snapshot.id)
         }
@@ -1773,7 +1868,7 @@ pub async fn prune_profile_snapshots_with_operation(
         delete_snapshot_with_context(app, engine, &operation.context, snapshot_id).await?;
     }
     if !expired.is_empty() {
-        schedule_storage_cleanup_with_context(app.clone(), operation.context.clone());
+        schedule_storage_cleanup_with_context(app.clone(), operation.context.clone(), true);
     }
     Ok(expired)
 }
@@ -2616,6 +2711,7 @@ fn maintenance_owner_from_config(session: &RepoSession) -> Result<String> {
 async fn run_maintenance_with_context(
     app: &tauri::AppHandle,
     context: &AccountContext,
+    cleanup_scope: Option<&str>,
 ) -> Result<()> {
     let _operation_guard = operation_gate().write().await;
     // Queued maintenance can outlive its account/workspace. Revalidate only
@@ -2669,6 +2765,20 @@ async fn run_maintenance_with_context(
     .await
     .context("kopia maintenance task panicked")??;
 
+    // Clear the durable intent and publish completion while the exclusive
+    // engine lease is still held. A deletion cannot slip into the gap between
+    // maintenance finishing and the queue marking the vault complete.
+    if let Some(scope) = cleanup_scope {
+        clear_cleanup_request(app, scope)
+            .context("Repository cleanup finished but its pending marker could not be cleared")?;
+        mark_cleanup_complete(scope);
+        set_cleanup_status(
+            app,
+            scope,
+            "complete",
+            "Storage cleanup completed. Usage is refreshing…",
+        );
+    }
     engine_job.finish("succeeded", "completed", None, None, None);
     Ok(())
 }
@@ -2678,7 +2788,7 @@ pub async fn run_maintenance(app: &tauri::AppHandle, state: &AppStateWrapper) ->
         let guard = state.0.lock().map_err(|error| anyhow!("Lock: {}", error))?;
         AccountContext::capture(&guard)?
     };
-    run_maintenance_with_context(app, &context).await
+    run_maintenance_with_context(app, &context, None).await
 }
 
 /// Reclaim obsolete packs before a near-capacity backup. The commercial plan
@@ -2705,61 +2815,33 @@ pub async fn prepare_repository_for_backup(
     {
         return Ok(());
     }
-    if CLEANUP_RUNNING.swap(true, Ordering::AcqRel) {
-        if pressure.maintenance_urgent {
-            // A dashboard/deletion cleanup may have been queued just before
-            // this backup. Wait for it instead of letting the backup race the
-            // 750 ms scheduling delay and spend reclamation headroom first.
-            for _ in 0..1_800 {
-                operation.ensure_not_cancelled()?;
-                if !CLEANUP_RUNNING.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            if CLEANUP_RUNNING.load(Ordering::Acquire) {
-                return Err(anyhow!(
-                    "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Storage cleanup is still running. Retry this backup when cleanup finishes."
-                ));
-            }
-            if operation
-                .api()
-                .enforce_retention()
-                .await
-                .map(|current| current.maintenance_urgent)
-                .unwrap_or(false)
-            {
-                return Err(anyhow!(
-                    "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Your optimized backup storage is full after cleanup. Remove a retained backup or choose a larger plan."
-                ));
-            }
-        }
-        return Ok(());
-    }
-
-    emit_storage_cleanup(
-        app,
-        "running",
-        if pressure.maintenance_urgent {
-            "Storage is full. Reclaiming expired backup data before retrying…"
-        } else {
-            "Optimizing repository storage before backup…"
-        },
+    schedule_storage_cleanup_with_context(
+        app.clone(),
+        operation.context.clone(),
+        pressure.maintenance_urgent,
     );
-    let result = run_maintenance_with_context(app, &operation.context).await;
-    CLEANUP_RUNNING.store(false, Ordering::Release);
-    match result {
-        Ok(()) => {
-            mark_cleanup_complete(operation.account_scope());
-            emit_storage_cleanup(app, "complete", "Repository optimization completed");
+    if pressure.maintenance_urgent {
+        // A backup at the safety ceiling must not race its own queued cleanup.
+        // Other vaults' cleanup jobs do not masquerade as this vault's result.
+        for _ in 0..1_800 {
+            operation.ensure_not_cancelled()?;
+            let status = cleanup_status_for_scope(operation.account_scope());
+            if status.status == "failed" {
+                return Err(anyhow!(
+                    "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Storage cleanup failed: {}",
+                    status.message
+                ));
+            }
+            if status.status != "pending" && status.status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        Err(error) => {
-            emit_storage_cleanup(
-                app,
-                "failed",
-                &format!("Repository optimization could not finish: {}", error),
-            );
-            eprintln!("Pre-backup repository maintenance failed: {}", error);
+        let status = cleanup_status_for_scope(operation.account_scope());
+        if status.status == "pending" || status.status == "running" {
+            return Err(anyhow!(
+                "OPTIMIZED_STORAGE_QUOTA_EXCEEDED: Storage cleanup is still running. Retry this backup when cleanup finishes."
+            ));
         }
     }
     operation.ensure_not_cancelled()?;
@@ -2782,71 +2864,106 @@ pub async fn prepare_repository_for_backup(
 /// blocked. Calls are coalesced and rate-limited because safe Kopia cleanup can
 /// require multiple maintenance cycles before remote objects are reclaimable.
 pub fn schedule_storage_cleanup(app: tauri::AppHandle) -> &'static str {
+    // A deletion is a new cleanup request even if another pass finished
+    // recently. The dashboard's repeated pressure hints use the cooldown.
+    schedule_storage_cleanup_for_current(app, true)
+}
+
+fn schedule_storage_cleanup_for_current(app: tauri::AppHandle, force: bool) -> &'static str {
     let context = {
         let state = app.state::<AppStateWrapper>();
         let guard = match state.0.lock() {
             Ok(guard) => guard,
-            Err(_) => {
-                CLEANUP_RUNNING.store(false, Ordering::Release);
-                return "unavailable";
-            }
+            Err(_) => return "unavailable",
         };
         match AccountContext::capture(&guard) {
             Ok(context) => context,
-            Err(_) => {
-                CLEANUP_RUNNING.store(false, Ordering::Release);
-                return "unavailable";
-            }
+            Err(_) => return "unavailable",
         }
     };
 
-    schedule_storage_cleanup_with_context(app, context)
+    schedule_storage_cleanup_with_context(app, context, force)
 }
 
 fn schedule_storage_cleanup_with_context(
     app: tauri::AppHandle,
     context: AccountContext,
+    force: bool,
 ) -> &'static str {
-    if CLEANUP_RUNNING.swap(true, Ordering::AcqRel) {
-        return "running";
-    }
-
-    if cleanup_within_cooldown(&context.account_scope) {
-        CLEANUP_RUNNING.store(false, Ordering::Release);
+    if !force && cleanup_within_cooldown(&context.account_scope) {
         return "cooldown";
     }
+    let scope = context.account_scope.clone();
+    if let Err(error) = persist_cleanup_request(&app, &scope) {
+        set_cleanup_status(
+            &app,
+            &scope,
+            "failed",
+            &format!("Could not save the cleanup request: {error:#}"),
+        );
+        return "unavailable";
+    }
+    let (result, start_worker, progress) = {
+        let Ok(mut queue) = cleanup_coordinator().lock() else {
+            return "unavailable";
+        };
+        let (result, start_worker) = queue.enqueue(context, force);
+        let progress = queue
+            .statuses
+            .get(&scope)
+            .map(|record| record.progress.clone());
+        (result, start_worker, progress)
+    };
+    if result != "scheduled" {
+        return result;
+    }
+    if let Some(progress) = progress {
+        let _ = app.emit("storage-cleanup", progress);
+    }
+    if start_worker {
+        tauri::async_runtime::spawn(cleanup_queue_worker(app));
+    }
+    result
+}
 
-    emit_storage_cleanup(
-        &app,
-        "pending",
-        "Deleted storage is queued for safe cleanup",
-    );
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        emit_storage_cleanup(&app, "running", "Reclaiming deleted storage…");
-
-        let result = run_maintenance_with_context(&app, &context).await;
-
-        if result.is_ok() {
-            mark_cleanup_complete(&context.account_scope);
-        }
-        CLEANUP_RUNNING.store(false, Ordering::Release);
-
+async fn cleanup_queue_worker(app: tauri::AppHandle) {
+    loop {
+        let context = {
+            let Ok(mut queue) = cleanup_coordinator().lock() else {
+                return;
+            };
+            match queue.pending.pop_front() {
+                Some(context) => context,
+                None => {
+                    queue.worker_running = false;
+                    return;
+                }
+            }
+        };
+        let scope = context.account_scope.clone();
+        set_cleanup_status(&app, &scope, "running", "Reclaiming deleted storage…");
+        let result = run_maintenance_with_context(&app, &context, Some(&scope)).await;
         match result {
-            Ok(()) => emit_storage_cleanup(
-                &app,
-                "complete",
-                "Storage cleanup completed. Usage is refreshing…",
-            ),
-            Err(error) => emit_storage_cleanup(
-                &app,
-                "failed",
-                &format!("Storage cleanup could not finish: {}", error),
-            ),
+            Ok(()) => {}
+            Err(error) => {
+                if context
+                    .ensure_current(app.state::<AppStateWrapper>().inner())
+                    .is_err()
+                {
+                    set_cleanup_status(
+                        &app,
+                        &scope,
+                        "paused",
+                        "Cleanup will resume when this vault is selected and unlocked",
+                    );
+                    continue;
+                }
+                let message = format!("Storage cleanup could not finish: {error:#}");
+                eprintln!("{message}");
+                set_cleanup_status(&app, &scope, "failed", &message);
+            }
         }
-    });
-
-    "scheduled"
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2970,8 +3087,28 @@ pub async fn cmd_kopia_maintenance(
 }
 
 #[tauri::command]
-pub fn cmd_schedule_storage_cleanup(app: tauri::AppHandle) -> String {
-    schedule_storage_cleanup(app).to_string()
+pub fn cmd_schedule_storage_cleanup(app: tauri::AppHandle, force: Option<bool>) -> String {
+    schedule_storage_cleanup_for_current(app, force.unwrap_or(false)).to_string()
+}
+
+#[tauri::command]
+pub fn cmd_get_storage_cleanup_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppStateWrapper>,
+) -> Result<StorageCleanupProgress, String> {
+    let (context, pending) = {
+        let guard = state.0.lock().map_err(|error| format!("Lock: {error}"))?;
+        let context = AccountContext::capture(&guard).map_err(|error| error.to_string())?;
+        let pending = crate::db::cleanup_requested(&guard.db, &context.account_scope)
+            .map_err(|error| error.to_string())?;
+        (context, pending)
+    };
+    if pending {
+        // If the app closed during cleanup, the durable marker survives. Once
+        // this account is unlocked again, requeue it against the same vault.
+        schedule_storage_cleanup_with_context(app, context.clone(), false);
+    }
+    Ok(cleanup_status_for_scope(&context.account_scope))
 }
 
 pub async fn sync_kopia_manifest(app: &tauri::AppHandle, state: &AppStateWrapper) -> Result<()> {
@@ -2992,19 +3129,89 @@ mod tests {
         ensure_restore_not_cancelled, execute_rollback_steps, expired_profile_snapshot_ids,
         parse_snapshot, repository_is_missing, try_begin_update,
     };
+    use crate::backup_operations::AccountContext;
     use std::sync::{Arc, Mutex};
+
+    fn cleanup_context(scope: &str) -> AccountContext {
+        AccountContext {
+            api: crate::api::SaveStateClient::new("offline-cleanup-test".to_string()),
+            account_scope: scope.to_string(),
+            repository_password: "test-only".to_string(),
+            session_generation: 0,
+        }
+    }
+
+    #[test]
+    fn cleanup_queue_coalesces_each_vault_and_preserves_fifo_order() {
+        let mut queue = super::CleanupCoordinator::default();
+        assert_eq!(
+            queue.enqueue(cleanup_context("personal"), false),
+            ("scheduled", true)
+        );
+        assert_eq!(
+            queue.enqueue(cleanup_context("personal"), false),
+            ("running", false)
+        );
+        assert_eq!(
+            queue.enqueue(cleanup_context("organization"), false),
+            ("scheduled", false)
+        );
+        assert_eq!(queue.pending.len(), 2);
+        assert_eq!(queue.pending.pop_front().unwrap().account_scope, "personal");
+        assert_eq!(
+            queue.pending.pop_front().unwrap().account_scope,
+            "organization"
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_requires_backoff_or_explicit_retry() {
+        let mut queue = super::CleanupCoordinator::default();
+        queue.statuses.insert(
+            "personal".to_string(),
+            super::CleanupRecord {
+                progress: super::StorageCleanupProgress {
+                    status: "failed".to_string(),
+                    message: "offline test failure".to_string(),
+                    account_scope: "personal".to_string(),
+                },
+                updated_at: std::time::Instant::now(),
+            },
+        );
+        assert_eq!(
+            queue.enqueue(cleanup_context("personal"), false),
+            ("retry_later", false)
+        );
+        assert_eq!(
+            queue.enqueue(cleanup_context("personal"), true),
+            ("scheduled", true)
+        );
+    }
+
+    #[test]
+    fn cleanup_cooldowns_are_kept_for_each_vault() {
+        let personal = "cooldown-test-personal";
+        let organization = "cooldown-test-organization";
+        assert!(!super::cleanup_within_cooldown(personal));
+        super::mark_cleanup_complete(personal);
+        super::mark_cleanup_complete(organization);
+        assert!(super::cleanup_within_cooldown(personal));
+        assert!(super::cleanup_within_cooldown(organization));
+    }
 
     #[tokio::test]
     async fn admitted_workflow_reuses_lease_when_maintenance_is_queued() {
         let gate = tokio::sync::RwLock::new(());
-        let lease = super::begin_operation_in(&gate).unwrap();
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let lease = super::begin_operation_in(&gate, &generation).await.unwrap();
         let writer = gate.write();
         tokio::pin!(writer);
         // Polling once queues the writer deterministically, without a sleep.
         assert!(futures_util::poll!(writer.as_mut()).is_pending());
-        // This is the previous nested-begin_operation failure: Tokio reserves
-        // admission for the queued writer even while the outer read is held.
-        assert!(super::begin_operation_in(&gate).is_err());
+        let next_reader = super::begin_operation_in(&gate, &generation);
+        tokio::pin!(next_reader);
+        // Ordinary work waits behind the writer instead of failing as busy.
+        assert!(futures_util::poll!(next_reader.as_mut()).is_pending());
 
         async fn nested_step(_lease: &super::EngineLease<'_>, completed: &mut Vec<u8>, step: u8) {
             tokio::task::yield_now().await;
@@ -3014,16 +3221,33 @@ mod tests {
         for step in 0..3 {
             nested_step(&lease, &mut completed, step).await;
             assert!(futures_util::poll!(writer.as_mut()).is_pending());
-            assert!(super::begin_operation_in(&gate).is_err());
+            assert!(futures_util::poll!(next_reader.as_mut()).is_pending());
         }
         assert_eq!(completed, vec![0, 1, 2]);
         drop(lease);
         let maintenance = tokio::time::timeout(std::time::Duration::from_secs(1), writer)
             .await
             .unwrap();
-        assert!(super::begin_operation_in(&gate).is_err());
+        assert!(futures_util::poll!(next_reader.as_mut()).is_pending());
         drop(maintenance);
-        assert!(super::begin_operation_in(&gate).is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(1), next_reader)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_operation_rejects_an_account_changed_while_it_waited() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let gate = tokio::sync::RwLock::new(());
+        let generation = AtomicU64::new(0);
+        let session_change = gate.write().await;
+        let reader = super::begin_operation_in(&gate, &generation);
+        tokio::pin!(reader);
+        assert!(futures_util::poll!(reader.as_mut()).is_pending());
+        generation.fetch_add(1, Ordering::SeqCst);
+        drop(session_change);
+        assert!(reader.await.is_err());
     }
 
     fn sleeping_stream() -> super::StreamSourceCommand {

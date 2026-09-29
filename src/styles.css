@@ -689,6 +689,26 @@ code {
   color: #f2bd72;
   font-size: 0.75rem;
   font-weight: 600;
+  max-width: 100%;
+}
+
+.cleanup-state.failed {
+  color: #ff8d87;
+  background: rgba(255, 105, 97, 0.1);
+}
+
+.cleanup-retry {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.cleanup-retry:disabled {
+  opacity: 0.5;
+  cursor: wait;
 }
 
 .cleanup-dot {

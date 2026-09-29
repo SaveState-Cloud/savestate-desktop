@@ -42,7 +42,8 @@ let explorerManifest = null;     // manifest JSON
 let selectedExplorerFiles = new Set();
 let currentFolder = '/';       // Current folder path in backups view
 let folderList = [];           // Available folders for move/profile dropdowns
-let storageCleanupPending = false;
+let storageCleanupScope = null;
+let storageCleanupStatusRequest = 0;
 const activeToasts = new Map();
 let globalProgressHideTimer = null;
 let pendingBackupErrorToast = null;
@@ -1022,11 +1023,13 @@ function setupTauriListeners() {
 
     listen('storage-cleanup', (event) => {
         const cleanup = event.payload;
-        storageCleanupPending = cleanup.status === 'pending' || cleanup.status === 'running';
-        setStorageCleanupState(
-            storageCleanupPending,
-            cleanup.status === 'pending' ? friendlyError(cleanup.message) : cleanup.message,
-        );
+        if (!storageCleanupScope) {
+            void refreshStorageCleanupStatus();
+            return;
+        }
+        if (cleanup.accountScope !== storageCleanupScope) return;
+        storageCleanupStatusRequest += 1;
+        setStorageCleanupState(cleanup.status, cleanup.message);
 
         if (cleanup.status === 'complete') {
             showToast('Deleted storage cleanup completed', 'success');
@@ -1121,6 +1124,9 @@ function endAuthenticatedSession() {
     authenticatedSessionActive = false;
     serviceWorkspaceReady = false;
     currentAccount = null;
+    storageCleanupScope = null;
+    storageCleanupStatusRequest += 1;
+    setStorageCleanupState('idle', '');
     repositorySessionGeneration += 1;
     repositoryWarmupPromise = null;
     legacyProfileNoticeShown = false;
@@ -1313,6 +1319,9 @@ async function switchWorkspace(workspaceId) {
         await invoke('cmd_switch_account_workspace', { workspaceId });
         serviceWorkspaceReady = true;
         workspaceUiGeneration += 1;
+        storageCleanupScope = null;
+        storageCleanupStatusRequest += 1;
+        setStorageCleanupState('idle', '');
         repositorySessionGeneration += 1;
         repositoryWarmupPromise = null;
         currentAccount = null;
@@ -1649,9 +1658,10 @@ async function loadDashboard() {
             `${restoreUsed.toLocaleString()} bytes this month · unlimited · free`;
 
         const inferredCleanup = storageUsageUi.shouldScheduleCleanup(account.usage, backupState);
-        // A maintenance hint is not a customer-facing storage state. Only show
-        // the badge while a native cleanup job is actually queued or running.
-        setStorageCleanupState(storageCleanupPending);
+        // Read the native queue instead of guessing from physical storage.
+        // This also restores a pending or failed status after UI navigation.
+        await refreshStorageCleanupStatus();
+        if (generation !== workspaceUiGeneration) return;
         if (inferredCleanup) {
             invoke('cmd_schedule_storage_cleanup').catch((error) => {
                 console.warn('Could not schedule storage cleanup:', error);
@@ -1709,13 +1719,48 @@ async function loadDashboard() {
     }
 }
 
-function setStorageCleanupState(pending, message = 'Cleanup pending') {
+async function refreshStorageCleanupStatus() {
+    const request = ++storageCleanupStatusRequest;
+    try {
+        const progress = await invoke('cmd_get_storage_cleanup_status');
+        if (request !== storageCleanupStatusRequest) return;
+        storageCleanupScope = progress.accountScope;
+        setStorageCleanupState(progress.status, progress.message);
+    } catch {
+        if (request !== storageCleanupStatusRequest) return;
+        storageCleanupScope = null;
+        setStorageCleanupState('idle', '');
+    }
+}
+
+function setStorageCleanupState(status, message = '') {
     const state = document.getElementById('cleanup-state');
     const text = document.getElementById('cleanup-state-text');
     if (!state || !text) return;
-    state.classList.toggle('hidden', !pending);
-    text.textContent = pending ? (message || 'Cleanup pending') : '';
+    const visible = status === 'pending' || status === 'running'
+        || status === 'paused' || status === 'failed';
+    state.classList.toggle('hidden', !visible);
+    state.classList.toggle('failed', status === 'failed');
+    text.textContent = visible ? (message || 'Storage cleanup is queued') : '';
+    const retry = document.getElementById('btn-retry-cleanup');
+    if (retry) retry.classList.toggle('hidden', status !== 'failed');
 }
+
+document.getElementById('btn-retry-cleanup')?.addEventListener('click', async () => {
+    const retry = document.getElementById('btn-retry-cleanup');
+    retry.disabled = true;
+    try {
+        const result = await invoke('cmd_schedule_storage_cleanup', { force: true });
+        if (result !== 'scheduled' && result !== 'running') {
+            showToast('Storage cleanup could not be queued. Try again after signing in.', 'error');
+        }
+        await refreshStorageCleanupStatus();
+    } catch (error) {
+        showToast('Storage cleanup could not be queued: ' + friendlyError(error), 'error');
+    } finally {
+        retry.disabled = false;
+    }
+});
 
 // ────────────────────────────────────────────────────────────────
 // Backup helpers
