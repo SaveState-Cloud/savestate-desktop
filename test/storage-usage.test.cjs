@@ -14,6 +14,16 @@ test('confirmed empty backup lists still show the optimized repository footprint
     assert.equal(customerVisibleUsage({ bytes: 242_984_291 }, backupState), 242_984_291);
 });
 
+test('an empty repository under 5 MiB displays zero only when no files are retained', () => {
+    const empty = { backups: [] };
+    assert.equal(customerVisibleUsage({ bytes: 4_321_404, fileCount: 0 }, empty), 0);
+    assert.equal(customerVisibleUsage({ bytes: 5 * 1024 * 1024, fileCount: 0 }, empty), 5 * 1024 * 1024);
+    assert.equal(customerVisibleUsage({ bytes: 4_321_404, fileCount: 1 }, empty), 4_321_404);
+    assert.equal(customerVisibleUsage({ bytes: 4_321_404, fileCount: 0 }, null), 4_321_404);
+    // A snapshot of an empty folder does not count as a retained file.
+    assert.equal(customerVisibleUsage({ bytes: 4_321_404, fileCount: 0 }, { backups: [{ id: 'empty-folder' }] }), 0);
+});
+
 test('customer quota usage uses optimized storage while source bytes remain separate', () => {
     assert.equal(customerVisibleUsage({ bytes: 12_345, sourceBytes: 98_765 }, null), 12_345);
 });
