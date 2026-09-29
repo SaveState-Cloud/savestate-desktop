@@ -256,6 +256,7 @@ fn main() {
             kopia::cmd_kopia_set_retention,
             kopia::cmd_kopia_maintenance,
             kopia::cmd_schedule_storage_cleanup,
+            kopia::cmd_get_storage_cleanup_status,
             // Profiles
             profiles::cmd_create_profile,
             profiles::cmd_update_profile,

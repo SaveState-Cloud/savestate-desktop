@@ -82,6 +82,11 @@ CREATE TABLE IF NOT EXISTS app_metadata (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cleanup_requests (
+    account_scope TEXT PRIMARY KEY,
+    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS byos_vaults (
     id TEXT PRIMARY KEY,
     owner_account TEXT NOT NULL,
@@ -95,6 +100,32 @@ CREATE TABLE IF NOT EXISTS byos_vaults (
 );
 CREATE INDEX IF NOT EXISTS idx_byos_vaults_owner ON byos_vaults(owner_account);
 "#;
+
+pub fn request_cleanup(conn: &Connection, account_scope: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO cleanup_requests (account_scope) VALUES (?1)
+         ON CONFLICT(account_scope) DO UPDATE SET requested_at = CURRENT_TIMESTAMP",
+        params![account_scope],
+    )?;
+    Ok(())
+}
+
+pub fn cleanup_requested(conn: &Connection, account_scope: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cleanup_requests WHERE account_scope = ?1",
+        params![account_scope],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+pub fn clear_cleanup_request(conn: &Connection, account_scope: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM cleanup_requests WHERE account_scope = ?1",
+        params![account_scope],
+    )?;
+    Ok(())
+}
 
 /// Safely add the profile_id column if it doesn't exist yet.
 const MIGRATE_PROFILE_ID: &str = r#"
@@ -1202,6 +1233,23 @@ pub fn save_file_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_intent_survives_reopening_and_is_scoped_to_one_vault() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(database.path()).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            request_cleanup(&conn, "person::service-1").unwrap();
+            request_cleanup(&conn, "person::service-1").unwrap();
+            assert!(cleanup_requested(&conn, "person::service-1").unwrap());
+            assert!(!cleanup_requested(&conn, "person::service-2").unwrap());
+        }
+        let conn = Connection::open(database.path()).unwrap();
+        assert!(cleanup_requested(&conn, "person::service-1").unwrap());
+        clear_cleanup_request(&conn, "person::service-1").unwrap();
+        assert!(!cleanup_requested(&conn, "person::service-1").unwrap());
+    }
 
     fn test_profile() -> BackupProfile {
         BackupProfile {
