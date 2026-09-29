@@ -495,7 +495,7 @@ function setupEventListeners() {
         const retention = parseInt(document.getElementById('profile-retention').value) || 0;
         const vaultId = document.getElementById('profile-vault').value || null;
 
-        if (!name || !sourcePath) { showToast('Name and source path required', 'error'); return; }
+        if (!name || !sourcePath) { showToast('Profile name and folder required', 'error'); return; }
 
         // Validate time forma
         let schedule = null;
@@ -517,10 +517,10 @@ function setupEventListeners() {
                 await invoke('cmd_update_profile', {
                     id: editId, name, sourcePath, schedule, retention, enabled: true, folder: '/', vaultId,
                 });
-                showToast('Backup source updated', 'success');
+                showToast('Profile updated', 'success');
             } else {
                 await invoke('cmd_create_profile', { name, sourcePath, schedule, retention, folder: '/', vaultId });
-                showToast('Backup source added', 'success');
+                showToast('Profile added', 'success');
             }
             closeProfileModal({ returnFocus: false });
             document.getElementById('btn-create-profile').focus();
@@ -537,7 +537,7 @@ function setupEventListeners() {
         const deleteBackups = document.getElementById('profile-delete-backups').checked;
         const button = document.getElementById('btn-confirm-profile-delete');
         button.disabled = true;
-        button.textContent = deleteBackups ? 'Deleting backups…' : 'Deleting source…';
+        button.textContent = deleteBackups ? 'Deleting backups…' : 'Deleting profile…';
         try {
             if (target.kind === 'database') {
                 await invoke('cmd_delete_database_profile', { id: target.id, deleteBackups });
@@ -546,8 +546,8 @@ function setupEventListeners() {
             }
             closeProfileDeleteModal();
             showToast(deleteBackups
-                ? (target.vaultId ? 'Source restore points were deleted from your bucket.' : 'Source folder and its remaining backups were deleted.')
-                : (target.vaultId ? 'Source deleted. Backups in your bucket were preserved.' : 'Source deleted. Its backup folder was preserved.'), 'success');
+                ? (target.vaultId ? 'Profile restore points were deleted from your bucket.' : "Profile's backup folder and its remaining backups were deleted.")
+                : (target.vaultId ? 'Profile deleted. Backups in your bucket were preserved.' : 'Profile deleted. Its backup folder was preserved.'), 'success');
             if (target.kind === 'database') {
                 void loadDatabaseProfiles();
             } else {
@@ -557,7 +557,7 @@ function setupEventListeners() {
             showToast(friendlyError(error), 'error');
         } finally {
             button.disabled = false;
-            button.textContent = 'Delete source';
+            button.textContent = 'Delete profile';
         }
     });
 
@@ -1101,7 +1101,7 @@ async function checkAuthStatus() {
                 invoke('cmd_count_unowned_profiles')
                     .then((count) => {
                         if (Number(count) > 0) {
-                            showToast('Existing backup sources are paused until you assign them to an account from Vaults.', 'info');
+                            showToast('Existing profiles are paused until you assign them to an account from Vaults.', 'info');
                         }
                     })
                     .catch(() => {});
@@ -1245,11 +1245,11 @@ function selectVault(vaultId) {
         ? 'Browse backups' : 'Restore points';
     document.getElementById('btn-create-profile').disabled = true;
     document.getElementById('vault-source-count').textContent = 'Loading…';
-    document.getElementById('custom-vault-dashboard-count').textContent = 'Loading backup sources…';
+    document.getElementById('custom-vault-dashboard-count').textContent = 'Loading profiles…';
     document.getElementById('byos-form').classList.add('hidden');
     document.getElementById('vault-detail-title').textContent = availableVaults().find(vault => vault.id === vaultId)?.label || 'Vault';
-    document.getElementById('vault-detail-subtitle').textContent = 'Loading backup sources…';
-    document.getElementById('profiles-list').textContent = 'Loading backup sources…';
+    document.getElementById('vault-detail-subtitle').textContent = 'Loading profiles…';
+    document.getElementById('profiles-list').textContent = 'Loading profiles…';
     setWorkspaceMenuOpen(false);
     renderWorkspaceSwitcher();
     syncVaultContextUi();
@@ -1293,12 +1293,12 @@ function renderCustomVaultDashboard(profiles, loadError = null) {
     if (!selectedVaultId || selectedVaultId === vaultModel.MANAGED_VAULT_ID) return;
     const status = document.getElementById('custom-vault-dashboard-count');
     if (loadError) {
-        status.textContent = `Could not load backup sources: ${friendlyError(loadError)}`;
+        status.textContent = `Could not load profiles: ${friendlyError(loadError)}`;
         return;
     }
     const sources = vaultModel.profilesInVault(profiles, selectedVaultId);
     const scheduled = sources.filter(profile => profile.enabled && String(profile.schedule || '').trim()).length;
-    status.textContent = `${sources.length} backup source${sources.length === 1 ? '' : 's'} · ${scheduled} scheduled`;
+    status.textContent = `${sources.length} profile${sources.length === 1 ? '' : 's'} · ${scheduled} scheduled`;
 }
 
 async function switchWorkspace(workspaceId) {
@@ -3026,11 +3026,11 @@ function openProfileDeleteModal(profile, kind) {
     document.getElementById('profile-delete-copy').textContent = kind === 'database'
         ? `The database connection and saved password will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every restore point.`
         : profile.vault_id
-            ? 'The source and schedule will be removed. Leave the option unchecked to keep every restore point in your own bucket.'
-            : `The source and schedule will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every backup.`;
+            ? 'The profile and schedule will be removed. Leave the option unchecked to keep every restore point in your own bucket.'
+            : `The profile and schedule will be removed. Leave the option below unchecked to keep ${profile.folder || 'its backup folder'} and every backup.`;
     document.querySelector('#profile-delete-backups + span small').textContent = profile.vault_id
-        ? 'Deletes restore points tagged to this source from your own bucket. Other bucket contents remain untouched.'
-        : 'Only versions still inside this source folder are deleted. Backups moved elsewhere are preserved.';
+        ? 'Deletes restore points tagged to this profile from your own bucket. Other bucket contents remain untouched.'
+        : "Only versions still inside this profile's backup folder are deleted. Backups moved elsewhere are preserved.";
     document.getElementById('profile-delete-backups').checked = false;
     document.getElementById('profile-delete-modal').classList.remove('hidden');
 }
@@ -3081,8 +3081,8 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
                 : 'An eligible plan is required for new custom-vault backups. You can reconnect an existing custom vault to restore files.';
     const vaults = availableVaults(profiles, databases);
     const countLabel = vault => countsPending
-        ? 'Loading backup sources…'
-        : `${vault.sourceCount} backup source${vault.sourceCount === 1 ? '' : 's'}`
+        ? 'Loading profiles…'
+        : `${vault.sourceCount} profile${vault.sourceCount === 1 ? '' : 's'}`
             + (vault.managed ? ` · ${vault.databaseCount} database backup${vault.databaseCount === 1 ? '' : 's'}` : '')
             + ` · ${vault.scheduledCount} scheduled`;
     const signature = JSON.stringify(vaults.map(vault => [
@@ -3135,7 +3135,7 @@ function renderVaultOverview(profiles, databases, entitlement, vaultError, planP
             remove.textContent = 'Disconnect';
             remove.setAttribute('aria-label', `Disconnect ${vault.label}`);
             remove.addEventListener('click', async () => {
-                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its ${vault.provider === 'filesystem' ? 'drive folder' : 'bucket'} and every backup stay untouched. Remove its backup sources first.`, { title: 'Disconnect vault' });
+                const accepted = await confirmDialog(`Disconnect ${vault.label} on this PC? Its ${vault.provider === 'filesystem' ? 'drive folder' : 'bucket'} and every backup stay untouched. Remove its profiles first.`, { title: 'Disconnect vault' });
                 if (!accepted) return;
                 try {
                     await invoke('cmd_byos_remove_vault', { vaultId: vault.id });
@@ -3243,10 +3243,10 @@ async function loadProfiles({ remoteResults = null } = {}) {
             document.getElementById('profile-limit-summary').textContent = !resolvedRemote
                 ? 'Checking your automated-schedule allowance…'
                 : profileLimit === null
-                ? 'Schedule allowance could not be checked right now. Existing sources are shown below.'
-                : `${[...profiles, ...databases].filter(profile => profile.enabled && String(profile.schedule || '').trim()).length} of ${profileLimit} automated schedules in use across file sources and databases. Manual-only sources do not count.`;
+                ? 'Schedule allowance could not be checked right now. Existing profiles are shown below.'
+                : `${[...profiles, ...databases].filter(profile => profile.enabled && String(profile.schedule || '').trim()).length} of ${profileLimit} automated schedules in use across file profiles and databases. Manual-only profiles do not count.`;
             const selectedProfiles = vaultModel.profilesInVault(profiles, selectedVaultId);
-            document.getElementById('vault-source-count').textContent = `${selectedProfiles.length} source${selectedProfiles.length === 1 ? '' : 's'}`;
+            document.getElementById('vault-source-count').textContent = `${selectedProfiles.length} profile${selectedProfiles.length === 1 ? '' : 's'}`;
             document.getElementById('vault-database-section').classList.toggle('hidden', !selectedVault.managed);
             document.getElementById('vault-database-summary').textContent = `${databases.length} database backup${databases.length === 1 ? '' : 's'} in Cloud - Personal · ${databases.filter(profile => profile.enabled && String(profile.schedule || '').trim()).length} scheduled`;
             if (visibleSnapshotVaultId !== selectedVaultId) document.getElementById('byos-snapshots').classList.add('hidden');
@@ -3298,7 +3298,7 @@ async function loadProfiles({ remoteResults = null } = {}) {
         if (profilesResult.status === 'rejected') {
             const error = document.createElement('p');
             error.className = 'text-muted';
-            error.textContent = `Could not load backup sources: ${friendlyError(profilesResult.reason)}`;
+            error.textContent = `Could not load profiles: ${friendlyError(profilesResult.reason)}`;
             container.appendChild(error);
             return;
         }
@@ -3308,12 +3308,12 @@ async function loadProfiles({ remoteResults = null } = {}) {
             const empty = document.createElement('div');
             empty.className = 'vault-empty';
             empty.textContent = !resolvedRemote
-                ? 'Checking your plan. Existing sources and restore points remain available.'
+                ? 'Checking your plan. Existing profiles and restore points remain available.'
                 : canBackupSelectedVault
-                ? 'No backup sources in this vault yet. Add a folder and give it a schedule, or leave it manual-only.'
+                ? 'No profiles in this vault yet. Add a folder and give it a schedule, or leave it manual-only.'
                 : selectedVault?.managed
                     ? 'Cloud - Personal backups require an active SaveState plan.'
-                    : 'No backup sources in this vault. Existing customer-owned restore points can still be opened above.';
+                    : 'No profiles in this vault. Existing customer-owned restore points can still be opened above.';
             container.appendChild(empty);
             return;
         }
@@ -3349,7 +3349,7 @@ async function loadProfiles({ remoteResults = null } = {}) {
                 </div>
                 <div class="profile-meta">
                     <div class="profile-meta-item">
-                        <span class="meta-label">Source</span>
+                        <span class="meta-label">Folder</span>
                         <span class="meta-value" title="${escapeHtml(p.source_path)}">${escapeHtml(shortenPath(p.source_path))}</span>
                     </div>
                     <div class="profile-meta-item">
@@ -3461,11 +3461,11 @@ async function openProfileModal(profile = null, vaultId = selectedVaultId) {
     picker.value = destinationId || '';
     document.getElementById('profile-vault-name').value = destination?.label || 'Cloud - Personal';
     document.getElementById('profile-vault-help').textContent = profile
-        ? 'This source stays in its original vault. Create another source to back up to a different vault.'
-        : 'This source and its restore points will belong to this vault.';
+        ? 'This profile stays in its original vault. Create another profile to back up to a different vault.'
+        : 'This profile and its restore points will belong to this vault.';
 
     if (profile) {
-        title.textContent = 'Edit Backup Source';
+        title.textContent = 'Edit profile';
         document.getElementById('profile-edit-id').value = profile.id;
         document.getElementById('profile-name').value = profile.name;
         document.getElementById('profile-source').value = profile.source_path;
@@ -3486,7 +3486,7 @@ async function openProfileModal(profile = null, vaultId = selectedVaultId) {
         }
         document.getElementById('profile-retention').value = profile.retention || 0;
     } else {
-        title.textContent = 'Add Backup Source';
+        title.textContent = 'Add profile';
         form.reset();
         document.getElementById('profile-edit-id').value = '';
         document.getElementById('profile-schedule-interval').value = 1;
@@ -3509,7 +3509,7 @@ function updateScheduleTimePreview() {
 
     const rawTimes = timesInput.value.split(',').map(value => value.trim()).filter(Boolean);
     if (rawTimes.length === 0) {
-        help.textContent = 'Leave blank to run this source manually. UTC equivalents appear here after you enter a time.';
+        help.textContent = 'Leave blank to run this profile manually. UTC equivalents appear here after you enter a time.';
         return;
     }
 

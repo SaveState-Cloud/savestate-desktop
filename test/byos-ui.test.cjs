@@ -10,7 +10,7 @@ const app = read('src', 'app.js');
 const native = read('src-tauri', 'src', 'byos.rs');
 const profiles = read('src-tauri', 'src', 'profiles.rs');
 
-test('Vaults own customer storage, backup sources, and schedules', () => {
+test('Vaults own customer storage, profiles, and schedules', () => {
   assert.match(html, /id="vault-overview"/);
   assert.match(html, /id="vault-detail"/);
   assert.match(html, /id="byos-form"/);
@@ -75,12 +75,23 @@ test('vault creation is not numerically capped and plan-check errors are distinc
   assert.match(app, /if \(signature === lastVaultRowsSignature\)/);
 });
 
-test('backup-source dialog moves and contains keyboard focus', () => {
+test('profile dialog moves and contains keyboard focus', () => {
   assert.match(html, /class="modal glass-card" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title"/);
   assert.match(app, /profileModalReturnFocus = document\.activeElement/);
   assert.match(app, /document\.getElementById\('profile-name'\)\.focus\(\)/);
   assert.match(app, /document\.getElementById\('profile-modal'\)\.addEventListener\('keydown'/);
   assert.match(app, /if \(event\.key === 'Escape'\)/);
+});
+
+test('file-backup navigation and dialogs use the Profiles label', () => {
+  assert.match(html, /data-view="profiles"[\s\S]*?<span>Profiles<\/span>/);
+  assert.match(html, /id="btn-create-profile"[\s\S]*?Add profile/);
+  assert.match(html, /id="profile-modal-title">Add profile<\/h3>/);
+  assert.match(html, /id="profile-delete-title">Delete profile\?<\/h3>/);
+  assert.match(app, /title\.textContent = 'Edit profile'/);
+  assert.match(app, /title\.textContent = 'Add profile'/);
+  assert.doesNotMatch(html, /backup sources?/i);
+  assert.doesNotMatch(app, /backup sources?/i);
 });
 
 test('the visible profile page refreshes after background scheduled backups', () => {

@@ -17,7 +17,7 @@ test('Cloud - Personal is always the first vault and keeps legacy null destinati
   assert.deepEqual(vaults.profilesInVault([{ vault_id: null }, { vault_id: 'b2-1' }], 'b2-1'), [{ vault_id: 'b2-1' }]);
 });
 
-test('disabled or manual-only sources do not consume the scheduled count', () => {
+test('disabled or manual-only profiles do not consume the scheduled count', () => {
   const result = vaults.vaultsWithCounts([], [
     { vault_id: null, enabled: false, schedule: '{"times":["10:00"]}' },
     { vault_id: null, enabled: true, schedule: '' },
@@ -27,7 +27,7 @@ test('disabled or manual-only sources do not consume the scheduled count', () =>
   assert.equal(result[0].scheduledCount, 0);
 });
 
-test('a custom vault holds multiple scheduled backup sources', () => {
+test('a custom vault holds multiple scheduled profiles', () => {
   const profiles = [
     { id: 'documents', vault_id: 'b2-1', enabled: true, schedule: '{"times":["09:00"]}' },
     { id: 'photos', vault_id: 'b2-1', enabled: true, schedule: '{"times":["18:00"]}' },

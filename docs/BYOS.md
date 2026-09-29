@@ -19,14 +19,14 @@ available in an installed release until a new installer is published.
    storage-provider validation before the vault is saved. A new drive vault
    gets an ID marker in its folder so a later drive-letter collision cannot
    silently initialize a repository on a different disk.
-4. Select a vault in the lower-left corner and add one or more file/folder backup sources. Each source
+4. Select a vault in the lower-left corner and add one or more file/folder profiles. Each profile
    can have its own local-time schedule and retention or be manual-only. Its
-   destination is fixed after creation; add another source to back up the same
+   destination is fixed after creation; add another profile to back up the same
    folder to a different vault without moving its existing restore points.
-5. Run a source in its vault. Use **Restore points** inside a custom vault to
+5. Run a profile in its vault. Use **Restore points** inside a custom vault to
    browse snapshots directly from its bucket and restore into a new local
    folder. **Browse backups** inside Cloud - Personal opens the managed backup
-   browser. Custom vaults have their own dashboard and source list; managed-only
+   browser. Custom vaults have their own dashboard and profile list; managed-only
    database and quick-backup pages are not shown while one is selected.
    Disconnecting a custom vault never deletes its bucket or drive data.
 

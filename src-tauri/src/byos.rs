@@ -159,7 +159,7 @@ fn ensure_source_outside_vault(source: &Path, session: &RepoSession) -> Result<(
     let Some(folder) = session.local_path.as_deref() else {
         return Ok(());
     };
-    let source = fs::canonicalize(source).context("Backup source is no longer available")?;
+    let source = fs::canonicalize(source).context("Backup folder is no longer available")?;
     let destination =
         fs::canonicalize(folder).context("External vault drive is no longer available")?;
     let source = source.to_string_lossy().to_ascii_lowercase();
@@ -175,7 +175,7 @@ fn ensure_source_outside_vault(source: &Path, session: &RepoSession) -> Result<(
         || source.starts_with(&prefix(&destination))
         || destination.starts_with(&prefix(&source))
     {
-        bail!("Choose a backup source outside this vault's storage folder so it cannot back itself up");
+        bail!("Choose a backup folder outside this vault's storage folder so it cannot back itself up");
     }
     Ok(())
 }
