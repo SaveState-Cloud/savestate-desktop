@@ -27,6 +27,8 @@ const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 struct StoredSession {
     email: String,
     token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     master_key: String,
     #[serde(default)]
     key_id: Option<String>,
@@ -44,14 +46,32 @@ fn credential_entry() -> Result<keyring::v1::Entry> {
     .context("Windows Credential Manager is unavailable")
 }
 
-fn save_session(email: &str, token: &str, master_key: &[u8; 32]) -> Result<()> {
+fn session_storage_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn save_session(
+    email: &str,
+    token: &str,
+    refresh_token: Option<String>,
+    master_key: &[u8; 32],
+) -> Result<()> {
+    let _storage = session_storage_lock()
+        .lock()
+        .map_err(|_| anyhow!("Session storage lock failed"))?;
     let session = StoredSession {
         email: email.to_string(),
         token: token.to_string(),
+        refresh_token,
         master_key: hex::encode(master_key),
         key_id: Some(master_key_id(master_key)),
     };
-    let json = serde_json::to_vec(&session)?;
+    write_session(&session)
+}
+
+fn write_session(session: &StoredSession) -> Result<()> {
+    let json = serde_json::to_vec(session)?;
     credential_entry()?
         .set_secret(&json)
         .context("Failed to save the remembered session securely")?;
@@ -60,6 +80,11 @@ fn save_session(email: &str, token: &str, master_key: &[u8; 32]) -> Result<()> {
 }
 
 fn load_session() -> Option<(StoredSession, [u8; 32])> {
+    let _storage = session_storage_lock().lock().ok()?;
+    load_session_unlocked()
+}
+
+fn load_session_unlocked() -> Option<(StoredSession, [u8; 32])> {
     let data = credential_entry().ok()?.get_secret().ok()?;
     let session: StoredSession = serde_json::from_slice(&data).ok()?;
     let decoded = hex::decode(&session.master_key).ok()?;
@@ -75,6 +100,9 @@ fn load_session() -> Option<(StoredSession, [u8; 32])> {
 }
 
 fn clear_persisted_session() {
+    let Ok(_storage) = session_storage_lock().lock() else {
+        return;
+    };
     if let Ok(entry) = credential_entry() {
         let _ = entry.delete_credential();
     }
@@ -86,13 +114,50 @@ pub(crate) fn refresh_remembered_session_token(
     token: &str,
     master_key: &[u8; 32],
 ) -> Result<()> {
-    let Some((stored, _)) = load_session() else {
+    let _storage = session_storage_lock()
+        .lock()
+        .map_err(|_| anyhow!("Session storage lock failed"))?;
+    let Some((mut stored, _)) = load_session_unlocked() else {
         return Ok(());
     };
     if !stored.email.trim().eq_ignore_ascii_case(email.trim()) {
         return Ok(());
     }
-    save_session(email, token, master_key)
+    stored.email = email.to_string();
+    stored.token = token.to_string();
+    stored.master_key = hex::encode(master_key);
+    stored.key_id = Some(master_key_id(master_key));
+    write_session(&stored)
+}
+
+fn renew_stored_session(
+    stored: &mut StoredSession,
+    previous_token: &str,
+    renewed: &crate::api::SessionCredentials,
+) -> bool {
+    // A completed request from an old account/workspace must never overwrite a new login.
+    if stored.token != previous_token {
+        return false;
+    }
+    stored.token = renewed.token.clone();
+    stored.refresh_token = renewed.refresh_token.clone();
+    true
+}
+
+pub(crate) fn persist_session_renewal(
+    previous_token: &str,
+    renewed: &crate::api::SessionCredentials,
+) -> Result<()> {
+    let _storage = session_storage_lock()
+        .lock()
+        .map_err(|_| anyhow!("Session storage lock failed"))?;
+    let Some((mut stored, _)) = load_session_unlocked() else {
+        return Ok(());
+    };
+    if renew_stored_session(&mut stored, previous_token, renewed) {
+        write_session(&stored)?;
+    }
+    Ok(())
 }
 
 // Legacy password wrapper (read compatibility and initialize-once fallback).
@@ -626,14 +691,16 @@ fn install_authenticated_state(
     master_key: [u8; 32],
     remember_me: bool,
 ) -> Result<()> {
-    let token = api
-        .token
-        .as_deref()
-        .ok_or_else(|| anyhow!("The account session has no token"))?;
+    let credentials = api.session_credentials()?;
     let mut guard = state.0.lock().map_err(|e| anyhow!("Lock error: {e}"))?;
     let _session_change = crate::backup_operations::begin_session_change()?;
     if remember_me {
-        save_session(email, token, &master_key)?;
+        save_session(
+            email,
+            &credentials.token,
+            credentials.refresh_token,
+            &master_key,
+        )?;
     } else {
         clear_persisted_session();
     }
@@ -1076,6 +1143,7 @@ pub fn try_restore_session(state: &AppStateWrapper) {
     if let Some((session, master_key)) = load_session() {
         if let Ok(mut guard) = state.0.lock() {
             guard.api.set_token(session.token);
+            let _ = guard.api.set_refresh_token(session.refresh_token);
             guard.email = Some(session.email.trim().to_ascii_lowercase());
             guard.master_key = Some(master_key);
             guard.session_generation = guard.session_generation.wrapping_add(1);
@@ -1086,6 +1154,35 @@ pub fn try_restore_session(state: &AppStateWrapper) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_preserves_vault_key_and_cannot_overwrite_another_session() {
+        let mut stored: StoredSession = serde_json::from_value(serde_json::json!({
+            "email": "owner@example.com", "token": "old", "master_key": "unchanged-key",
+            "key_id": "unchanged-id"
+        }))
+        .unwrap();
+        assert!(
+            stored.refresh_token.is_none(),
+            "old Credential Manager records remain readable"
+        );
+        let renewed = crate::api::SessionCredentials {
+            token: "new".into(),
+            refresh_token: Some("renewed-device-credential".into()),
+        };
+        assert!(!renew_stored_session(
+            &mut stored,
+            "different-login",
+            &renewed
+        ));
+        assert_eq!(stored.token, "old");
+        assert!(renew_stored_session(&mut stored, "old", &renewed));
+        assert_eq!(stored.token, "new");
+        assert_eq!(stored.refresh_token, renewed.refresh_token);
+        assert_eq!(stored.master_key, "unchanged-key");
+        assert_eq!(stored.key_id.as_deref(), Some("unchanged-id"));
+        assert_eq!(stored.email, "owner@example.com");
+    }
 
     #[test]
     fn legacy_master_key_wrapper_remains_compatible() {

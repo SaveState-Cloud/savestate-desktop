@@ -25,6 +25,8 @@ fn compiled_environment() -> &'static str {
 pub struct LoginResponse {
     pub token: String,
     #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
     pub email: Option<String>,
     pub encrypted_master_key: Option<String>,
     #[serde(default)]
@@ -411,6 +413,28 @@ pub struct SaveStateClient {
     pub installation_id: String,
     client: Client,
     transfer_client: Client,
+    // Shared by scheduler/UI clones; switching identity/workspace detaches it.
+    credentials: Arc<Mutex<SessionCredentials>>,
+    renewal: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionCredentials {
+    pub token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+fn token_claims(token: &str) -> Option<serde_json::Value> {
+    let decoded = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn access_token_is_fresh(token: &str, now: i64) -> bool {
+    token_claims(token)
+        .and_then(|claims| claims.get("exp")?.as_i64())
+        .is_some_and(|expires| expires > now.saturating_add(300))
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -502,6 +526,8 @@ impl SaveStateClient {
         Self {
             base_url: compiled_api_base_url().to_string(),
             token: None,
+            credentials: Arc::new(Mutex::new(SessionCredentials::default())),
+            renewal: Arc::new(tokio::sync::Mutex::new(())),
             installation_id,
             client: Client::builder()
                 .default_headers(default_headers)
@@ -520,11 +546,44 @@ impl SaveStateClient {
     }
 
     pub fn set_token(&mut self, token: String) {
+        let refresh_token = self
+            .token
+            .as_deref()
+            .and_then(token_claims)
+            .and_then(|old| {
+                let new = token_claims(&token)?;
+                (old.get("sub") == new.get("sub")
+                    && old.get("authVersion") == new.get("authVersion"))
+                .then(|| self.session_credentials().ok()?.refresh_token)
+                .flatten()
+            });
+        self.credentials = Arc::new(Mutex::new(SessionCredentials {
+            token: token.clone(),
+            refresh_token,
+        }));
+        self.renewal = Arc::new(tokio::sync::Mutex::new(()));
         self.token = Some(token);
     }
 
     pub fn clear_token(&mut self) {
         self.token = None;
+        self.credentials = Arc::new(Mutex::new(SessionCredentials::default()));
+        self.renewal = Arc::new(tokio::sync::Mutex::new(()));
+    }
+
+    pub(crate) fn session_credentials(&self) -> Result<SessionCredentials> {
+        self.credentials
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| anyhow!("Session credential lock failed"))
+    }
+
+    pub(crate) fn set_refresh_token(&mut self, token: Option<String>) -> Result<()> {
+        self.credentials
+            .lock()
+            .map_err(|_| anyhow!("Session credential lock failed"))?
+            .refresh_token = token;
+        Ok(())
     }
 
     pub fn workspace_id(&self) -> Option<String> {
@@ -548,11 +607,64 @@ impl SaveStateClient {
         (service_id > 0).then(|| format!("service:{service_id}"))
     }
 
-    fn auth_header(&self) -> Result<String> {
-        self.token
-            .as_ref()
-            .map(|t| format!("Bearer {}", t))
-            .ok_or_else(|| anyhow!("Not authenticated"))
+    async fn auth_header(&self) -> Result<String> {
+        if self.token.is_none() {
+            return Err(anyhow!("Not authenticated"));
+        }
+        let credentials = self.session_credentials()?;
+        // Existing installations keep working until their old access token expires.
+        // A new password login is required once to establish the persistent credential.
+        if credentials.refresh_token.is_none() {
+            return Ok(format!("Bearer {}", credentials.token));
+        }
+        if access_token_is_fresh(&credentials.token, chrono::Utc::now().timestamp()) {
+            return Ok(format!("Bearer {}", credentials.token));
+        }
+        // Only one renewal across all clones, including simultaneous UI and backup work.
+        let _renewal = self.renewal.lock().await;
+        let credentials = self.session_credentials()?;
+        if access_token_is_fresh(&credentials.token, chrono::Utc::now().timestamp()) {
+            return Ok(format!("Bearer {}", credentials.token));
+        }
+        let claims = token_claims(&credentials.token)
+            .ok_or_else(|| anyhow!("Invalid account session (401)"))?;
+        let response = self
+            .client
+            .post(format!("{}/auth/refresh", self.base_url))
+            .json(&serde_json::json!({
+                "refreshToken": credentials.refresh_token,
+                "serviceId": claims.get("serviceId"),
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("Could not renew session; check your connection")?;
+        let status = response.status();
+        if !status.is_success() {
+            // Network/server failures never erase credentials or masquerade as revocation.
+            return Err(anyhow!("Session renewal failed ({status})"));
+        }
+        let renewed: SessionCredentials = response
+            .json()
+            .await
+            .context("Invalid session renewal response")?;
+        let new_claims =
+            token_claims(&renewed.token).ok_or_else(|| anyhow!("Invalid renewed account token"))?;
+        if new_claims.get("sub") != claims.get("sub")
+            || new_claims.get("serviceId") != claims.get("serviceId")
+            || new_claims.get("authVersion") != claims.get("authVersion")
+            || !access_token_is_fresh(&renewed.token, chrono::Utc::now().timestamp())
+            || renewed.refresh_token.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(anyhow!("Session renewal changed the account or workspace"));
+        }
+        #[cfg(not(test))]
+        crate::auth::persist_session_renewal(&credentials.token, &renewed)?;
+        *self
+            .credentials
+            .lock()
+            .map_err(|_| anyhow!("Session credential lock failed"))? = renewed.clone();
+        Ok(format!("Bearer {}", renewed.token))
     }
 
     pub async fn inspect_organization_installation(
@@ -565,7 +677,7 @@ impl SaveStateClient {
                 "{}/organization/installations/inspect",
                 self.base_url
             ))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .json(&serde_json::json!({ "token": setup_token }))
             .send()
             .await
@@ -582,7 +694,7 @@ impl SaveStateClient {
                 "{}/organization/installations/available",
                 self.base_url
             ))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .send()
             .await
             .context("Failed to find organization installations for this account")?;
@@ -599,7 +711,7 @@ impl SaveStateClient {
                 "{}/organization/installations/connect",
                 self.base_url
             ))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .json(&serde_json::json!({
                 "installationId": installation_id,
                 "deviceId": self.installation_id,
@@ -620,7 +732,7 @@ impl SaveStateClient {
                 "{}/organization/installations/redeem",
                 self.base_url
             ))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .json(&serde_json::json!({
                 "token": setup_token,
                 "deviceId": self.installation_id,
@@ -677,7 +789,7 @@ impl SaveStateClient {
         error_message: Option<&str>,
         started_at: &str,
     ) {
-        let Ok(auth) = self.auth_header() else { return };
+        let api = self.clone();
         let client = self.client.clone();
         let url = format!("{}/engine/jobs", self.base_url);
         let occurred_at = chrono::Utc::now().to_rfc3339();
@@ -700,6 +812,9 @@ impl SaveStateClient {
             },
         });
         tokio::spawn(async move {
+            let Ok(auth) = api.auth_header().await else {
+                return;
+            };
             let _ = client
                 .post(url)
                 .header("Authorization", auth)
@@ -718,7 +833,7 @@ impl SaveStateClient {
         &self,
         schedules: Vec<EngineScheduleSnapshot>,
     ) -> Result<()> {
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let url = format!("{}/engine/schedules", self.base_url);
         let body = serde_json::json!({ "schedules": schedules });
         let response = self
@@ -743,6 +858,7 @@ impl SaveStateClient {
         let body = serde_json::json!({
             "email": email,
             "password": password,
+            "persistentSession": true,
         });
 
         let resp = self
@@ -770,7 +886,8 @@ impl SaveStateClient {
             .json()
             .await
             .context("Failed to parse login response")?;
-        self.token = Some(login_resp.token.clone());
+        self.set_token(login_resp.token.clone());
+        self.set_refresh_token(login_resp.refresh_token.clone())?;
         Ok(login_resp)
     }
 
@@ -778,7 +895,7 @@ impl SaveStateClient {
 
     pub async fn get_account(&self) -> Result<AccountResponse> {
         let url = format!("{}/account", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -801,7 +918,7 @@ impl SaveStateClient {
 
     pub async fn get_entitlements(&self) -> Result<EntitlementResponse> {
         let url = format!("{}/account/entitlements", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let response = self
             .client
             .get(&url)
@@ -816,7 +933,7 @@ impl SaveStateClient {
         let response = self
             .client
             .get(format!("{}/account/workspaces", self.base_url))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .send()
             .await
             .context("Failed to fetch account workspaces")?;
@@ -830,7 +947,7 @@ impl SaveStateClient {
         let response = self
             .client
             .post(format!("{}/account/workspaces/switch", self.base_url))
-            .header("Authorization", self.auth_header()?)
+            .header("Authorization", self.auth_header().await?)
             .json(&serde_json::json!({ "workspaceId": workspace_id }))
             .send()
             .await
@@ -845,7 +962,7 @@ impl SaveStateClient {
     /// `mode` is "backup" (read/write) or "restore" (read-only).
     pub async fn repo_session(&self, mode: &str, grant_id: Option<&str>) -> Result<RepoSession> {
         let url = format!("{}/repo/session", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -877,7 +994,7 @@ impl SaveStateClient {
         bytes: u64,
     ) -> Result<RestoreAuthorization> {
         let url = format!("{}/restore/authorize", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -918,7 +1035,7 @@ impl SaveStateClient {
 
     pub async fn enforce_retention(&self) -> Result<RetentionResult> {
         let url = format!("{}/backup/enforce-retention", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -949,7 +1066,7 @@ impl SaveStateClient {
         folder: Option<&str>,
     ) -> Result<PresignResponse> {
         let url = format!("{}/backup/presign", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let mut body = serde_json::json!({
             "filename": filename,
@@ -990,7 +1107,7 @@ impl SaveStateClient {
         folder: Option<&str>,
     ) -> Result<MultipartCreateResponse> {
         let url = format!("{}/backup/multipart/create", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let mut body = serde_json::json!({
             "filename": filename,
@@ -1026,7 +1143,7 @@ impl SaveStateClient {
         part_number: u32,
     ) -> Result<MultipartPresignResponse> {
         let url = format!("{}/backup/multipart/presign-part", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let body = serde_json::json!({
             "key": key,
@@ -1059,7 +1176,7 @@ impl SaveStateClient {
         parts: Vec<MultipartPart>,
     ) -> Result<()> {
         let url = format!("{}/backup/multipart/complete", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let body = serde_json::json!({
             "key": key,
@@ -1091,7 +1208,7 @@ impl SaveStateClient {
         content_type: &str,
     ) -> Result<PresignResponse> {
         let url = format!("{}/backup/manifest/upload", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let body = serde_json::json!({
             "exactKey": exact_key,
@@ -1120,7 +1237,7 @@ impl SaveStateClient {
 
     pub async fn list_backups(&self) -> Result<BackupListResponse> {
         let url = format!("{}/backup/list", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1145,7 +1262,7 @@ impl SaveStateClient {
 
     pub async fn presign_download(&self, key: &str) -> Result<DownloadResponse> {
         let url = format!("{}/backup/presign-download", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let body = serde_json::json!({ "key": key });
 
@@ -1173,7 +1290,7 @@ impl SaveStateClient {
 
     pub async fn delete_backup(&self, key: &str) -> Result<()> {
         let url = format!("{}/backup/{}", self.base_url, key);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1196,7 +1313,7 @@ impl SaveStateClient {
 
     pub async fn cancel_subscription(&self) -> Result<CancelResponse> {
         let url = format!("{}/account/cancel", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1219,7 +1336,7 @@ impl SaveStateClient {
 
     pub async fn resume_subscription(&self) -> Result<serde_json::Value> {
         let url = format!("{}/account/resume", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1378,7 +1495,7 @@ impl SaveStateClient {
     /// Upload the encrypted master key to the server for safekeeping.
     pub async fn save_master_key(&self, encrypted_key: &str) -> Result<()> {
         let url = format!("{}/auth/master-key", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let body = serde_json::json!({ "encryptedMasterKey": encrypted_key });
 
         let resp = self
@@ -1400,7 +1517,7 @@ impl SaveStateClient {
     /// Retrieve the encrypted master key from the server.
     pub async fn get_master_key(&self) -> Result<MasterKeyResponse> {
         let url = format!("{}/auth/master-key", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1428,7 +1545,7 @@ impl SaveStateClient {
         verifier: &str,
     ) -> Result<MasterKeyEnvelopeWriteResponse> {
         let url = format!("{}/auth/master-key-envelope", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let envelope_value: serde_json::Value =
             serde_json::from_str(envelope).context("Invalid master-key envelope JSON")?;
         let resp = self
@@ -1454,7 +1571,7 @@ impl SaveStateClient {
         verifier: &str,
     ) -> Result<MasterKeyEnvelopeWriteResponse> {
         let url = format!("{}/auth/master-key-envelope", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let envelope_value: serde_json::Value =
             serde_json::from_str(envelope).context("Invalid master-key envelope JSON")?;
         let resp = self
@@ -1474,7 +1591,7 @@ impl SaveStateClient {
 
     pub async fn get_master_key_envelope(&self) -> Result<MasterKeyEnvelopeResponse> {
         let url = format!("{}/auth/master-key-envelope", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .get(&url)
@@ -1490,7 +1607,7 @@ impl SaveStateClient {
     /// Persist notification / webhook settings server-side.
     pub async fn save_settings(&self, settings: &UserSettings) -> Result<()> {
         let url = format!("{}/account/settings", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1511,7 +1628,7 @@ impl SaveStateClient {
     /// Fetch the user's settings from the server.
     pub async fn get_settings(&self) -> Result<UserSettings> {
         let url = format!("{}/account/settings", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1538,7 +1655,7 @@ impl SaveStateClient {
         notification: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let url = format!("{}/notifications/send", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1572,7 +1689,7 @@ impl SaveStateClient {
     /// Fetch the manifest JSON for a given backup key.
     pub async fn get_manifest(&self, key: &str) -> Result<serde_json::Value> {
         let url = format!("{}/backup/manifest", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let body = serde_json::json!({ "key": key });
 
         let resp = self
@@ -1600,7 +1717,7 @@ impl SaveStateClient {
         parent_folder: &str,
     ) -> Result<serde_json::Value> {
         let url = format!("{}/backup/create-folder", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let body = serde_json::json!({
             "name": name,
             "parentFolder": parent_folder,
@@ -1632,7 +1749,7 @@ impl SaveStateClient {
         profile_name: &str,
     ) -> Result<String> {
         let url = format!("{}/backup/profile-folders", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .post(&url)
@@ -1668,7 +1785,7 @@ impl SaveStateClient {
     /// Stop treating a folder as profile-managed while preserving its backups.
     pub async fn detach_profile_folder(&self, profile_id: &str) -> Result<()> {
         let url = format!("{}/backup/profile-folders/{}", self.base_url, profile_id);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .delete(&url)
@@ -1695,7 +1812,7 @@ impl SaveStateClient {
         destination_folder: &str,
     ) -> Result<serde_json::Value> {
         let url = format!("{}/backup/move", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let body = serde_json::json!({
             "key": key,
             "destinationFolder": destination_folder,
@@ -1725,7 +1842,7 @@ impl SaveStateClient {
         let mut url = reqwest::Url::parse(&format!("{}/backup/folders", self.base_url))
             .context("Invalid folder API URL")?;
         url.query_pairs_mut().append_pair("path", path);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1746,7 +1863,7 @@ impl SaveStateClient {
     /// List logical folders. Repository objects are never exposed as folders.
     pub async fn list_folders(&self) -> Result<serde_json::Value> {
         let url = format!("{}/backup/folders", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let resp = self
             .client
@@ -1772,7 +1889,7 @@ impl SaveStateClient {
         retention: Option<(&str, usize)>,
     ) -> Result<()> {
         let url = format!("{}/backup/kopia-manifest", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
 
         let mut request = self
             .client
@@ -1800,7 +1917,7 @@ impl SaveStateClient {
 
     pub async fn get_kopia_manifest(&self) -> Result<serde_json::Value> {
         let url = format!("{}/backup/kopia-manifest", self.base_url);
-        let auth = self.auth_header()?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .get(&url)
@@ -1819,7 +1936,211 @@ impl SaveStateClient {
 
 #[cfg(test)]
 mod account_recovery_contract_tests {
-    use super::{LoginResponse, MasterKeyEnvelopeResponse};
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn session_token(user: u64, service: u64, expires: i64) -> String {
+        let claims = serde_json::json!({"sub": user, "serviceId": service, "authVersion": 0, "exp": expires});
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+
+    // Loopback-only HTTP fixture: no real account, Credential Manager or production request.
+    async fn renewal_server(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0, "request ended prematurely");
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(request.len() < 65536);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn renewal_boundary_and_workspace_changes_keep_device_access_separate() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(!access_token_is_fresh(
+            &session_token(7, 12, now + 300),
+            now
+        ));
+        assert!(access_token_is_fresh(&session_token(7, 12, now + 301), now));
+        let mut api = SaveStateClient::new("session-test".into());
+        api.set_token(session_token(7, 12, now - 86400));
+        api.set_refresh_token(Some("refresh".into())).unwrap();
+        let old_workspace = api.clone();
+        api.set_token(session_token(7, 13, now + 86400));
+        assert_eq!(
+            api.session_credentials().unwrap().refresh_token.as_deref(),
+            Some("refresh")
+        );
+        assert!(!Arc::ptr_eq(&api.credentials, &old_workspace.credentials));
+        api.set_token(session_token(8, 14, now + 86400));
+        assert!(api.session_credentials().unwrap().refresh_token.is_none());
+        api.clear_token();
+        assert!(api.session_credentials().unwrap().token.is_empty());
+        assert!(api.session_credentials().unwrap().refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_requests_share_one_renewal_after_two_days() {
+        let now = chrono::Utc::now().timestamp();
+        let fresh = session_token(7, 12, now + 86400);
+        let (base, server) = renewal_server(vec![(
+            200,
+            serde_json::json!({"token": fresh, "refreshToken": "renewed"}),
+        )])
+        .await;
+        let mut api = SaveStateClient::new("session-test".into());
+        api.base_url = base;
+        api.set_token(session_token(7, 12, now - 86400));
+        api.set_refresh_token(Some("original-refresh".into()))
+            .unwrap();
+        let requests = (0..12).map(|_| {
+            let api = api.clone();
+            async move { api.auth_header().await.unwrap() }
+        });
+        for header in futures_util::future::join_all(requests).await {
+            assert_eq!(header, format!("Bearer {fresh}"));
+        }
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /auth/refresh "));
+        assert!(requests[0].contains("\"refreshToken\":\"original-refresh\""));
+        assert!(requests[0].contains("\"serviceId\":12"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_backup_repository_request_uses_renewed_access_not_refresh_credential() {
+        let now = chrono::Utc::now().timestamp();
+        let fresh = session_token(7, 12, now + 86400);
+        let (base, server) = renewal_server(vec![
+            (200, serde_json::json!({"token": fresh, "refreshToken": "device-refresh-only"})),
+            (200, serde_json::json!({
+                "mode": "backup", "bucket": "fixture-bucket", "prefix": "", "endpoint": "https://storage.invalid",
+                "region": "fixture", "accessKeyId": "fixture-id", "secretAccessKey": "fixture-secret", "expiresIn": 3600
+            })),
+        ]).await;
+        let mut api = SaveStateClient::new("session-test".into());
+        api.base_url = base;
+        api.set_token(session_token(7, 12, now - 86400));
+        api.set_refresh_token(Some("old-device-refresh".into()))
+            .unwrap();
+        let session = api.repo_session("backup", None).await.unwrap();
+        assert_eq!(session.bucket, "fixture-bucket");
+        let requests = server.await.unwrap();
+        assert!(requests[1].starts_with("POST /repo/session "));
+        assert!(requests[1].contains(&format!("Bearer {fresh}")));
+        assert!(!requests[1].contains("device-refresh"));
+    }
+
+    #[tokio::test]
+    async fn offline_connection_failure_keeps_the_remembered_login_in_memory() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut api = SaveStateClient::new("session-test".into());
+        api.base_url = format!("http://{address}");
+        let expired = session_token(7, 12, chrono::Utc::now().timestamp() - 86400);
+        api.set_token(expired.clone());
+        api.set_refresh_token(Some("device-refresh".into()))
+            .unwrap();
+        let error = api.auth_header().await.unwrap_err().to_string();
+        assert!(error.contains("check your connection"));
+        assert!(crate::scheduler::classify_schedule_failure(&error).retryable);
+        assert_eq!(api.session_credentials().unwrap().token, expired);
+        assert_eq!(
+            api.session_credentials().unwrap().refresh_token.as_deref(),
+            Some("device-refresh")
+        );
+        assert!(api.token.is_some());
+    }
+
+    #[tokio::test]
+    async fn server_outage_retains_session_and_next_backup_request_can_retry() {
+        let now = chrono::Utc::now().timestamp();
+        let fresh = session_token(7, 12, now + 86400);
+        let (base, server) = renewal_server(vec![
+            (503, serde_json::json!({"error": "temporary"})),
+            (
+                200,
+                serde_json::json!({"token": fresh, "refreshToken": "renewed"}),
+            ),
+        ])
+        .await;
+        let mut api = SaveStateClient::new("session-test".into());
+        api.base_url = base;
+        let expired = session_token(7, 12, now - 86400);
+        api.set_token(expired.clone());
+        api.set_refresh_token(Some("original-refresh".into()))
+            .unwrap();
+        let error = api.auth_header().await.unwrap_err().to_string();
+        assert!(error.contains("503"));
+        assert!(crate::scheduler::classify_schedule_failure(&error).retryable);
+        assert_eq!(api.session_credentials().unwrap().token, expired);
+        assert_eq!(
+            api.session_credentials().unwrap().refresh_token.as_deref(),
+            Some("original-refresh")
+        );
+        assert_eq!(api.auth_header().await.unwrap(), format!("Bearer {fresh}"));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn renewal_rejects_revocation_and_wrong_account_responses() {
+        let now = chrono::Utc::now().timestamp();
+        let (base, server) = renewal_server(vec![
+            (401, serde_json::json!({"error": "Unauthorized"})),
+            (200, serde_json::json!({"token": session_token(8, 12, now + 86400), "refreshToken": "wrong-account"})),
+        ]).await;
+        let mut api = SaveStateClient::new("session-test".into());
+        api.base_url = base;
+        let expired = session_token(7, 12, now - 86400);
+        api.set_token(expired.clone());
+        api.set_refresh_token(Some("refresh".into())).unwrap();
+        assert!(api
+            .auth_header()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("401"));
+        assert!(api
+            .auth_header()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("account or workspace"));
+        assert_eq!(api.session_credentials().unwrap().token, expired);
+        server.await.unwrap();
+    }
 
     #[test]
     fn login_response_matches_account_recovery_api_contract() {
