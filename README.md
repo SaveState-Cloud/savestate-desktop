@@ -88,6 +88,14 @@ product sheet is available at
   client can safely recover the existing vault after reauthentication.
 - Storage access uses short-lived, account-scoped credentials issued by the
   SaveState API.
+- Account access tokens are renewed silently before expiry, including from
+  scheduled backup requests and after restarting the app. With **Remember me**
+  enabled, the renewable desktop credential is saved alongside the session in
+  Windows Credential Manager, never as a plaintext password. Active devices
+  stay signed in; 90 days without renewal requires signing in again. Explicit
+  sign-out removes the local credential, and account-password recovery revokes
+  it server-side. Network outages preserve the login for retry. Upgrading from
+  a client without renewable sessions requires one new sign-in.
 - On Windows, the client enables Kopia's native Volume Shadow Copy policy in
   `when-available` mode before backups. This gives Kopia a stable view of files
   opened by running services when VSS is available and falls back to normal
